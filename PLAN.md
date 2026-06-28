@@ -93,12 +93,19 @@ Reference and path rules:
 - Unknown JSON fields are validation errors unless the schema explicitly marks an extension point.
 - Orphan files are warnings in early development and errors once migration/versioning exists.
 
+Sample rules:
+- Samples live under `samples/` and are referenced by project-relative path; absolute paths and `..` are errors (the REAPER lesson).
+- v1 accepts uncompressed PCM WAV (`.wav`) only; other formats are deferred. Validate by extension *and* a basic header check, not by trust.
+- A referenced sample that does not exist on disk is an error that names the missing path.
+- A per-sample size cap is enforced (v1 default 50 MB, configurable) to keep bundles and the asset endpoint sane; oversize is an error.
+
 ## 5. Format choice (decided, with the alternatives on record)
 
 **Container: JSON, governed by a published JSON Schema.**
 - Authoring is tolerant (accept JSON5 — comments, trailing commas — on read).
 - Writing is **canonical readable JSON**: UTF-8, no comments, no duplicate keys, deterministic key order, 2-space indent, trailing newline, normalised number formatting, and no non-finite numbers. A `fmt` command (think `prettier`/`rustfmt`) makes every writer converge on identical bytes → clean diffs.
 - Comments/annotations are **first-class fields** (`"description"`, `"notes"`) rather than free-floating `//`, so the canonical serializer never has to preserve trivia. This sidesteps the entire format-preserving-parser problem.
+- **Comment-destruction is explicit policy, not an accident.** The serializer is *not* format-preserving. JSON5 `//` and `/* */` comments are accepted on read but dropped the moment any writer (UI or `fmt`) rewrites the file. Durable annotations must live in `description`/`notes` fields. This is the same wall every non-format-preserving canonicaliser hits — switching container format (TOML/YAML/KDL) would not change it, which is why the comment desire is solved with structured fields rather than format choice. `AGENTS.md` must state this loudly.
 
 Canonicalisation is **JCS-inspired, not raw RFC 8785 JCS**. RFC 8785 is useful because it defines deterministic JSON by constraining JSON to an interoperable subset and using stable primitive serialisation + property ordering. This product deliberately keeps pretty 2-space output and may use schema-specific key order for readability. Hashes must therefore use `musictool fmt` output, not a generic JSON library's output.
 
@@ -126,7 +133,7 @@ Versioning and migrations:
 - Golden fixtures must include the current version number so accidental schema drift is visible in diffs.
 
 Engine parameter registry:
-- Engine-specific params are not arbitrary open JSON. Each built-in engine (`basic-mono`, `basic-poly`, `drumkit`) must declare a parameter registry with valid names, value type, min/max or enum, default, units, whether it is automatable, and comparison epsilon if numeric.
+- Engine-specific params are not arbitrary open JSON. Each built-in engine (`basic-mono`, `basic-poly`, `drumkit`) must declare a parameter registry with valid names, value type, min/max or enum, default, units, and whether it is automatable. The concrete v1 registry contents are specified in §6.2. Because all params are integers (§6), comparison is exact equality; the registry reserves an optional `epsilon` field only for a hypothetical future float param.
 - Instrument `params` use the registry to validate flat dotted keys such as `"filter.cutoff"`.
 - Automation `param` values must reference an automatable registry entry on the target track's instrument.
 - Unknown params are validation errors with "did you mean" diagnostics where possible (`fitler.cutoff` should not silently pass).
@@ -154,7 +161,7 @@ Persisted musical time uses these conventions:
 - Arrangement clips use ticks from the start of the song.
 - UI labels may show bars/beats/steps, but files store ticks.
 - Timeline fields use JSON Schema `integer` plus semantic validation and `fmt` normalisation. Inputs like `3840.0` may parse to a number, but canonical output must write `3840`.
-- Floating point values are allowed for musical parameters (`velocity`, `probability`, gains, filter values), not for timeline positions. Canonical output uses JavaScript's shortest round-trip number representation. Semantic comparisons of parameter values should either compare canonicalised values or use an explicit per-parameter epsilon from the parameter registry.
+- **Canonical files contain no floating-point numbers at all.** Every persisted quantity — timeline positions *and* musical parameters — is an integer in a defined unit. Velocity, probability, sustain, resonance, and pan are permille (0–1000, or ±1000); envelope times are milliseconds; cutoff is hertz; detune and pitch are cents; gain is dB×100. The exact units per parameter live in the registry (§6.2). This makes byte-identical output across languages reduce to integer printing (no Grisu/Ryū shortest-round-trip dependency) and makes semantic comparison exact integer equality (no epsilon needed). The chosen resolutions (1 ms, 1 Hz, 0.1% of full scale, 1 cent, 0.01 dB) are below the threshold of musical relevance for v1. Inputs like `3840.0` or `0.80` may parse to a number, but canonical output must write the integer (`3840`, and `0.8`-as-permille is `800`). If a genuinely continuous float parameter is ever required, it may not be added until it ships with a defined canonical decimal precision and a cross-implementation byte-identical test (§18).
 
 Tempo and meter:
 - V1 supports a single effective tempo and meter, but the format should reserve map-shaped fields now because tick→seconds conversion depends on them.
@@ -173,8 +180,8 @@ For v1, keep the grammar intentionally small and **placement-only**:
 - `.` = rest at this grid step.
 - Spaces are visual separators only and do not count as steps.
 - `|` is an optional bar separator. It must fall on a bar boundary if present.
-- `X` may be accepted on read as a convenience for an accented trigger, but `fmt` must canonicalise it to lowercase `x` plus a `stepEvents` velocity override. If that conversion is not implemented, reject `X` in Phase 0.
-- `-` = tie/hold marker for future melodic grids; invalid in drum lanes until implemented.
+- `X` (accented trigger) is **rejected in Phase 0**. The validator emits a diagnostic pointing at the offending column: "accented triggers are not supported yet; use lowercase `x` and set `velocity` in `stepEvents`." It is neither silently accepted nor silently converted. The auto-convert-to-`stepEvents` behaviour is deferred until the basic grammar has golden tests.
+- `-` (tie/hold marker) is reserved for future melodic grids and is **rejected** in drum lanes until implemented, with a diagnostic naming the column.
 
 Every lane with `steps` must declare a grid:
 
@@ -183,9 +190,9 @@ Every lane with `steps` must declare a grid:
   "lane": "kick",
   "grid": { "stepsPerBar": 16 },
   "steps": "x..x ..x. x..x ..x.",
-  "defaults": { "velocity": 0.8 },
+  "defaults": { "velocity": 800 },
   "stepEvents": [
-    { "step": 6, "velocity": 0.55, "probability": 0.8 },
+    { "step": 6, "velocity": 550, "probability": 800 },
     { "step": 11, "microTicks": -12, "ratchet": 2, "gateTicks": 120 }
   ]
 }
@@ -203,11 +210,11 @@ Validation rules:
 - `lengthTicks` must be an integer multiple of a bar for v1 grid patterns.
 - Each grid step maps to `stepIndex * ticksPerBar / stepsPerBar` within its bar. This must be an integer; reject grids that do not divide cleanly into ticks.
 - `stepEvents[*].step` is zero-based within the pattern, must point at an `x` step, and must be unique.
-- `microTicks` is applied after swing/groove. `ratchet` is a positive integer count. `gateTicks` is a positive integer duration override. `probability` is 0–1.
+- `microTicks` is applied after swing/groove. `ratchet` is a positive integer count. `gateTicks` is a positive integer duration override. `velocity` and `probability` are permille integers (0–1000); see §6.2.
 - Advanced Strudel-like features (`*`, Euclidean `(3,8)`, nested groups, random choice, probability syntax) are explicitly out of v1. Add them only after the basic grammar has golden tests.
 
 Canonical pattern formatting:
-- `fmt` lowercases all `x` symbols and emits `steps` as the canonical placement string. If `X` is accepted on read, it becomes `x` plus a `stepEvents` velocity override of `1.0`.
+- `fmt` emits `steps` as the canonical placement string of `x` and `.` only. (`X` is rejected on read in v1, so there is no case-folding to perform.)
 - Within each bar, group steps in blocks of four when `stepsPerBar` is divisible by four. Use ` | ` between bars. Example for one 16-step bar: `"x..x ..x. x..x ..x."`.
 - If `stepsPerBar` is not divisible by four, group by the largest divisor of `stepsPerBar` that is `<= 4` and `> 1`; if no such divisor exists, emit the bar with no internal spaces.
 - Do not preserve arbitrary spacing from input; `fmt` owns spacing.
@@ -218,6 +225,63 @@ Pattern representation rules:
 - Drum tracks use grid patterns in v1.
 - Melodic tracks use note event-list patterns in v1.
 - Melodic grid patterns and ties are future work and must not be accepted until their canonical form is specified.
+
+### 6.2 Engine parameter registry (v1 contents)
+
+All persisted quantities are integers in a defined unit (§6). Each built-in engine declares a registry; `validate` checks instrument `params` and automation targets against it, and unknown keys are errors with "did you mean" suggestions. Defaults are chosen to map cleanly onto Tone.js (`MonoSynth` / `PolySynth` / `Sampler`) so the Phase 1 engine binds with unit-scaling only, no translation tables.
+
+Units:
+- `Hz` — integer hertz.
+- `ms` — integer milliseconds.
+- `cents` — integer cents (100 = one semitone).
+- `permille` — integer 0–1000 (or ±1000 for bipolar) representing a 0.0–1.0 normalised value (velocity, sustain level, resonance, probability, swing, pan).
+- `dB×100` — integer hundredths of a decibel (−6 dB → −600).
+- `count` — a plain non-negative integer.
+- `enum` — a string from a fixed set.
+
+Shared subtractive-voice params (both `basic-mono` and `basic-poly`):
+
+| param | unit | range / values | default | automatable |
+|---|---|---|---|---|
+| `oscillator` | enum | sine, triangle, sawtooth, square | sawtooth | no |
+| `detune` | cents | −1200..1200 | 0 | yes |
+| `filter.type` | enum | lowpass, highpass, bandpass | lowpass | no |
+| `filter.cutoff` | Hz | 20..20000 | 12000 | yes |
+| `filter.resonance` | permille | 0..1000 | 100 | yes |
+| `filterEnv.amount` | permille | 0..1000 | 0 | yes |
+| `amp.attack` | ms | 0..20000 | 5 | no |
+| `amp.decay` | ms | 0..20000 | 100 | no |
+| `amp.sustain` | permille | 0..1000 | 900 | no |
+| `amp.release` | ms | 0..60000 | 1000 | no |
+| `gain` | dB×100 | −6000..600 | 0 | yes |
+| `pan` | permille | −1000..1000 | 0 | yes |
+
+`basic-mono` adds:
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `portamento` | ms | 0..5000 | 0 | no |
+
+`basic-poly` adds:
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `maxVoices` | count | 1..32 | 16 | no |
+
+`drumkit` params are per kit voice, namespaced `<voice>.<param>` where `<voice>` is a key in the instrument's `kit` map (e.g. `kick.gain`):
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `<voice>.gain` | dB×100 | −6000..600 | 0 | yes |
+| `<voice>.pan` | permille | −1000..1000 | 0 | yes |
+| `<voice>.pitch` | cents | −2400..2400 | 0 | no |
+| `<voice>.chokeGroup` | count | 0..16 | 0 (none) | no |
+
+Registry rules:
+- `automatable: yes` is required for an automation lane to target a param; automation values use the param's unit (a `filter.cutoff` lane stores integer Hz).
+- Per-note / per-step expression fields reuse these units: `velocity`, `probability`, and `swing` are permille; `microTicks` and `gateTicks` are ticks; `ratchet` is a count.
+- A `drumkit` automation target must name an existing voice (`kick.gain`, not `kik.gain`), validated against the instrument's `kit` map.
+- Third-party engines later need a plugin registry; do not weaken built-in validation to prepare for them.
 
 ## 7. Separate the *musical document* from *engine state*
 
@@ -250,7 +314,7 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
   ],
   "ppqn": 960,
   "key": { "root": "A", "scale": "minor" },
-  "swing": 0.0,
+  "swing": 0,
   "trackOrder": ["drums", "bass", "pad"]
 }
 ```
@@ -294,9 +358,9 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
   "type": "synth",
   "engine": "basic-mono",
   "params": {
-    "oscillator": "saw",
+    "oscillator": "sawtooth",
     "filter.cutoff": 800,
-    "filter.resonance": 0.2
+    "filter.resonance": 200
   }
 }
 ```
@@ -320,8 +384,8 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
   "params": {
     "oscillator": "triangle",
     "filter.cutoff": 1200,
-    "attack": 0.4,
-    "release": 1.2
+    "amp.attack": 400,
+    "amp.release": 1200
   }
 }
 ```
@@ -342,9 +406,9 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
       "lane": "hat",
       "grid": { "stepsPerBar": 16 },
       "steps": "x.x. x.x. x.x. x.x.",
-      "defaults": { "velocity": 0.6, "swing": 0.12 },
+      "defaults": { "velocity": 600, "swing": 120 },
       "stepEvents": [
-        { "step": 2, "velocity": 0.35, "probability": 0.8 },
+        { "step": 2, "velocity": 350, "probability": 800 },
         { "step": 8, "microTicks": -12, "ratchet": 2, "gateTicks": 120 }
       ]
     }
@@ -359,9 +423,9 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
   "kind": "notes",
   "lengthTicks": 7680,
   "notes": [
-    { "pitch": "A1", "startTick": 0,    "durationTicks": 720, "velocity": 0.9 },
-    { "pitch": "A1", "startTick": 960,  "durationTicks": 480, "velocity": 0.7, "microTicks": -8 },
-    { "pitch": "C2", "startTick": 2400, "durationTicks": 960, "velocity": 0.8, "probability": 0.8 }
+    { "pitch": "A1", "startTick": 0,    "durationTicks": 720, "velocity": 900 },
+    { "pitch": "A1", "startTick": 960,  "durationTicks": 480, "velocity": 700, "microTicks": -8 },
+    { "pitch": "C2", "startTick": 2400, "durationTicks": 960, "velocity": 800, "probability": 800 }
   ]
 }
 ```
@@ -382,6 +446,23 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
 ```
 
 The first real task (Phase 0) is to build *exactly this example*, write the schema that validates it, and prove parse→serialize is idempotent. If an implementation cannot validate this fixture and reject deliberately broken variants of it, Phase 0 is not done.
+
+### 8.1 Semantic validation rules (v1 checklist)
+
+JSON Schema covers shape; these cross-file/semantic rules live in code. Each must have a passing valid fixture and a failing invalid fixture:
+
+- Every `id` matches `^[a-z][a-z0-9-]*$` and equals its file name.
+- `project.json.trackOrder`: every listed id has a `tracks/<id>.json` (unknown id → error), there are no duplicate ids (→ error), and a track file missing from `trackOrder` is an orphan (warning early, error once versioning exists, per §4).
+- Every `track.instrument` references an existing `instruments/<id>.json`.
+- Every `track.patterns[*]`, every `arrangement.clips[*].pattern`, and every `clips[*].track` resolves to an existing object.
+- A grid (drum) track references only `kind: "grid"` patterns; a melodic/instrument track references only `kind: "notes"` patterns.
+- `ppqn`, `tempoMap`, `meterMap` obey §6: exactly one point each in v1, all starting at tick 0, matching the convenience `tempo`/`timeSignature` fields.
+- Grid `lengthTicks` is a positive integer multiple of a bar; step counts and step→tick divisibility obey §6.1.
+- Instrument `params` keys exist in the engine's registry (§6.2), values are in range/enum, and unknown keys produce "did you mean" suggestions.
+- Automation `param` targets an `automatable: true` registry entry on the target track's instrument (including the `<voice>.<param>` form for drumkits); `points` values are in the param's unit and range; point ticks are strictly increasing and within `arrangement.lengthTicks`.
+- Every referenced sample resolves to a file inside `samples/`, is project-relative, contains no `..`, and obeys the §4 sample rules (WAV, exists, within size cap).
+- No persisted number outside the timeline is a float; all params/expression are integers in registry units (§6).
+- `project.json.format` equals the supported version; a newer `format` is rejected (not migrated).
 
 ## 9. The agent contract
 
@@ -448,6 +529,8 @@ Mechanism:
 
 Concurrency policy (keep simple in v1, document clearly): if the UI has in-flight unsaved edits when an external edit lands on the same file, last-writer-wins with a visible warning and a retained diagnostic that names the file. The `project.lock` is advisory — an agent can be asked (via `AGENTS.md`) to check it. Real merge/CRDT is a later concern; the per-file split already makes most collisions unlikely.
 
+Single-writer assumption (v1): the sidecar admits one read-write UI session per project. A second browser connecting to an already-open project is rejected with a clear message ("project is open in another window"); admitting additional sessions as read-only followers is an easy later relaxation. This keeps last-writer-wins honest — only one UI holds optimistic unsaved state, so every other writer is a filesystem editor (the agent), which the echo/external-edit machinery in steps 3–4 already handles.
+
 Undo policy: UI undo/redo applies only to local UI edit history. An accepted external edit becomes a new baseline and is not undone by pressing Undo. If an external edit lands while undo history exists, retain the history only when object IDs still resolve cleanly; otherwise clear the affected history segment and show a diagnostic.
 
 Cross-file transactions: some UI operations must update multiple files. The sidecar protocol therefore needs write batches even though each file is written atomically. Watcher-side validation should tolerate transient invalid states during the settle window, but the browser should only accept a new project snapshot after project-level validation passes. Invalid external edits should surface diagnostics and keep the last valid in-memory model active.
@@ -460,7 +543,9 @@ Echo-detection by content hash/write ID is the linchpin — without it you get i
 musictool validate <project>      # JSON Schema + pattern-grammar + semantic checks
                                    #   (referenced instrument exists, pattern length sane, etc.)
 musictool fmt <project>           # canonical formatter → identical bytes from any writer
-musictool describe <project>      # human/agent summary: tracks, bars, key, density
+musictool describe <project> [--json]
+                                   # human/agent summary: tracks, bars, key, density
+                                   #   (--json is the machine mode; golden tests assert on it)
 musictool doctor <project>        # validation plus actionable diagnostics and suggested fixes
 musictool render <project> [--out out.wav] [--bars 0-8]
                                    # offline render so the agent can verify it made sound,
@@ -468,6 +553,26 @@ musictool render <project> [--out out.wav] [--bars 0-8]
 ```
 
 Diagnostics must include file path, JSON pointer or pattern-string span, line/column where available, severity, and a short suggested fix. Agents act much more reliably when they can run one command and see exactly where a mistake is.
+
+Every diagnostic is a structured object — the same shape emitted by `validate`/`doctor` and pushed over the sidecar `diagnosticsChanged` message:
+
+```json
+{
+  "severity": "error",
+  "code": "pattern.step-count-mismatch",
+  "file": "patterns/drums-verse.json",
+  "pointer": "/lanes/0/steps",
+  "span": { "start": 12, "end": 13 },
+  "loc": { "line": 5, "column": 14 },
+  "message": "lane 'kick' has 15 steps but stepsPerBar*bars = 16",
+  "suggestion": "add one '.' to reach 16 steps"
+}
+```
+
+- `severity` is `error | warning | info`; `validate` exits non-zero if any `error` is present.
+- `code` is a stable, namespaced, machine-readable identifier so agents and tests assert on specific diagnostics without matching prose.
+- `pointer` is an RFC 6901 JSON Pointer into the file; `span` is a character range into a pattern string when the error is inside one; `loc` is line/column when available. At least one locator is always present.
+- `describe --json`, `validate`, and `doctor` all have machine modes; golden/diagnostic tests assert on the JSON and the human-readable text is rendered from it, so prose wording can change without breaking tests.
 
 `render` should run headless eventually. Tone.js has an offline rendering API (`Tone.Offline`) built on `OfflineAudioContext`, but Node/headless sampler behavior should be proven with a Phase 1 spike before it becomes the only regression-test path. Acceptable v1 render paths, in order of implementation likelihood:
 - Browser-based Playwright render harness using the real Web Audio implementation.
@@ -499,7 +604,8 @@ Recommendation: **(b)** for v1 (keeps web-first, generalises cleanly to server),
 
 **Phase 0 — Format & validator foundation** *(no UI, no audio)*
 TypeScript workspace, schema, canonical parser/serializer, the v1 pattern-string grammar + parser, engine parameter registry, `validate`/`fmt`/`describe`/`doctor` CLI, the §8 worked example as a fixture, tiny test `.wav` samples, invalid fixtures, `format-spec.md`, `AGENTS.md`. `render` may exist as a documented stub, but it is not implemented in Phase 0.
-✅ *Done when:* an agent hand-edits a project and it validates; parse→serialize is **idempotent** (round-trip stable); `fmt` output is byte-stable including canonical `steps` strings; invalid fixtures fail with useful diagnostics; all persisted musical time is integer ticks; per-step grid expression and automation-param validation are covered by fixtures.
+✅ *Done when:* an agent hand-edits a project and it validates; parse→serialize is **idempotent** (round-trip stable); `fmt` output is byte-stable including canonical `steps` strings; invalid fixtures fail with useful diagnostics; all persisted numbers are integers in their declared unit (no floats anywhere in canonical files); a `format: 2` project is rejected rather than migrated; per-step grid expression and automation-param validation are covered by fixtures.
+✅ *Also done when (ergonomics gate):* given only `docs/format-spec.md`, `AGENTS.md`, and the CLI — no other context — a fresh agent can complete a realistic task such as "add a four-on-the-floor kick and a bassline that follows it" and produce a project that passes `validate` without human hand-holding. This is the real exit criterion; the mechanical checks above are necessary but not sufficient. If the loop is painful, the format is not done.
 
 **Phase 1 — Audio engine MVP**
 Spike offline render path first, then load document → play. Lookahead scheduler, immutable scheduling snapshots, one synth + a drum sampler, sidecar sample loading, transport (headless or trivial UI). `render` CLI works through the chosen render path.
@@ -541,6 +647,8 @@ Tauri wrap → server storage + auth → in-app assistant (user token) → MCP s
 - **Pattern strings must stay deterministic.** `steps` is placement-only; expression lives in sorted `stepEvents`; `fmt` owns spacing and case.
 - **Parameter validation is part of the music model.** Engine params and automation params must be checked against the registry, or agents will silently create broken automation.
 - **Split canonical implementations create invisible divergence.** Keep Phase 0 parser/formatter/validator in one TypeScript package reused by CLI, UI, sidecar, and tests.
+- **Cross-language number divergence.** Canonical files contain no floats — every quantity is an integer in a registry unit (§6/§6.2) — so byte-identical output across TS and any future Rust serializer reduces to integer printing. Keep it that way: a cross-implementation golden test must assert byte-identical serialization of the fixtures, and any future float parameter must ship with a defined canonical precision *before* it is allowed in.
+- **Canonical rewriting destroys free-floating comments.** The serializer is not format-preserving; `//` and `/* */` in hand-edited JSON5 are dropped on the next write. Durable annotations must use `description`/`notes` fields; `AGENTS.md` must say so loudly. Changing container format would not change this.
 - **Schema tooling can lie by omission.** Test Ajv 2020-12 mode and any TS type generator against the actual schema features before trusting them.
 - **Scheduler & DSP correctness** — the "almost right" trap. *Human owns / closely reviews.* Agent does breadth (UI, plumbing, CRUD, sidecar protocol).
 - **Sync reconcile & echo detection** — subtle concurrency; infinite-loop and lost-edit bugs live here. *Human owns.*
@@ -563,9 +671,10 @@ Tauri wrap → server storage + auth → in-app assistant (user token) → MCP s
 5. Implement the v1 pattern-string grammar + parser with location-aware errors and sparse `stepEvents` expression validation.
 6. Implement `validate`, `fmt`, `describe`, and `doctor`; add the §8 worked example under `/fixtures/valid` with tiny test `.wav` samples.
 7. Add the built-in engine parameter registry and validate instrument params plus automation target params.
-8. Add invalid fixtures for bad IDs, absolute sample paths, `..` paths, wrong step counts, non-integer timeline values, missing references, unknown fields, malformed pattern strings, bad `stepEvents`, bad engine params, non-automatable params, and unsupported mixed pattern representations.
+8. Add invalid fixtures for bad IDs, absolute sample paths, `..` paths, wrong step counts, non-integer timeline values, missing references, unknown fields, malformed pattern strings, bad `stepEvents`, bad engine params, non-automatable params, unsupported mixed pattern representations, `trackOrder` mismatches (unknown id, duplicate), a dangling sample reference, a non-WAV/oversize sample, a `format: 2` project, a float used where an integer unit is required, and an `X` accented trigger.
 9. Write round-trip tests: **parse → serialize → parse must be identical**, and `fmt` must be byte-stable.
-10. Write golden-output tests for `describe` and diagnostics tests for `doctor`.
+10. Write golden-output tests for `describe --json` and diagnostics tests for `doctor`, plus a cross-implementation byte-identical serialization test (a single implementation now; the harness must be ready for a second).
+11. Run the ergonomics gate (§16): hand a fresh agent only the spec, `AGENTS.md`, and CLI, and confirm it can complete a realistic edit task that validates.
 
 Stop at the end of Phase 0 and have a human confirm the format feels right before building the engine and UI on top of it — that review is the cheapest it will ever be.
 
