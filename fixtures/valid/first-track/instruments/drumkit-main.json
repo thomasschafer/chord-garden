@@ -1,0 +1,12 @@
+{
+  "id": "drumkit-main",
+  "type": "drumkit",
+  "kit": {
+    "hat": {
+      "sample": "samples/hat.wav"
+    },
+    "kick": {
+      "sample": "samples/kick.wav"
+    }
+  }
+}

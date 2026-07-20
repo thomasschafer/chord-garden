@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "name": "first track",
+  "ppqn": 960,
+  "tempoMap": [
+    {
+      "startTick": 0,
+      "bpm": 12400
+    }
+  ],
+  "meterMap": [
+    {
+      "startTick": 0,
+      "timeSignature": [4, 4]
+    }
+  ],
+  "key": {
+    "root": "A",
+    "scale": "minor"
+  },
+  "swing": 0,
+  "trackOrder": ["drums", "bass", "pad"]
+}

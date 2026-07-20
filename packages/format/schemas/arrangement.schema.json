@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chord-garden.dev/schemas/arrangement.schema.json",
+  "title": "Arrangement",
+  "type": "object",
+  "properties": {
+    "description": { "type": "string" },
+    "lengthTicks": { "type": "integer", "minimum": 1 },
+    "clips": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "track": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "pattern": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "startTick": { "type": "integer", "minimum": 0 },
+          "repeatCount": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["track", "pattern", "startTick", "repeatCount"],
+        "unevaluatedProperties": false
+      }
+    }
+  },
+  "required": ["lengthTicks", "clips"],
+  "unevaluatedProperties": false
+}

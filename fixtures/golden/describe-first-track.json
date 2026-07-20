@@ -1,0 +1,76 @@
+{
+  "name": "first track",
+  "format": 1,
+  "ppqn": 960,
+  "bpm": 12400,
+  "timeSignature": [
+    4,
+    4
+  ],
+  "key": {
+    "root": "A",
+    "scale": "minor"
+  },
+  "swing": 0,
+  "lengthTicks": 61440,
+  "bars": 16,
+  "tracks": [
+    {
+      "id": "drums",
+      "type": "drumkit",
+      "instrument": "drumkit-main",
+      "patterns": [
+        "drums-verse"
+      ],
+      "clipCount": 1,
+      "automatedParams": []
+    },
+    {
+      "id": "bass",
+      "type": "instrument",
+      "instrument": "bass-synth",
+      "patterns": [
+        "bass-main"
+      ],
+      "clipCount": 1,
+      "automatedParams": []
+    },
+    {
+      "id": "pad",
+      "type": "instrument",
+      "instrument": "pad-synth",
+      "patterns": [],
+      "clipCount": 0,
+      "automatedParams": [
+        "filter.cutoff"
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "id": "bass-main",
+      "kind": "notes",
+      "bars": 2,
+      "noteCount": 3,
+      "pitchRange": [
+        "A1",
+        "C2"
+      ]
+    },
+    {
+      "id": "drums-verse",
+      "kind": "grid",
+      "bars": 1,
+      "lanes": [
+        {
+          "lane": "kick",
+          "hits": 6
+        },
+        {
+          "lane": "hat",
+          "hits": 8
+        }
+      ]
+    }
+  ]
+}

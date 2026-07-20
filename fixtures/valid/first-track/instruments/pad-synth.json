@@ -1,0 +1,11 @@
+{
+  "id": "pad-synth",
+  "type": "synth",
+  "engine": "basic-poly",
+  "params": {
+    "amp.attack": 400,
+    "amp.release": 1200,
+    "filter.cutoff": 1200,
+    "oscillator": "triangle"
+  }
+}

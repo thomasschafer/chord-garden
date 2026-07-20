@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chord-garden.dev/schemas/instrument-synth.schema.json",
+  "title": "SynthInstrument",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "description": { "type": "string" },
+    "type": { "const": "synth" },
+    "engine": { "enum": ["basic-mono", "basic-poly"] },
+    "params": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z][a-zA-Z0-9]*(\\.[a-zA-Z][a-zA-Z0-9]*)*$": {
+          "type": ["integer", "string"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["id", "type", "engine"],
+  "unevaluatedProperties": false
+}

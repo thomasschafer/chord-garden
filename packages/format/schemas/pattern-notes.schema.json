@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chord-garden.dev/schemas/pattern-notes.schema.json",
+  "title": "NotesPattern",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "description": { "type": "string" },
+    "kind": { "const": "notes" },
+    "lengthTicks": { "type": "integer", "minimum": 1 },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pitch": { "type": "string", "pattern": "^[A-G][#b]?(-1|[0-9])$" },
+          "startTick": { "type": "integer", "minimum": 0 },
+          "durationTicks": { "type": "integer", "minimum": 1 },
+          "velocity": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "microTicks": { "type": "integer", "minimum": -1920, "maximum": 1920 },
+          "probability": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "ratchet": { "type": "integer", "minimum": 1, "maximum": 16 }
+        },
+        "required": ["pitch", "startTick", "durationTicks", "velocity"],
+        "unevaluatedProperties": false
+      }
+    }
+  },
+  "required": ["id", "kind", "lengthTicks", "notes"],
+  "unevaluatedProperties": false
+}

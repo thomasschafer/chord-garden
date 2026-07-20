@@ -1,0 +1,27 @@
+{
+  "id": "bass-main",
+  "kind": "notes",
+  "lengthTicks": 7680,
+  "notes": [
+    {
+      "pitch": "A1",
+      "startTick": 0,
+      "durationTicks": 720,
+      "velocity": 900
+    },
+    {
+      "pitch": "A1",
+      "startTick": 960,
+      "durationTicks": 480,
+      "velocity": 700,
+      "microTicks": -8
+    },
+    {
+      "pitch": "C2",
+      "startTick": 2400,
+      "durationTicks": 960,
+      "velocity": 800,
+      "probability": 800
+    }
+  ]
+}

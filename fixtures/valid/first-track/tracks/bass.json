@@ -1,0 +1,6 @@
+{
+  "id": "bass",
+  "type": "instrument",
+  "instrument": "bass-synth",
+  "patterns": ["bass-main"]
+}

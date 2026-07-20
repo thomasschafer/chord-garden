@@ -1,0 +1,20 @@
+{
+  "id": "p",
+  "kind": "grid",
+  "lengthTicks": 3840,
+  "lanes": [
+    {
+      "lane": "kick",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "x..x ..x. x..x ..x.",
+      "stepEvents": [
+        {
+          "step": 1,
+          "velocity": 500
+        }
+      ]
+    }
+  ]
+}

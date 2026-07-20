@@ -1,0 +1,15 @@
+{
+  "track": "t",
+  "lanes": [
+    {
+      "param": "amp.attack",
+      "interp": "linear",
+      "points": [
+        [
+          0,
+          100
+        ]
+      ]
+    }
+  ]
+}

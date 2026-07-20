@@ -1,0 +1,6 @@
+{
+  "id": "drums",
+  "type": "drumkit",
+  "instrument": "drumkit-main",
+  "patterns": ["drums-verse"]
+}

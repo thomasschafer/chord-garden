@@ -1,0 +1,9 @@
+{
+  "id": "k",
+  "type": "drumkit",
+  "kit": {
+    "kick": {
+      "sample": "samples/kick.wav"
+    }
+  }
+}

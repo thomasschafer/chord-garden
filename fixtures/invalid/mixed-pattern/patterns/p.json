@@ -1,0 +1,22 @@
+{
+  "id": "p",
+  "kind": "grid",
+  "lengthTicks": 3840,
+  "lanes": [
+    {
+      "lane": "kick",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "x..x ..x. x..x ..x."
+    }
+  ],
+  "notes": [
+    {
+      "pitch": "A1",
+      "startTick": 0,
+      "durationTicks": 480,
+      "velocity": 800
+    }
+  ]
+}

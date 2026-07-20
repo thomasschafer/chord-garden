@@ -1,0 +1,10 @@
+{
+  "id": "bass-synth",
+  "type": "synth",
+  "engine": "basic-mono",
+  "params": {
+    "filter.cutoff": 800,
+    "filter.resonance": 200,
+    "oscillator": "sawtooth"
+  }
+}

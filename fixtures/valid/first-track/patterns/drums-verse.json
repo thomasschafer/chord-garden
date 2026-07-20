@@ -1,0 +1,38 @@
+{
+  "id": "drums-verse",
+  "kind": "grid",
+  "lengthTicks": 3840,
+  "lanes": [
+    {
+      "lane": "kick",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "x..x ..x. x..x ..x."
+    },
+    {
+      "lane": "hat",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "x.x. x.x. x.x. x.x.",
+      "defaults": {
+        "velocity": 600,
+        "swing": 120
+      },
+      "stepEvents": [
+        {
+          "step": 2,
+          "velocity": 350,
+          "probability": 800
+        },
+        {
+          "step": 8,
+          "microTicks": -12,
+          "gateTicks": 120,
+          "ratchet": 2
+        }
+      ]
+    }
+  ]
+}

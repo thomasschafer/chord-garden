@@ -1,0 +1,19 @@
+{
+  "name": "chord-garden",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/cli",
+    "typecheck": "npm run build -w @chord-garden/format && npm run typecheck -w @chord-garden/cli",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}

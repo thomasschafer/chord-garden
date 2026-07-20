@@ -1,0 +1,14 @@
+{
+  "track": "pad",
+  "lanes": [
+    {
+      "param": "filter.cutoff",
+      "interp": "linear",
+      "points": [
+        [0, 200],
+        [30720, 4000],
+        [61440, 800]
+      ]
+    }
+  ]
+}

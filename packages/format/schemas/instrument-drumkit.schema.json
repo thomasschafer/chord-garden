@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chord-garden.dev/schemas/instrument-drumkit.schema.json",
+  "title": "DrumkitInstrument",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "description": { "type": "string" },
+    "type": { "const": "drumkit" },
+    "kit": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": {
+          "type": "object",
+          "properties": {
+            "sample": { "type": "string", "minLength": 1 }
+          },
+          "required": ["sample"],
+          "unevaluatedProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "params": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z][a-zA-Z0-9]*(\\.[a-zA-Z][a-zA-Z0-9]*)*$": {
+          "type": ["integer", "string"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["id", "type", "kit"],
+  "unevaluatedProperties": false
+}
