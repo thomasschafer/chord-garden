@@ -1,0 +1,6 @@
+{
+  "id": "hats",
+  "type": "drumkit",
+  "instrument": "hats-kit",
+  "patterns": ["hats-main"]
+}

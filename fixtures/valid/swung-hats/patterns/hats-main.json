@@ -1,0 +1,27 @@
+{
+  "id": "hats-main",
+  "kind": "grid",
+  "lengthTicks": 3840,
+  "lanes": [
+    {
+      "lane": "straight-hat",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": ".x.x .x.x .... ....",
+      "defaults": {
+        "swing": 0
+      }
+    },
+    {
+      "lane": "swung-hat",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": ".x.x .x.x .... ....",
+      "defaults": {
+        "swing": 500
+      }
+    }
+  ]
+}

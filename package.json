@@ -6,8 +6,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/cli",
-    "typecheck": "npm run build -w @chord-garden/format && npm run typecheck -w @chord-garden/cli",
+    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli",
+    "typecheck": "npm run build -w @chord-garden/format && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli",
     "test": "vitest run",
     "test:watch": "vitest"
   },

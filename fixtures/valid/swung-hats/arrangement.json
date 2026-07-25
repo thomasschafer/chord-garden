@@ -1,0 +1,11 @@
+{
+  "lengthTicks": 3840,
+  "clips": [
+    {
+      "track": "hats",
+      "pattern": "hats-main",
+      "startTick": 0,
+      "repeatCount": 1
+    }
+  ]
+}

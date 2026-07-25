@@ -1,0 +1,12 @@
+{
+  "id": "hats-kit",
+  "type": "drumkit",
+  "kit": {
+    "straight-hat": {
+      "sample": "samples/hat.wav"
+    },
+    "swung-hat": {
+      "sample": "samples/hat.wav"
+    }
+  }
+}
