@@ -38,6 +38,13 @@ export interface SynthProcessor {
     commands: readonly NoteCommand[],
     ramps: ParamRamps,
   ): void;
+  /**
+   * Silence every voice at once, with no release stage. Used when the transport
+   * jumps: a seek that let releases ring would leave the old position audible
+   * over the new one.
+   */
+  reset(): void;
+  activeVoiceCount(): number;
 }
 
 class SynthVoice {
@@ -125,6 +132,19 @@ class SynthVoice {
   isIdle(): boolean {
     return this.envelope.isIdle();
   }
+
+  reset(): void {
+    this.envelope.reset();
+    this.filter.reset();
+    this.oscillator.resetPhase();
+    this.noteId = -1;
+    this.keyDown = false;
+    this.velocityGain = 0;
+    this.startedOrder = -1;
+    this.releasedOrder = -1;
+    this.glideSamplesRemaining = 0;
+    this.glideIncrement = 0;
+  }
 }
 
 abstract class BaseSynthProcessor implements SynthProcessor {
@@ -142,6 +162,10 @@ abstract class BaseSynthProcessor implements SynthProcessor {
     commands: readonly NoteCommand[],
     ramps: ParamRamps,
   ): void;
+
+  abstract reset(): void;
+
+  abstract activeVoiceCount(): number;
 
   protected writeStereo(
     mono: number,
@@ -193,6 +217,15 @@ export class BasicMonoProcessor extends BaseSynthProcessor {
   getCurrentFrequency(): number {
     return this.voice.currentFrequency;
   }
+
+  reset(): void {
+    this.voice.reset();
+    this.order = 0;
+  }
+
+  activeVoiceCount(): number {
+    return this.voice.isIdle() ? 0 : 1;
+  }
 }
 
 export class BasicPolyProcessor extends BaseSynthProcessor {
@@ -233,6 +266,17 @@ export class BasicPolyProcessor extends BaseSynthProcessor {
 
   getVoiceCount(): number {
     return this.voices.length;
+  }
+
+  reset(): void {
+    for (const voice of this.voices) voice.reset();
+    this.order = 0;
+  }
+
+  activeVoiceCount(): number {
+    let count = 0;
+    for (const voice of this.voices) if (!voice.isIdle()) count++;
+    return count;
   }
 
   getActiveNoteIds(): number[] {

@@ -76,6 +76,11 @@ export class AdsrEnvelope {
     return this.stage === "idle";
   }
 
+  /** Return to silence immediately, with no release stage. */
+  reset(): void {
+    this.finish();
+  }
+
   private beginDecay(): void {
     const sustain = permilleToUnit(this.settings.sustainPermille);
     const decaySamples = msToSamples(this.settings.decayMs, this.sampleRate);

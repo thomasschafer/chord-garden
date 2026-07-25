@@ -143,6 +143,11 @@ export class DrumkitProcessor {
     return this.playbacks.length;
   }
 
+  /** Stop every playback immediately; used when the transport jumps. */
+  reset(): void {
+    this.playbacks.length = 0;
+  }
+
   private resolveVoiceOutputs(
     voiceOutputs: DrumVoiceOutputs | undefined,
   ): { left: Float32Array; right: Float32Array }[] | undefined {
