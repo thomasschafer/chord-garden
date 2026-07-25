@@ -7,6 +7,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./compiler": {
+      "types": "./dist/compiler.d.ts",
+      "default": "./dist/compiler.js"
+    },
+    "./live": {
+      "types": "./dist/live/index.d.ts",
+      "default": "./dist/live/index.js"
+    },
+    "./wav": {
+      "types": "./dist/render/wav.d.ts",
+      "default": "./dist/render/wav.js"
     }
   },
   "files": [

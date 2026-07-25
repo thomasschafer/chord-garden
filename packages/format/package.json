@@ -8,6 +8,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./pure": {
+      "types": "./dist/pure.d.ts",
+      "default": "./dist/pure.js"
+    },
     "./registry": {
       "types": "./dist/registry.d.ts",
       "default": "./dist/registry.js"

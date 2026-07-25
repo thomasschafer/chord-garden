@@ -1,7 +1,7 @@
 import type { Project } from "./model.js";
 import { ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
-import { pitchToMidi } from "./semantic.js";
+import { pitchToMidi } from "./pitch.js";
 
 export interface DescribeTrack {
   id: string;

@@ -1,5 +1,3 @@
-import { writeFileSync } from "node:fs";
-import type { RenderedAudio } from "./renderer.js";
 
 export interface DecodedWav {
   sampleRate: number;
@@ -105,18 +103,6 @@ export function encodeWav(audio: WavAudio, bitsPerSample: PcmBitDepth = 24): Uin
     if (audio.right !== undefined) offset = writePcm(view, offset, audio.right[frame]!, bitsPerSample);
   }
   return bytes;
-}
-
-export function writeWav(
-  path: string,
-  audio: WavAudio | RenderedAudio,
-  bitsPerSample: PcmBitDepth = 24,
-): void {
-  const source: WavAudio =
-    "master" in audio
-      ? { sampleRate: audio.sampleRate, left: audio.master.left, right: audio.master.right }
-      : audio;
-  writeFileSync(path, encodeWav(source, bitsPerSample));
 }
 
 function decodePcm(view: DataView, offset: number, bits: 8 | 16 | 24 | 32): number {

@@ -5,6 +5,7 @@ import type { LoadedFile } from "./loadProject.js";
 import type { GridPatternDoc, InstrumentDoc, NotesPatternDoc, Project, TrackDoc } from "./model.js";
 import { ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
+import { pitchToMidi } from "./pitch.js";
 import { checkParamValue, resolveParam, validParamKeys } from "./registry.js";
 import { closestMatch } from "./util.js";
 import { checkWavHeader } from "./wav.js";
@@ -528,13 +529,3 @@ function checkSamples(project: Project, report: Report): void {
   }
 }
 
-const PITCH_CLASS: Record<string, number> = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
-
-export function pitchToMidi(pitch: string): number | undefined {
-  const match = /^([A-G])(#|b)?(-1|[0-9])$/.exec(pitch);
-  if (!match) return undefined;
-  const base = PITCH_CLASS[match[1]!]!;
-  const accidental = match[2] === "#" ? 1 : match[2] === "b" ? -1 : 0;
-  const octave = Number(match[3]);
-  return base + accidental + (octave + 1) * 12;
-}

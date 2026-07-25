@@ -2,7 +2,7 @@ import type { JsonValue } from "./jsonParse.js";
 import type { Clip, NoteEvent, Project } from "./model.js";
 import { ticksPerBar } from "./musicTime.js";
 import { formatSteps, parseSteps } from "./pattern.js";
-import { pitchToMidi } from "./semantic.js";
+import { pitchToMidi } from "./pitch.js";
 import { serializeCanonical } from "./serialize.js";
 
 /**

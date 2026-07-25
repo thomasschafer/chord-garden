@@ -37,8 +37,8 @@ export {
 export {
   decodeWav,
   encodeWav,
-  writeWav,
   type DecodedWav,
   type PcmBitDepth,
   type WavAudio,
 } from "./render/wav.js";
+export { writeWav } from "./render/wavFile.js";

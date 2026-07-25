@@ -3,16 +3,20 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "tools/*"
   ],
   "scripts": {
-    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli",
-    "typecheck": "npm run build -w @chord-garden/format && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli",
+    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli && npm run build -w @chord-garden/dev-server && npm run build:web",
+    "build:web": "node tools/dev-server/dist/buildWeb.js",
+    "typecheck": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli && npm run typecheck -w @chord-garden/dev-server",
+    "dev": "npm run build && node tools/dev-server/dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   }

@@ -1,0 +1,19 @@
+{
+  "name": "@chord-garden/dev-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "chord-garden-dev": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.tests.json && tsc -p tsconfig.web.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@chord-garden/engine": "*",
+    "@chord-garden/format": "*",
+    "esbuild": "^0.28.1"
+  }
+}

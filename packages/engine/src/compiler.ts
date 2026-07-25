@@ -1,3 +1,6 @@
+// The pure entry, not the package root: the root reaches `node:fs` through
+// `loadProject`, and this module has to bundle for the browser (see the format
+// package's `pure.ts`).
 import {
   parseSteps,
   pitchToMidi,
@@ -10,7 +13,7 @@ import {
   type PatternDoc,
   type Project,
   type TrackDoc,
-} from "@chord-garden/format";
+} from "@chord-garden/format/pure";
 
 export interface CompileOptions {
   /** Defaults to 48000. */

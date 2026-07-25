@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Typecheck only: esbuild does the emitting for the browser, and there is no
+    // second output to keep in step with it.
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // The harness runs in a page, not in Node. Leaving the default `types` in
+    // place would let `@types/node` globals typecheck here and then fail to
+    // bundle, which is exactly the mistake this project keeps hitting.
+    "types": []
+  },
+  "include": ["web", "src/api.ts"]
+}

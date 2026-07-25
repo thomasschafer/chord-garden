@@ -3,3 +3,5 @@ dist/
 render/
 *.tsbuildinfo
 .DS_Store
+
+tools/dev-server/build/
