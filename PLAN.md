@@ -294,6 +294,29 @@ Registry rules:
 - A `drumkit` automation target must name an existing voice (`kick.gain`, not `kik.gain`), validated against the instrument's `kit` map.
 - Third-party engines later need a plugin registry; do not weaken built-in validation to prepare for them.
 
+### 6.3 Headroom is the author's job, not the engine's
+
+*Added after building the Phase 1 renderer, which revealed this by clipping the worked example.*
+
+`gain` defaults to 0 dB (unity), and a resonant filter can output a higher peak than it was fed —
+that is what resonance does. So a single sawtooth voice at velocity 900 through `filter.resonance:
+200` peaks around 1.33, and summing it with drums pushes the master to roughly +3.6 dBFS. Nothing
+is malfunctioning; there is simply no headroom anywhere in the default signal path.
+
+The decision: **the engine never applies hidden gain reduction.** Automatic makeup gain or a
+built-in limiter would make levels unpredictable and un-reasonable-about, which is exactly wrong for
+a format whose whole premise is that an agent can predict the effect of an edit. Instead:
+
+- Authors (human or agent) gain-stage explicitly with `gain`, and the worked example demonstrates
+  this (§8: the bass sits at −1000, i.e. −10 dB).
+- The renderer leaves the float master unclipped so `render --analyze` can *measure* the overshoot;
+  only integer WAV quantisation clamps.
+- `--analyze` reports master clipping as a warning, so an author who overshoots is told, with a
+  number, rather than discovering it by ear.
+
+This is the general principle for the whole engine: surface problems as measurements, never
+silently paper over them.
+
 ## 7. Separate the *musical document* from *engine state*
 
 Only the musical document persists to disk:
@@ -367,12 +390,17 @@ Keeping this boundary clean is what keeps the agent integration sane: the agent 
   "type": "synth",
   "engine": "basic-mono",
   "params": {
-    "oscillator": "sawtooth",
     "filter.cutoff": 800,
-    "filter.resonance": 200
+    "filter.resonance": 200,
+    "gain": -1000,
+    "oscillator": "sawtooth"
   }
 }
 ```
+
+(`params` keys are shown in canonical order — `fmt` sorts them alphabetically, since `params` is an
+open map rather than a fixed-shape object. The `gain: -1000` is −10 dB; see §6.3 for why it is
+there.)
 
 `tracks/pad.json`:
 ```json
@@ -584,6 +612,40 @@ There is deliberately no separate `doctor` command: `validate` itself emits rich
 - `--seed N` seeds the PRNG used to resolve `probability`; the default seed is fixed, so renders are reproducible by default. Seed derivation must be stable per event (hash of seed + track + pattern + event position), so editing one lane does not reshuffle probability outcomes elsewhere.
 - `--analyze` writes a machine-readable JSON report alongside the audio: per-track and master peak/RMS loudness, clipping detection, silence detection ("track rendered but produced silence" is a classic agent failure and must be loud), detected onset times compared against the compiled event schedule (so "kick onsets land on beats 1-2-3-4" is checkable), and a coarse spectral summary (band energies / centroid) per track.
 
+Two design rules the analysis must obey, both learned by getting them wrong first:
+
+- **Look for sound that should not be there, not only sound that should.** An onset check that only
+  counts detected onsets *matching* an expected position can never exceed the expected count, so it
+  hands out a clean bill of health on audio containing extra unscheduled hits — a doubled clip, a
+  runaway ratchet, a choke group that failed to cut. That is confirmation bias encoded into the one
+  signal the agent trusts. Report unmatched detections (`spurious`) alongside unmatched expectations.
+- **A warning that fires on healthy projects is worse than no warning**, because agents learn to skip
+  the `warnings` array wholesale. An energy-rise detector legitimately fires on filter sweeps and
+  automation jumps, so report counts as data always but gate the *warning* behind a named, reported
+  threshold. Every threshold and band edge belongs in the report itself (`parameters`), so the numbers
+  are self-describing and an agent knows what "silent" or "matched" meant without reading our source.
+- **Distinguish "silent with no events" from "silent with events."** The former is normal (the worked
+  example's `pad` track); the latter means the author wrote notes that made no sound, and is the
+  single highest-value warning in the system.
+
+Known limits of onset analysis, recorded so nobody mistakes them for bugs:
+
+- **A voice's envelope peak can lag its note start.** A low-frequency resonant voice (55 Hz through
+  `filter.resonance: 200`) is loudest on its *second* oscillator cycle, ~20 ms in. No rise test can
+  distinguish that from a genuine extra hit 7% louder at the same distance, so candidates within a
+  named maximum attack lag (~30 ms) after a scheduled position are attributed to that event. The cost
+  is a blind spot: genuinely unscheduled sound inside that window is not reported. At 124 BPM that is
+  about a quarter of a 16th note, so ratchets and displaced hits stay visible. This is an explicit
+  engineering judgement, expressed as a named constant and pinned by a test on both sides of the
+  boundary — not a tuning artefact.
+- **Onsets at sample 0 need an implicit silent baseline.** A rise detector that averages only the
+  frames that exist will use the transient itself as its own baseline at the start of a buffer and
+  miss the hit entirely. Nearly every drum pattern starts on beat 1, so this case is the rule rather
+  than the exception. Frames before sample 0 must count as zero energy.
+- **Simultaneous identical events are one observable onset.** Coincident scheduled events collapse,
+  and a doubled clip at the same tick is genuinely indistinguishable in audio from one louder hit —
+  that class of mistake is caught by `describe`, not by listening.
+
 Diagnostics must include file path, JSON pointer or pattern-string span, line/column where available, severity, and a short suggested fix. Agents act much more reliably when they can run one command and see exactly where a mistake is.
 
 Every diagnostic is a structured object — the same shape emitted by `validate` and pushed over the sidecar `diagnosticsChanged` message:
@@ -680,6 +742,7 @@ The overriding constraint: **no human reviews the implementation.** The maintain
 
 - **The format is hardest to change.** Stabilise Phase 0 before building on it. Changing the schema after the UI and engine bind to it is expensive.
 - **Mixed timing units are fatal.** Persist ticks everywhere. Beat/bar floats may appear in UI labels, never in canonical project files.
+- **Never round a duration; difference two rounded positions.** *(Learned the hard way in Phase 1.)* An event spanning ticks [a, b) has `durationSamples = tickToSample(b) - tickToSample(a)`. Rounding the tick *length* on its own leaves one-sample gaps or overlaps between back-to-back events whenever samples-per-tick is non-integer (124 BPM at 960 PPQN and 48 kHz is 750/31), which surfaces as clicks in the render and is miserable to trace back from the audio. The same rule makes ratchets tile their gate exactly by construction, with no remainder-distribution logic. Any future port must preserve this.
 - **Pattern strings must stay deterministic.** `steps` is placement-only; expression lives in sorted `stepEvents`; `fmt` owns spacing and case.
 - **Parameter validation is part of the music model.** Engine params and automation params must be checked against the registry, or agents will silently create broken automation.
 - **Split canonical implementations create invisible divergence.** Keep the parser/formatter/validator in one TypeScript package reused by CLI, UI, sidecar, and tests; keep the DSP core in one package reused by renderer and worklet.

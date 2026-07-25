@@ -20,13 +20,15 @@ time:
 3. `musictool describe <project> --json` — confirms the project now
    contains what you think it contains (track list, pattern bar counts, hit
    counts per lane, note counts and pitch range).
-4. `musictool render <project> --analyze` (arrives in Phase 1) — the real
-   check. `validate` only proves the JSON is well-formed; `render --analyze`
-   proves the result actually sounds like what you intended (onsets land
-   where the pattern says they should, tracks that should be audible aren't
-   silent, nothing is clipping). Until `render` exists, `validate` +
-   `describe` is the full loop — say so if asked to confirm something only
-   audio can prove.
+4. `musictool render <project> --analyze` — the real check. It writes
+   `render/master.wav` and `render/analysis.json` by default, then prints a
+   short summary. Use `--json` for the full report. Read `warnings` first,
+   then check master/track `peakDb`, `rmsDb`, and `clipping`; a track with
+   scheduled events must not be `silent`, `onsets.matched` should equal
+   `onsets.expected`, and `onsets.spurious` should be inspected. A silent
+   track with zero `eventCount` is normal.
+   `validate` only proves the JSON is well-formed; this proves the result
+   actually made sound at the scheduled positions.
 
 Don't consider an edit done until `validate` passes with no errors. Read
 `musictool validate <project>` output for `error`-severity `code` values —

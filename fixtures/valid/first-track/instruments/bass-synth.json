@@ -5,6 +5,7 @@
   "params": {
     "filter.cutoff": 800,
     "filter.resonance": 200,
+    "gain": -1000,
     "oscillator": "sawtooth"
   }
 }
