@@ -1,7 +1,12 @@
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  canonicalFiles,
   loadProject,
   type AutomationDoc,
+  type Clip,
   type DrumkitInstrumentDoc,
   type GridPatternDoc,
   type NotesPatternDoc,
@@ -9,11 +14,16 @@ import {
   type Project,
   type SynthInstrumentDoc,
 } from "@chord-garden/format";
-import { describe, expect, it } from "vitest";
-import { compile } from "../src/index.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { compile, type CompiledNoteEvent, type CompiledSchedule, type CompiledTrack } from "../src/index.js";
 
 const FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/first-track", import.meta.url));
 const SWUNG_HATS_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/swung-hats", import.meta.url));
+const temporaryDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
 interface ProjectOptions {
   pattern: PatternDoc;
@@ -23,6 +33,24 @@ interface ProjectOptions {
   bpm?: number;
   swing?: number;
   automation?: AutomationDoc;
+  /** Replaces the default single clip at tick 0. */
+  clips?: Clip[];
+}
+
+function loadFixture(root: string): Project {
+  const loaded = loadProject(root);
+  expect(loaded.ok).toBe(true);
+  return loaded.project!;
+}
+
+function trackEvents(schedule: CompiledSchedule, trackId: string): CompiledNoteEvent[] {
+  const track = schedule.tracks.find((candidate) => candidate.trackId === trackId);
+  if (track === undefined) throw new Error(`schedule has no track "${trackId}"`);
+  return track.events;
+}
+
+function tracksExcept(schedule: CompiledSchedule, trackId: string): CompiledTrack[] {
+  return schedule.tracks.filter((track) => track.trackId !== trackId);
 }
 
 function makeProject(options: ProjectOptions): Project {
@@ -65,7 +93,7 @@ function makeProject(options: ProjectOptions): Project {
     patterns: new Map([[options.pattern.id, options.pattern]]),
     arrangement: {
       lengthTicks: options.lengthTicks ?? options.pattern.lengthTicks * repeatCount,
-      clips: [{ track: "main-track", pattern: options.pattern.id, startTick: 0, repeatCount }],
+      clips: options.clips ?? [{ track: "main-track", pattern: options.pattern.id, startTick: 0, repeatCount }],
     },
     automation: options.automation === undefined ? new Map() : new Map([["main-track", options.automation]]),
   };
@@ -75,18 +103,34 @@ function notesPattern(notes: NotesPatternDoc["notes"], lengthTicks = 3840): Note
   return { id: "notes-main", kind: "notes", lengthTicks, notes };
 }
 
+function notesPatternOf(project: Project, patternId: string): NotesPatternDoc {
+  const pattern = project.patterns.get(patternId);
+  if (pattern?.kind !== "notes") throw new Error(`fixture pattern "${patternId}" is not a notes pattern`);
+  return pattern;
+}
+
+function pitchOrder(patternJson: string): string[] {
+  const doc = JSON.parse(patternJson) as { notes: { pitch: string }[] };
+  return doc.notes.map((note) => note.pitch);
+}
+
+function copyFixtureToTemporaryDirectory(): string {
+  const root = mkdtempSync(join(tmpdir(), "chord-garden-compiler-"));
+  temporaryDirectories.push(root);
+  cpSync(FIXTURE, root, { recursive: true });
+  return root;
+}
+
 describe("compile", () => {
   it("compiles the worked example to its golden schedule", () => {
-    const loaded = loadProject(FIXTURE);
-    expect(loaded.ok).toBe(true);
-    const schedule = compile(loaded.project!);
+    const schedule = compile(loadFixture(FIXTURE));
     const drums = schedule.tracks[0]!;
     const bass = schedule.tracks[1]!;
     const pad = schedule.tracks[2]!;
 
     expect(schedule.totalSamples).toBe(1_486_452);
     expect(drums.events).toHaveLength(239);
-    expect(bass.events).toHaveLength(17);
+    expect(bass.events).toHaveLength(15);
     expect(pad.events).toHaveLength(0);
     expect(drums.events.filter((event) => event.voice === "kick")).toHaveLength(96);
     expect(drums.events.filter((event) => event.voice === "hat")).toHaveLength(143);
@@ -137,9 +181,7 @@ describe("compile", () => {
   });
 
   it("compiles the swung hats fixture to exact straight and swung offsets", () => {
-    const loaded = loadProject(SWUNG_HATS_FIXTURE);
-    expect(loaded.ok).toBe(true);
-    const events = compile(loaded.project!).tracks[0]!.events;
+    const events = compile(loadFixture(SWUNG_HATS_FIXTURE)).tracks[0]!.events;
     const straight = events.filter((event) => event.voice === "straight-hat").map((event) => event.startSample);
     const swung = events.filter((event) => event.voice === "swung-hat").map((event) => event.startSample);
 
@@ -259,6 +301,148 @@ describe("compile", () => {
     expect(before.filter((event) => event.voice === "stable")).toEqual(
       after.filter((event) => event.voice === "stable"),
     );
+  });
+
+  it("does not re-roll another track's events when an unrelated clip is inserted", () => {
+    const before = compile(loadFixture(FIXTURE));
+    const withExtraClip = loadFixture(FIXTURE);
+    // The fixture's pad track owns no pattern, so the inserted clip borrows the
+    // bass pattern; what matters is that it touches neither drums nor bass.
+    withExtraClip.arrangement.clips.unshift({ track: "pad", pattern: "bass-main", startTick: 0, repeatCount: 1 });
+    const after = compile(withExtraClip);
+
+    expect(trackEvents(after, "drums")).toEqual(trackEvents(before, "drums"));
+    expect(trackEvents(after, "bass")).toEqual(trackEvents(before, "bass"));
+    expect(trackEvents(before, "drums")).toHaveLength(239);
+    expect(trackEvents(before, "bass")).toHaveLength(15);
+    expect(trackEvents(after, "pad")).toHaveLength(3);
+  });
+
+  it("compiles the same schedule whichever order the clips array is in", () => {
+    const reversed = loadFixture(FIXTURE);
+    reversed.arrangement.clips.reverse();
+
+    expect(reversed.arrangement.clips.map((clip) => clip.track)).toEqual(["bass", "drums"]);
+    expect(compile(reversed)).toEqual(compile(loadFixture(FIXTURE)));
+  });
+
+  it("leaves other tracks untouched when a clip is removed or moved", () => {
+    const before = compile(loadFixture(FIXTURE));
+    const withoutDrums = loadFixture(FIXTURE);
+    withoutDrums.arrangement.clips = withoutDrums.arrangement.clips.filter((clip) => clip.track !== "drums");
+    const movedBass = loadFixture(FIXTURE);
+    const bassClip = movedBass.arrangement.clips.find((clip) => clip.track === "bass")!;
+    bassClip.startTick = 7680;
+
+    // Removing the drums clip vacates the array slot the bass clip followed.
+    expect(tracksExcept(compile(withoutDrums), "drums")).toEqual(tracksExcept(before, "drums"));
+    expect(trackEvents(compile(withoutDrums), "drums")).toEqual([]);
+    // Moving a clip may re-roll its own events, but nothing else may move.
+    expect(tracksExcept(compile(movedBass), "bass")).toEqual(tracksExcept(before, "bass"));
+  });
+
+  it("does not re-roll a clip's events when another clip on the same track is inserted", () => {
+    const pattern = notesPattern([
+      { pitch: "C4", startTick: 0, durationTicks: 120, velocity: 800, probability: 500 },
+      { pitch: "E4", startTick: 480, durationTicks: 120, velocity: 800, probability: 500 },
+      { pitch: "G4", startTick: 960, durationTicks: 120, velocity: 800, probability: 500 },
+    ]);
+    const clip = (startTick: number): Clip => ({
+      track: "main-track",
+      pattern: pattern.id,
+      startTick,
+      repeatCount: 1,
+    });
+    const twoClips = makeProject({ pattern, lengthTicks: 11_520, clips: [clip(0), clip(3840)] });
+    const threeClips = makeProject({ pattern, lengthTicks: 11_520, clips: [clip(7680), clip(0), clip(3840)] });
+    const before = compile(twoClips, { seed: 3 }).tracks[0]!.events;
+    const after = compile(threeClips, { seed: 3 }).tracks[0]!.events;
+
+    // Both existing clips must keep exactly their events; the appended clip
+    // starts after them, so they stay a prefix of the sorted schedule.
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(before).toHaveLength(4);
+    expect(after).toHaveLength(6);
+  });
+
+  it("leaves every other note's events untouched when a note is inserted or removed", () => {
+    const before = compile(loadFixture(FIXTURE));
+    const withNote = loadFixture(FIXTURE);
+    // Deliberately non-canonical: this note sorts last musically (tick 7200)
+    // but sits first in the array, which is exactly what `fmt` would move.
+    notesPatternOf(withNote, "bass-main").notes.unshift({
+      pitch: "D2",
+      startTick: 7200,
+      durationTicks: 240,
+      velocity: 800,
+    });
+    const after = compile(withNote);
+    const withoutFirst = loadFixture(FIXTURE);
+    const removed = notesPatternOf(withoutFirst, "bass-main").notes.shift();
+    const afterRemoval = compile(withoutFirst);
+
+    // The event count alone hides this bug and must not stand in for the
+    // comparison: keying on the array index also produced exactly +6 events
+    // here, while silently swapping which C2 events fired.
+    expect(trackEvents(after, "bass")).toHaveLength(trackEvents(before, "bass").length + 6);
+    expect(trackEvents(after, "bass").filter((event) => event.midi === 38)).toHaveLength(6);
+    expect(trackEvents(after, "bass").filter((event) => event.midi !== 38)).toEqual(trackEvents(before, "bass"));
+    expect(tracksExcept(after, "bass")).toEqual(tracksExcept(before, "bass"));
+
+    // Removing the note the probabilistic C2 followed must not re-roll it.
+    expect(removed?.startTick).toBe(0);
+    expect(trackEvents(afterRemoval, "bass")).toHaveLength(trackEvents(before, "bass").length - 6);
+    expect(trackEvents(afterRemoval, "bass").filter((event) => event.midi === 36)).toEqual(
+      trackEvents(before, "bass").filter((event) => event.midi === 36),
+    );
+    expect(tracksExcept(afterRemoval, "bass")).toEqual(tracksExcept(before, "bass"));
+  });
+
+  it("compiles the same schedule whichever order the notes array is in", () => {
+    const reversed = loadFixture(FIXTURE);
+    notesPatternOf(reversed, "bass-main").notes.reverse();
+
+    expect(notesPatternOf(reversed, "bass-main").notes.map((note) => note.startTick)).toEqual([2400, 960, 0]);
+    expect(compile(reversed)).toEqual(compile(loadFixture(FIXTURE)));
+  });
+
+  it("compiles the same schedule after fmt sorts a non-canonically ordered notes array", () => {
+    const root = copyFixtureToTemporaryDirectory();
+    const patternPath = join(root, "patterns", "bass-main.json");
+    const handWritten =
+      JSON.stringify(
+        {
+          id: "bass-main",
+          kind: "notes",
+          lengthTicks: 7680,
+          notes: [
+            { pitch: "D2", startTick: 7200, durationTicks: 240, velocity: 700, probability: 600 },
+            { pitch: "C2", startTick: 2400, durationTicks: 960, velocity: 800, probability: 800 },
+            { pitch: "A1", startTick: 960, durationTicks: 480, velocity: 700, microTicks: -8 },
+            { pitch: "E2", startTick: 2400, durationTicks: 480, velocity: 700, probability: 400 },
+            { pitch: "A1", startTick: 0, durationTicks: 720, velocity: 900 },
+          ],
+        },
+        null,
+        2,
+      ) + "\n";
+    writeFileSync(patternPath, handWritten);
+
+    const project = loadFixture(root);
+    const before = compile(project, { seed: 5 });
+    const canonical = canonicalFiles(project);
+    const canonicalPattern = canonical.get("patterns/bass-main.json");
+    if (canonicalPattern === undefined) throw new Error("canonicalFiles produced no bass pattern");
+    for (const [relativePath, contents] of canonical) writeFileSync(join(root, relativePath), contents);
+    const after = compile(loadFixture(root), { seed: 5 });
+
+    // Guards against a vacuous pass: fmt must really have reordered the notes,
+    // and probability must really be dropping some of them (5 notes over 6
+    // repetitions would otherwise schedule 30 events).
+    expect(pitchOrder(canonicalPattern)).not.toEqual(pitchOrder(handWritten));
+    expect(pitchOrder(canonicalPattern)).toEqual(["A1", "A1", "C2", "E2", "D2"]);
+    expect(trackEvents(before, "bass")).toHaveLength(22);
+    expect(after).toEqual(before);
   });
 
   it("clips automation and supplies interpolated range boundaries", () => {

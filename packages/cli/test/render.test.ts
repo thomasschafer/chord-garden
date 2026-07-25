@@ -90,8 +90,8 @@ describe("render CLI", () => {
     expect(result.code).toBe(0);
     expect(drums.onsets.expected).toBe(191);
     expect(drums.onsets.matched).toBe(191);
-    expect(bass.onsets.expected).toBe(17);
-    expect(bass.onsets.matched).toBe(17);
+    expect(bass.onsets.expected).toBe(15);
+    expect(bass.onsets.matched).toBe(15);
     expect(drums.onsets.spurious).toBeLessThan(report.parameters.onset.spurious.warning.minimumCount);
     expect(bass.onsets.spurious).toBeLessThan(report.parameters.onset.spurious.warning.minimumCount);
     expect(report.parameters.onset.reportsScheduleMatchedCandidatesOnly).toBe(false);

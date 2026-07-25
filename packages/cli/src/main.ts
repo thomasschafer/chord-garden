@@ -12,15 +12,9 @@ import {
 } from "@chord-garden/format";
 import { compile, render, writeWav } from "@chord-garden/engine";
 import { analyzeRender, type AnalysisReport } from "./analysis.js";
+import { fmtAspects, type FmtAspect } from "./fmtAspects.js";
 
-const USAGE = `usage:
-  musictool validate <project> [--json]   check schema, pattern grammar, and semantic rules
-  musictool fmt <project> [--check]       rewrite files to canonical bytes (--check: report only)
-  musictool describe <project> [--json]   summarise the project
-  musictool render <project> [flags]       deterministically render a project to WAV
-
-render flags:
-  --out <path>         master WAV path (default: <project>/render/master.wav)
+const RENDER_FLAGS = `  --out <path>         master WAV path (default: <project>/render/master.wav)
   --bars <start>-<end> render zero-based bars in [start, end); start inclusive, end exclusive
   --stems              also write <outdir>/stems/<track>.wav
   --seed <n>           integer probability seed (default: 0)
@@ -28,6 +22,52 @@ render flags:
   --json               with --analyze, print the analysis JSON instead of the summary
   --sample-rate <n>    positive integer sample rate (default: 48000)
   --tail <seconds>     non-negative release tail (default: 2)
+`;
+
+const USAGE = `usage:
+  musictool validate <project> [--json]   check schema, pattern grammar, and semantic rules
+  musictool fmt <project> [--check]       rewrite files to canonical bytes (--check: report only)
+  musictool describe <project> [--json]   summarise the project
+  musictool render <project> [flags]      deterministically render a project to WAV
+
+render flags:
+${RENDER_FLAGS}`;
+
+const RENDER_USAGE = `usage:
+  musictool render <project> [flags]
+
+Renders the whole arrangement (or --bars) to a 24-bit stereo PCM WAV at the
+--sample-rate, plus a release tail. Stems use the same format. Renders are
+deterministic: the same project, seed, and sample rate give byte-identical
+audio.
+
+flags:
+${RENDER_FLAGS}
+analysis report (--analyze) — written to <outdir>/analysis.json and printed by
+--json. The signal fields appear both on "master" and on each entry of
+"tracks"; the onset, event, and spectral fields are per track:
+  warnings           the list to read first; empty means nothing was flagged
+  peakDb             loudest sample, dBFS; measured before WAV quantisation
+  rmsDb              average level, dBFS; null means exactly silent
+  clipping           .clipped, .sampleCount, .firstSampleIndex for samples
+                     past |1.0|
+  eventCount         events the compiler scheduled for the track, after
+                     "probability" has been resolved with the seed
+  onsets.expected    distinct sample positions those events start at, so
+                     coincident events count once
+  onsets.matched     expected positions a detected onset landed on; equal to
+                     .detected. Below .expected means scheduled sound is
+                     missing, and .unmatchedExpected lists where
+  onsets.spurious    detected attacks matching no scheduled position (a
+                     doubled clip, a runaway ratchet); .spuriousPositions
+                     gives sample offsets to seek to
+  silent             peak below parameters.silencePeakThreshold. Silent with a
+                     nonzero eventCount is a warning; silent with zero events
+                     is normal
+  spectral           .centroidHz and energy .share per band in .bands
+  parameters         every threshold, window, and band edge the report used,
+                     so the numbers above are self-describing
+  seed, barRange     what was rendered, echoed back
 `;
 
 export interface CliIo {
@@ -42,7 +82,7 @@ if (isDirectExecution()) process.exitCode = runCli(process.argv.slice(2));
 export function runCli(args: readonly string[], io: CliIo = PROCESS_IO): number {
   const [command, ...rest] = args;
   if (rest.includes("--help") || command === "--help" || command === "-h") {
-    io.stdout.write(USAGE);
+    io.stdout.write(command === "render" ? RENDER_USAGE : USAGE);
     return 0;
   }
   const flags = new Set(rest.filter((a) => a.startsWith("--")));
@@ -93,7 +133,7 @@ function runFmt(root: string, checkOnly: boolean, io: CliIo): number {
     io.stderr.write("fmt refused: fix validation errors first\n");
     return 1;
   }
-  const changed: string[] = [];
+  const changed: { path: string; aspects: FmtAspect[] }[] = [];
   for (const [path, canonical] of canonicalFiles(result.project)) {
     const absolute = join(root, path);
     let current: string | undefined;
@@ -103,7 +143,7 @@ function runFmt(root: string, checkOnly: boolean, io: CliIo): number {
       current = undefined;
     }
     if (current !== canonical) {
-      changed.push(path);
+      changed.push({ path, aspects: fmtAspects(current, canonical) });
       if (!checkOnly) writeFileSync(absolute, canonical);
     }
   }
@@ -111,8 +151,8 @@ function runFmt(root: string, checkOnly: boolean, io: CliIo): number {
     io.stdout.write("already canonical\n");
     return 0;
   }
-  for (const path of changed) {
-    io.stdout.write(`${checkOnly ? "would rewrite" : "rewrote"} ${path}\n`);
+  for (const { path, aspects } of changed) {
+    io.stdout.write(`${checkOnly ? "would rewrite" : "rewrote"} ${path} (${aspects.join(", ")})\n`);
   }
   return checkOnly ? 1 : 0;
 }

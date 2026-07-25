@@ -67,14 +67,51 @@ interface CompileContext {
   totalSamples: number;
 }
 
+/**
+ * The per-event key that seeds probability resolution. Every component is a
+ * musical coordinate; no array position appears anywhere, on purpose.
+ *
+ * The clip contributes its `startTick` rather than its index in
+ * `arrangement.clips`: `clips` is a set, so array position is not a property
+ * of the music, and canonical order (startTick, then track) does not even
+ * totally order it. Keying on the index made inserting or reordering any clip
+ * re-roll which events fire on every *other* clip and track, which breaks the
+ * guarantee that one edit changes one thing (PLAN.md §13). `startTick` is a
+ * musical position, so moving a clip re-rolls only that clip's own events.
+ *
+ * A note contributes its own coordinates for the same reason (see
+ * `PatternEventKey`): `notes` is a set too, and `fmt` sorts it.
+ */
 interface EventIdentity {
   trackId: string;
   patternId: string;
-  clipIndex: number;
+  clipStartTick: number;
   repeatIndex: number;
-  laneName: string;
-  eventIndex: number;
+  event: PatternEventKey;
 }
+
+/**
+ * Which event *within* a pattern is rolling. The obvious key — the event's
+ * index in its array — is wrong for `notes`, and the trap is worth naming:
+ * `fmt` sorts `notes` into canonical order, so an index-keyed identity let a
+ * format run silently change which probabilistic notes fire, i.e. change the
+ * music an agent had already verified. `startTick` + `midi` + `durationTicks`
+ * is exactly the canonical sort key (see `canonicalFiles`), so two notes
+ * collide in the identity only when canonical order ties them — in which case
+ * array position is not a well-defined property of the project and cannot be
+ * keyed on at all. Such a pair rolls together, which is what near-duplicates
+ * at one position and pitch should do (docs/format-spec.md §5).
+ *
+ * `pitch` enters as its MIDI number, not its spelling, so respelling `A#1` as
+ * `Bb1` cannot re-roll a note.
+ *
+ * Grid lanes keep their `step`, which is already a musical position within the
+ * bar rather than an array position, and is stable under every `fmt` rule
+ * (`steps` regrouping and `stepEvents` sorting both preserve step numbers).
+ */
+type PatternEventKey =
+  | { kind: "step"; laneName: string; step: number }
+  | { kind: "note"; startTick: number; midi: number; durationTicks: number };
 
 export function compile(project: Project, options: Partial<CompileOptions> = {}): CompiledSchedule {
   const sampleRate = options.sampleRate ?? 48_000;
@@ -165,9 +202,9 @@ function compileTrack(context: CompileContext, trackId: string): CompiledTrack {
     for (let repeatIndex = 0; repeatIndex < clip.repeatCount; repeatIndex++) {
       const repetitionStartTick = clip.startTick + repeatIndex * pattern.lengthTicks;
       if (pattern.kind === "grid") {
-        compileGridPattern(context, track, instrument, pattern, clipIndex, repeatIndex, repetitionStartTick, events);
+        compileGridPattern(context, track, instrument, pattern, clip.startTick, repeatIndex, repetitionStartTick, events);
       } else {
-        compileNotesPattern(context, track, pattern, clipIndex, repeatIndex, repetitionStartTick, events);
+        compileNotesPattern(context, track, pattern, clip.startTick, repeatIndex, repetitionStartTick, events);
       }
     }
   });
@@ -195,7 +232,7 @@ function compileGridPattern(
   track: TrackDoc,
   instrument: InstrumentDoc,
   pattern: GridPatternDoc,
-  clipIndex: number,
+  clipStartTick: number,
   repeatIndex: number,
   repetitionStartTick: number,
   output: CompiledNoteEvent[],
@@ -243,10 +280,9 @@ function compileGridPattern(
       const identity: EventIdentity = {
         trackId: track.id,
         patternId: pattern.id,
-        clipIndex,
+        clipStartTick,
         repeatIndex,
-        laneName: lane.lane,
-        eventIndex: step,
+        event: { kind: "step", laneName: lane.lane, step },
       };
       if (!fires(context.seed, identity, probability)) continue;
       emitRatchets(
@@ -267,7 +303,7 @@ function compileNotesPattern(
   context: CompileContext,
   track: TrackDoc,
   pattern: NotesPatternDoc,
-  clipIndex: number,
+  clipStartTick: number,
   repeatIndex: number,
   repetitionStartTick: number,
   output: CompiledNoteEvent[],
@@ -280,10 +316,14 @@ function compileNotesPattern(
     const identity: EventIdentity = {
       trackId: track.id,
       patternId: pattern.id,
-      clipIndex,
+      clipStartTick,
       repeatIndex,
-      laneName: "",
-      eventIndex: noteIndex,
+      event: {
+        kind: "note",
+        startTick: note.startTick,
+        midi,
+        durationTicks: note.durationTicks,
+      },
     };
     if (!fires(context.seed, identity, note.probability ?? 1000)) return;
     emitRatchets(
@@ -335,15 +375,13 @@ function emitRatchets(
 function fires(seed: number, identity: EventIdentity, probability: number): boolean {
   if (probability === 1000) return true;
   if (probability === 0) return false;
-  const key = JSON.stringify([
-    seed,
-    identity.trackId,
-    identity.patternId,
-    identity.clipIndex,
-    identity.repeatIndex,
-    identity.laneName,
-    identity.eventIndex,
-  ]);
+  const where = [seed, identity.trackId, identity.patternId, identity.clipStartTick, identity.repeatIndex];
+  const event = identity.event;
+  const key = JSON.stringify(
+    event.kind === "step"
+      ? [...where, event.laneName, event.step]
+      : [...where, event.startTick, event.midi, event.durationTicks],
+  );
   return fnv1a(key) / 0x1_0000_0000 < probability / 1000;
 }
 
