@@ -31,6 +31,22 @@ time:
    actually made sound at the scheduled positions. `musictool render --help`
    lists the flags and what each analysis field means.
 
+   A drumkit track's numbers are its whole kit mixed together, and coincident
+   hits collapse into one onset — a kick landing on a hat adds no distinct
+   expected onset, so the kick can be nearly invisible in the track's counts.
+   Each drumkit track therefore also carries `voices`: one entry per kit voice,
+   with its own `eventCount`, `peakDb`, `silent`, and `onsets`, measured by
+   running the same detector over that voice's own audio. A voice is the kit
+   entry and the pattern lane that drives it under one name
+   (`docs/format-spec.md` §6), so checking one lane of a drum pattern means
+   reading its voice here — "the kick lands on every beat" is that voice's
+   `onsets`, with no `--stems` and no copy of the project with the other lanes
+   deleted. Every `onsets` object lists the scheduled sample positions in
+   `expectedPositions`, and the report's `musicalGrid` gives `barPositions` and
+   `beatPositions` for the rendered range, so checking alignment is comparing
+   two lists rather than doing arithmetic over tempo and ppqn. A voice with
+   scheduled events that renders silent is warned about by name.
+
 Don't consider an edit done until `validate` passes with no errors. Read
 `musictool validate <project>` output for `error`-severity `code` values —
 they're stable identifiers, not prose to parse loosely.
@@ -40,13 +56,20 @@ Three things about the render that look like bugs and aren't:
 - **The output is 24-bit stereo PCM WAV**, at `--sample-rate` (default 48000),
   for the master and for each `--stems` file, whatever bit depth, channel count,
   or rate the input samples have. Decoding it as 16-bit gives noise, not audio.
+  `--stems` writes `stems/<track>.wav` for every track and, for a drumkit track,
+  also `stems/<track>.<voice>.wav` per kit voice; the per-voice files sum back to
+  their track's stem to within 24-bit rounding, since each file is quantised on
+  its own.
 - **`onsets.expected` already accounts for `probability`.** It counts the
   distinct sample positions of the events the compiler actually scheduled —
   after probability was resolved, with coincident events collapsed to one. A
   pattern holding 18 notes, one of them at `probability: 800`, legitimately
   reports `17 events, onsets 17/17`. That is a pass; don't go hunting for the
   missing note. The real failure is `matched` below `expected`, and
-  `unmatchedExpected` lists the positions that produced no sound.
+  `unmatchedExpected` lists the positions that produced no sound. Collapsing is
+  also why a drumkit track's onset counts sit below its `eventCount` — the
+  worked example's `drums` reports `239 events, onsets 191/191` — while a voice
+  collapses only against itself, so a voice's `expected` is its own hits.
 - **`--seed` changes which probabilistic events fire.** It defaults to 0, so a
   render is reproducible, but event and onset counts move with the seed. Keep
   one seed while iterating, and don't read a count change after a seed change as

@@ -125,9 +125,12 @@ index. A `stepEvents` entry may only target a step that is actually a hit;
 targeting a rest is an error (`pattern.step-event-not-a-hit`).
 
 A lane's `lane` name is not free text: it must be a key in the `kit` map of the
-instrument used by the track that plays this pattern (§6). A name that isn't is
-an error, `pattern.lane-unknown-voice`, with a "did you mean" suggestion. The
-check runs per track→pattern reference, so a pattern reached by two tracks is
+instrument used by the track that plays this pattern (§6). In that map the same
+name is a *voice*: lane and voice are one identifier seen from the pattern side
+and the instrument side, and it is the voice that params, stems, and analysis
+name (§6). A name that isn't a kit key is an error,
+`pattern.lane-unknown-voice`, with a "did you mean" suggestion. The check runs
+per track→pattern reference, so a pattern reached by two tracks is
 checked against both kits, and a pattern no track references is not checked at
 all (it is already reported as `orphan.pattern`).
 
@@ -287,6 +290,12 @@ Shared subtractive params, valid on both `basic-mono` and `basic-poly`:
 `drumkit` params are namespaced per kit voice, `<voice>.<param>`, where
 `<voice>` must be a key in the instrument's `kit` map (`kick.gain`, not
 `kik.gain`). There are no kit-wide drumkit params: everything is per voice.
+A voice is what a grid pattern's lane of the same name plays (§5): the lane holds
+the hits, the voice makes the sound. The voice is therefore the unit a render can
+isolate — `render --analyze` reports each voice's own level and onsets under its
+track's `voices`, so one lane of a kit can be verified on its own audio, and
+`--stems` writes it as `stems/<track>.<voice>.wav` (`musictool render --help`,
+`AGENTS.md`).
 
 | param | unit | range | default | automatable |
 |---|---|---|---|---|

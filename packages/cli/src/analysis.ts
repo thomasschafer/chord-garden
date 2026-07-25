@@ -1,4 +1,4 @@
-import type { CompiledSchedule, StereoAudio } from "@chord-garden/engine";
+import type { CompiledSchedule, CompiledTrack, MusicalGrid, StereoAudio } from "@chord-garden/engine";
 
 export const SILENCE_PEAK_THRESHOLD = 0.001;
 export const CLIPPING_THRESHOLD = 1;
@@ -35,6 +35,17 @@ export const SPURIOUS_ONSET_ENERGY_RISE_RATIO = 1.15;
 export const SPURIOUS_MAX_ATTACK_LAG_MS = 30;
 export const UNMATCHED_EXPECTED_LIMIT = 32;
 export const SPURIOUS_POSITIONS_LIMIT = 32;
+/**
+ * How many expected onset positions a report lists. Larger than the failure
+ * lists above on purpose: those describe what went wrong, while this one is the
+ * schedule itself and is read when nothing is wrong at all — an agent asking
+ * "where does this voice actually play?" wants the whole answer. 256 covers every
+ * sixteenth of a 16-bar loop, so the common case is complete; beyond that the
+ * list is truncated, which is visible as `expectedPositions.length < expected`.
+ */
+export const EXPECTED_POSITIONS_LIMIT = 256;
+/** Same reasoning as EXPECTED_POSITIONS_LIMIT, applied to the bar/beat ruler. */
+export const GRID_POSITIONS_LIMIT = 256;
 export const SPURIOUS_WARNING_MINIMUM_COUNT = 8;
 export const SPURIOUS_WARNING_EXPECTED_RATIO = 0.25;
 export const SPECTRAL_BAND_EDGES_HZ = [20, 80, 250, 800, 2_500, 8_000, 20_000] as const;
@@ -72,6 +83,15 @@ export interface OnsetAnalysis {
   spurious: number;
   meanOffsetSamples: number;
   maxOffsetSamples: number;
+  /**
+   * Every scheduled position sound was expected at, capped by
+   * parameters.onset.expectedPositionsLimit. Compare against
+   * musicalGrid.beatPositions to check beat alignment without arithmetic.
+   *
+   * The matched positions are not listed separately because they are exactly
+   * these positions minus `unmatchedExpected`.
+   */
+  expectedPositions: number[];
   unmatchedExpected: number[];
   /**
    * Sample positions for spurious candidates, capped by
@@ -93,11 +113,58 @@ export interface SpectralAnalysis {
   bands: SpectralBandAnalysis[];
 }
 
+/**
+ * One kit voice of a drumkit track, measured on that voice's own audio rather
+ * than inferred from the schedule. The voice name is the same identifier a grid
+ * pattern's lane carries (docs/format-spec.md §6).
+ *
+ * A track's numbers mix its voices together, and
+ * parameters.onset.coincidentEventsCollapsed then hides a voice inside them: a
+ * kick landing on a hat contributes no distinct expected onset, so a kick can be
+ * absent from a track's onset counts entirely. Within one voice there is far
+ * less to collapse, so a voice's expected onsets are its own hits.
+ */
+export interface VoiceAnalysis {
+  voice: string;
+  eventCount: number;
+  peak: number;
+  /** Null represents negative infinity for an exactly silent voice. */
+  peakDb: number | null;
+  silent: boolean;
+  onsets: OnsetAnalysis;
+}
+
 export interface TrackAnalysis extends SignalAnalysis {
   id: string;
   eventCount: number;
   onsets: OnsetAnalysis;
   spectral: SpectralAnalysis;
+  /**
+   * Drumkit tracks only, one entry per kit voice in kit order; absent on synth
+   * tracks, which have no voices to separate. The voice eventCounts sum to the
+   * track's, but the onset counts do not: coincident hits collapse per voice and
+   * again in the mix.
+   */
+  voices?: VoiceAnalysis[];
+}
+
+/**
+ * Where the bars and beats of the rendered range fall, in samples, so "is this
+ * on the beat?" is a comparison against onsets.expectedPositions rather than
+ * arithmetic over tempo and ppqn. Null when the caller supplied no grid.
+ */
+export interface MusicalGridAnalysis {
+  /** Zero-based bar number of the first rendered bar: the `--bars` start. */
+  startBar: number;
+  beatsPerBar: number;
+  /** Bars starting inside the range, before positionsLimit truncation. */
+  bars: number;
+  /** Beats starting inside the range, before positionsLimit truncation. */
+  beats: number;
+  /** Capped by parameters.musicalGrid.positionsLimit; `[0]` is 0. */
+  barPositions: number[];
+  /** Capped by parameters.musicalGrid.positionsLimit; `[0]` is 0. */
+  beatPositions: number[];
 }
 
 /**
@@ -134,6 +201,9 @@ export interface AnalysisParameters {
     coincidentEventsCollapsed: true;
     reportsScheduleMatchedCandidatesOnly: false;
     unmatchedExpectedLimit: number;
+    expectedPositionsLimit: number;
+    /** Voice onsets run the same detector over one kit voice's isolated audio. */
+    perVoiceDetectionIsAcoustic: true;
     spurious: {
       detector: "short-window-peak-envelope-rise";
       windowSamples: number;
@@ -164,6 +234,9 @@ export interface AnalysisParameters {
     maxFrames: number;
     bandEdgesHz: number[];
   };
+  musicalGrid: {
+    positionsLimit: number;
+  };
 }
 
 export interface AnalysisReport {
@@ -173,6 +246,7 @@ export interface AnalysisReport {
   barRange: { start: number; end: number } | null;
   totalSamples: number;
   durationSeconds: number;
+  musicalGrid: MusicalGridAnalysis | null;
   parameters: AnalysisParameters;
   master: SignalAnalysis;
   tracks: TrackAnalysis[];
@@ -182,6 +256,8 @@ export interface AnalysisReport {
 export interface AnalyzeOptions {
   seed: number;
   barRange?: { start: number; end: number };
+  /** From `musicalGrid(project, …)`; reported so onset positions read musically. */
+  musicalGrid?: MusicalGrid;
 }
 
 interface OnsetCandidate {
@@ -199,6 +275,8 @@ export function analyzeRender(
   stems: ReadonlyMap<string, StereoAudio>,
   schedule: CompiledSchedule,
   options: AnalyzeOptions,
+  /** Per-kit-voice audio from `render`, keyed track then voice; see VoiceAnalysis. */
+  voices: ReadonlyMap<string, ReadonlyMap<string, StereoAudio>> = new Map(),
 ): AnalysisReport {
   const parameters = analysisParameters(schedule.sampleRate);
   const warnings: string[] = [];
@@ -213,23 +291,24 @@ export function analyzeRender(
     const audio = stems.get(track.trackId);
     if (audio === undefined) throw new Error(`cannot analyze: rendered stem for track "${track.trackId}" is missing`);
     const signal = analyzeSignal(audio);
-    const expectedPositions = uniqueSorted(track.events.map((event) => event.startSample));
-    const detectedPositions = detectOnsets(audio, schedule.sampleRate);
-    const spuriousCandidatePositions = detectSpuriousOnsets(audio, schedule.sampleRate);
-    const onsets = matchOnsets(
-      expectedPositions,
-      detectedPositions,
-      spuriousCandidatePositions,
-      parameters.onset.toleranceSamples,
-      parameters.onset.spurious.attribution,
+    const onsets = analyzeOnsets(
+      audio,
+      uniqueSorted(track.events.map((event) => event.startSample)),
+      schedule.sampleRate,
+      parameters,
     );
+    const trackVoices = voices.get(track.trackId);
+    const voiceAnalyses =
+      trackVoices === undefined ? undefined : analyzeVoices(track, trackVoices, schedule.sampleRate, parameters);
 
-    if (track.events.length > 0 && signal.silent) {
+    const silentWithEvents = track.events.length > 0 && signal.silent;
+    const onsetMismatch = onsets.matched !== onsets.expected;
+    if (silentWithEvents) {
       warnings.push(
         `Track "${track.trackId}": events but silent (${track.events.length} scheduled; peak ${formatMetric(signal.peak)} is below ${SILENCE_PEAK_THRESHOLD}).`,
       );
     }
-    if (onsets.matched !== onsets.expected) {
+    if (onsetMismatch) {
       warnings.push(
         `Track "${track.trackId}": onset mismatch (matched ${onsets.matched} of ${onsets.expected} expected positions; ${onsets.expected - onsets.matched} unmatched).`,
       );
@@ -239,6 +318,7 @@ export function analyzeRender(
         `Track "${track.trackId}": disproportionate spurious onsets (${onsets.spurious} spurious for ${onsets.expected} expected; warning requires at least ${SPURIOUS_WARNING_MINIMUM_COUNT} and either no expected positions or more than ${SPURIOUS_WARNING_EXPECTED_RATIO * 100}% of expected).`,
       );
     }
+    warnings.push(...voiceWarnings(track.trackId, voiceAnalyses ?? [], { silentWithEvents, onsetMismatch }));
 
     return {
       id: track.trackId,
@@ -246,6 +326,7 @@ export function analyzeRender(
       ...signal,
       onsets,
       spectral: analyzeSpectrum(audio, schedule.sampleRate),
+      ...(voiceAnalyses === undefined ? {} : { voices: voiceAnalyses }),
     };
   });
 
@@ -256,10 +337,83 @@ export function analyzeRender(
     barRange: options.barRange ?? null,
     totalSamples: master.left.length,
     durationSeconds: master.left.length / schedule.sampleRate,
+    musicalGrid: options.musicalGrid === undefined ? null : gridAnalysis(options.musicalGrid),
     parameters,
     master: masterAnalysis,
     tracks,
     warnings,
+  };
+}
+
+function analyzeVoices(
+  track: CompiledTrack,
+  voices: ReadonlyMap<string, StereoAudio>,
+  sampleRate: number,
+  parameters: AnalysisParameters,
+): VoiceAnalysis[] {
+  for (const event of track.events) {
+    if (event.voice === undefined || !voices.has(event.voice)) {
+      throw new Error(
+        `cannot analyze: track "${track.trackId}" schedules voice "${event.voice ?? "(none)"}" but no audio was rendered for it`,
+      );
+    }
+  }
+  return [...voices].map(([voice, audio]): VoiceAnalysis => {
+    const events = track.events.filter((event) => event.voice === voice);
+    const signal = analyzeSignal(audio);
+    return {
+      voice,
+      eventCount: events.length,
+      peak: signal.peak,
+      peakDb: signal.peakDb,
+      silent: signal.silent,
+      onsets: analyzeOnsets(audio, uniqueSorted(events.map((event) => event.startSample)), sampleRate, parameters),
+    };
+  });
+}
+
+/**
+ * Voice warnings say only what a track warning cannot. A silent voice inside an
+ * audible track is invisible in the track's numbers and is as serious as a
+ * silent track, so it warns; when the whole track is already flagged silent, or
+ * its onsets already mismatch, the track warning is the same finding at a
+ * coarser grain and the voice stays data only. A silent voice's onsets are all
+ * unmatched by construction, so it warns once, about the silence.
+ *
+ * Voice spurious counts are reported but never warn: the track-level rule
+ * already covers unscheduled sound, and a second gate on a thinner signal is how
+ * a warning starts firing on healthy projects (PLAN.md §13).
+ */
+function voiceWarnings(
+  trackId: string,
+  voices: readonly VoiceAnalysis[],
+  trackWarned: { silentWithEvents: boolean; onsetMismatch: boolean },
+): string[] {
+  const warnings: string[] = [];
+  for (const voice of voices) {
+    if (voice.eventCount > 0 && voice.silent) {
+      if (!trackWarned.silentWithEvents) {
+        warnings.push(
+          `Track "${trackId}" voice "${voice.voice}": events but silent (${voice.eventCount} scheduled; peak ${formatMetric(voice.peak)} is below ${SILENCE_PEAK_THRESHOLD}).`,
+        );
+      }
+    } else if (!trackWarned.onsetMismatch && voice.onsets.matched !== voice.onsets.expected) {
+      warnings.push(
+        `Track "${trackId}" voice "${voice.voice}": onset mismatch (matched ${voice.onsets.matched} of ${voice.onsets.expected} expected positions; ${voice.onsets.expected - voice.onsets.matched} unmatched).`,
+      );
+    }
+  }
+  return warnings;
+}
+
+function gridAnalysis(grid: MusicalGrid): MusicalGridAnalysis {
+  return {
+    startBar: grid.startBar,
+    beatsPerBar: grid.beatsPerBar,
+    bars: grid.barStarts.length,
+    beats: grid.beatStarts.length,
+    barPositions: grid.barStarts.slice(0, GRID_POSITIONS_LIMIT),
+    beatPositions: grid.beatStarts.slice(0, GRID_POSITIONS_LIMIT),
   };
 }
 
@@ -283,6 +437,8 @@ function analysisParameters(sampleRate: number): AnalysisParameters {
       coincidentEventsCollapsed: true,
       reportsScheduleMatchedCandidatesOnly: false,
       unmatchedExpectedLimit: UNMATCHED_EXPECTED_LIMIT,
+      expectedPositionsLimit: EXPECTED_POSITIONS_LIMIT,
+      perVoiceDetectionIsAcoustic: true,
       spurious: {
         detector: "short-window-peak-envelope-rise",
         windowSamples: spuriousWindowSamples,
@@ -307,6 +463,9 @@ function analysisParameters(sampleRate: number): AnalysisParameters {
       fftSize: FFT_SIZE,
       maxFrames: SPECTRAL_MAX_FRAMES,
       bandEdgesHz: [...SPECTRAL_BAND_EDGES_HZ],
+    },
+    musicalGrid: {
+      positionsLimit: GRID_POSITIONS_LIMIT,
     },
   };
 }
@@ -512,6 +671,21 @@ function spuriousAttribution(sampleRate: number, tolerance: number): SpuriousAtt
   };
 }
 
+function analyzeOnsets(
+  audio: StereoAudio,
+  expectedPositions: number[],
+  sampleRate: number,
+  parameters: AnalysisParameters,
+): OnsetAnalysis {
+  return matchOnsets(
+    expectedPositions,
+    detectOnsets(audio, sampleRate),
+    detectSpuriousOnsets(audio, sampleRate),
+    parameters.onset.toleranceSamples,
+    parameters.onset.spurious.attribution,
+  );
+}
+
 function matchOnsets(
   expected: number[],
   detected: number[],
@@ -558,6 +732,7 @@ function matchOnsets(
     spurious: spuriousPositions.length,
     meanOffsetSamples: meanOffset,
     maxOffsetSamples: maxOffset,
+    expectedPositions: expected.slice(0, EXPECTED_POSITIONS_LIMIT),
     unmatchedExpected: unmatched,
     spuriousPositions: spuriousPositions.slice(0, SPURIOUS_POSITIONS_LIMIT),
   };

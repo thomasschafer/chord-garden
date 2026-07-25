@@ -5,6 +5,7 @@ export { Oscillator, type OscillatorShape } from "./oscillator.js";
 export {
   DrumkitProcessor,
   type DrumHitCommand,
+  type DrumVoiceOutputs,
   type DrumVoiceSettings,
   type SampleData,
 } from "./sampler.js";

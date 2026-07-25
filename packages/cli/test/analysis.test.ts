@@ -68,6 +68,27 @@ describe("scheduled onset detection", () => {
   });
 });
 
+describe("expected onset positions", () => {
+  it("lists the scheduled positions and matches the offsets reported against them", () => {
+    const starts = [0, TRANSIENT_SPACING, 2 * TRANSIENT_SPACING];
+    const track = trackOf(analyze(starts, starts));
+
+    expect(track.onsets.expectedPositions).toEqual(starts);
+    expect(track.onsets.unmatchedExpected).toEqual([]);
+  });
+
+  it("caps the list at the reported limit and leaves the truncation visible", () => {
+    const scheduled = Array.from({ length: 300 }, (_, index) => index * 160);
+    const report = analyze([], scheduled);
+    const onsets = trackOf(report).onsets;
+    const limit = report.parameters.onset.expectedPositionsLimit;
+
+    expect(onsets.expected).toBe(scheduled.length);
+    expect(onsets.expectedPositions).toEqual(scheduled.slice(0, limit));
+    expect(onsets.expectedPositions.length).toBeLessThan(onsets.expected);
+  });
+});
+
 describe("spurious onset positions", () => {
   it("places reported positions within the documented tolerance of the real transients", () => {
     const unscheduled = [TRANSIENT_SPACING, 2 * TRANSIENT_SPACING, 3 * TRANSIENT_SPACING, 4 * TRANSIENT_SPACING];

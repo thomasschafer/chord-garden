@@ -758,6 +758,7 @@ The overriding constraint: **no human reviews the implementation.** The maintain
 - **External edits are not local undo.** Treat accepted external changes as a new baseline unless a later collaboration model deliberately changes that policy.
 - **Sidecar security.** Localhost filesystem tools are attack surfaces. Token auth, Host/Origin checks, path confinement, message limits, and atomic writes are not optional, and each needs a test (path escape attempts, missing token, bad Origin).
 - **Don't let agent-legibility distort the musical model.** Keep ticks, swing, micro-timing first-class even though they make the schema less tidy.
+- **Per-voice render buffers scale with kit size.** *(Noted in Phase 1, deliberately not solved.)* `render --analyze` holds one full-length stereo buffer per track *and* per kit voice so a drum voice can be measured on its own audio; a 12-voice kit over five minutes is roughly 1.4 GB. Agents overwhelmingly render `--bars` ranges, which is the mitigation; if it ever bites, the fix is to produce and analyse voices one at a time rather than all at once, not to drop per-voice analysis.
 - **Sample portability.** Always project-relative paths; never absolute (the REAPER mistake).
 - **Fixture drift.** The worked example is a contract. Keep valid fixtures complete and invalid fixtures intentionally broken.
 

@@ -3,7 +3,9 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,11 +14,16 @@ import { fileURLToPath } from "node:url";
 import { loadProject } from "@chord-garden/format";
 import { compile, decodeWav, encodeWav } from "@chord-garden/engine";
 import { afterEach, describe, expect, it } from "vitest";
-import { type AnalysisReport } from "../src/analysis.js";
+import { type AnalysisReport, type TrackAnalysis, type VoiceAnalysis } from "../src/analysis.js";
 import { runCli, type CliIo } from "../src/main.js";
 
 const VALID_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/first-track", import.meta.url));
+const SWUNG_HATS_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/swung-hats", import.meta.url));
 const INVALID_FIXTURE = fileURLToPath(new URL("../../../fixtures/invalid/comment", import.meta.url));
+/** The worked example's tempo and grid: 124 bpm, 960 ppqn, 16 steps to the bar. */
+const SAMPLES_PER_TICK = ((60 / 124) / 960) * 48_000;
+const TICKS_PER_STEP = 240;
+const STEPS_PER_BAR = 16;
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -64,6 +71,149 @@ describe("render CLI", () => {
       true,
       true,
     ]);
+  });
+
+  it("writes a stem per track plus one per drumkit voice, flat and named <track>.<voice>.wav", () => {
+    const projectRoot = copyFixture();
+    const out = join(projectRoot, "audio", "mix.wav");
+    expect(run(["render", projectRoot, "--out", out, "--stems", "--tail", "0"]).code).toBe(0);
+    const stemsDirectory = join(projectRoot, "audio", "stems");
+
+    expect(readdirSync(stemsDirectory).sort()).toEqual([
+      "bass.wav",
+      "drums.hat.wav",
+      "drums.kick.wav",
+      "drums.wav",
+      "pad.wav",
+    ]);
+    // A stems/drums/ directory would collide with stems/drums.wav.
+    for (const name of readdirSync(stemsDirectory)) {
+      expect(statSync(join(stemsDirectory, name)).isFile()).toBe(true);
+    }
+  });
+
+  it("measures a drum voice on its own audio without --stems", () => {
+    const projectRoot = copyFixture();
+    const out = join(projectRoot, "voices", "master.wav");
+    const result = run(["render", projectRoot, "--out", out, "--bars", "0-4", "--analyze", "--json"]);
+    const report = JSON.parse(result.stdout) as AnalysisReport;
+    const drums = report.tracks.find((track) => track.id === "drums")!;
+    const kick = voiceOf(drums, "kick");
+    const hat = voiceOf(drums, "hat");
+
+    expect(result.code).toBe(0);
+    expect(existsSync(join(projectRoot, "voices", "stems"))).toBe(false);
+    expect(report.parameters.onset.perVoiceDetectionIsAcoustic).toBe(true);
+    // The voices account for every scheduled event, while the track's own onset
+    // count is short of them because coincident hits collapse in the mix.
+    expect(kick.eventCount + hat.eventCount).toBe(drums.eventCount);
+    expect(drums.onsets.expected).toBeLessThan(drums.eventCount);
+    expect(report.tracks.find((track) => track.id === "bass")!.voices).toBeUndefined();
+  });
+
+  /**
+   * The assertion the ergonomics gate could not make. The shipped kick lane is
+   * the §8 worked example's syncopated `x..x ..x. x..x ..x.`, so the kick voice's
+   * own hits are six per bar at named step positions — and the analysis reports
+   * every one of them even though the track's mixed numbers hide the kick.
+   */
+  it("reports the fixture kick voice's own six hits per bar with their positions", () => {
+    const projectRoot = copyFixture();
+    const out = join(projectRoot, "kick", "master.wav");
+    const result = run(["render", projectRoot, "--out", out, "--bars", "0-4", "--analyze", "--json"]);
+    const report = JSON.parse(result.stdout) as AnalysisReport;
+    const kick = voiceOf(report.tracks.find((track) => track.id === "drums")!, "kick");
+    const expectedPositions = stepPositions(4, [0, 3, 6, 8, 11, 14]);
+
+    expect(result.code).toBe(0);
+    expect(kick.eventCount).toBe(24);
+    expect(kick.onsets.expected).toBe(24);
+    expect(kick.onsets.matched).toBe(24);
+    expect(kick.onsets.spurious).toBe(0);
+    expect(kick.onsets.unmatchedExpected).toEqual([]);
+    expect(kick.silent).toBe(false);
+    expect(kick.onsets.expectedPositions).toEqual(expectedPositions);
+    // Steps 0 and 8 are beats 1 and 3; this kick is deliberately not on beats 2
+    // and 4, and the beat ruler shows that without any arithmetic.
+    const beats = report.musicalGrid!.beatPositions;
+    expect(kick.onsets.expectedPositions).toContain(beats[0]);
+    expect(kick.onsets.expectedPositions).toContain(beats[2]);
+    expect(kick.onsets.expectedPositions).not.toContain(beats[1]);
+    expect(kick.onsets.expectedPositions).not.toContain(beats[3]);
+  });
+
+  it("shows a four-on-the-floor kick voice landing on exactly four beats per bar", () => {
+    const projectRoot = copyFixture();
+    setKickSteps(projectRoot, "x... x... x... x...");
+    const out = join(projectRoot, "four", "master.wav");
+    const result = run(["render", projectRoot, "--out", out, "--bars", "0-4", "--analyze", "--json"]);
+    const report = JSON.parse(result.stdout) as AnalysisReport;
+    const kick = voiceOf(report.tracks.find((track) => track.id === "drums")!, "kick");
+    const grid = report.musicalGrid!;
+
+    expect(result.code).toBe(0);
+    expect(grid).toMatchObject({ startBar: 0, beatsPerBar: 4, bars: 4, beats: 16 });
+    expect(kick.onsets.expected).toBe(4 * grid.bars);
+    expect(kick.onsets.matched).toBe(kick.onsets.expected);
+    expect(kick.onsets.spurious).toBe(0);
+    expect(kick.onsets.unmatchedExpected).toEqual([]);
+    expect(kick.onsets.expectedPositions).toEqual(grid.beatPositions);
+    expect(kick.onsets.expectedPositions).toEqual(stepPositions(4, [0, 4, 8, 12]));
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("warns about a drum voice that has events but renders silent inside an audible track", () => {
+    const projectRoot = copyFixture();
+    const kitPath = join(projectRoot, "instruments", "drumkit-main.json");
+    const kit = readJson<{ params?: Record<string, number> }>(kitPath);
+    // The registry minimum for a voice gain, so the voice is inaudible while the
+    // rest of the kit still sounds: a real render, not synthetic audio.
+    kit.params = { ...kit.params, "kick.gain": -6000 };
+    writeJson(kitPath, kit);
+
+    const out = join(projectRoot, "quiet-voice", "master.wav");
+    const result = run(["render", projectRoot, "--out", out, "--bars", "0-2", "--analyze", "--json"]);
+    const report = JSON.parse(result.stdout) as AnalysisReport;
+    const drums = report.tracks.find((track) => track.id === "drums")!;
+    const kick = voiceOf(drums, "kick");
+
+    expect(result.code).toBe(0);
+    expect(drums.silent).toBe(false);
+    expect(kick.eventCount).toBeGreaterThan(0);
+    expect(kick.silent).toBe(true);
+    expect(report.warnings).toContainEqual(
+      expect.stringContaining('Track "drums" voice "kick": events but silent'),
+    );
+    // One finding per problem: the silent voice does not also report its onsets,
+    // and the audible voice reports nothing.
+    expect(report.warnings.filter((warning) => warning.includes('voice "kick"'))).toHaveLength(1);
+    expect(report.warnings.some((warning) => warning.includes('voice "hat"'))).toBe(false);
+  });
+
+  it("finds no warnings and no clipping in the swung-hats fixture, per voice included", () => {
+    const projectRoot = temporaryDirectory();
+    cpSync(SWUNG_HATS_FIXTURE, projectRoot, { recursive: true });
+    const out = join(projectRoot, "swung", "master.wav");
+    const result = run(["render", projectRoot, "--out", out, "--analyze", "--json"]);
+    const report = JSON.parse(result.stdout) as AnalysisReport;
+    const hats = report.tracks.find((track) => track.id === "hats")!;
+
+    expect(result.code).toBe(0);
+    expect(hats.voices!.map((voice) => voice.voice)).toEqual(["straight-hat", "swung-hat"]);
+    for (const voice of hats.voices!) {
+      expect(voice.eventCount).toBe(4);
+      expect(voice.onsets.matched).toBe(4);
+      expect(voice.onsets.expected).toBe(4);
+      expect(voice.onsets.spurious).toBe(0);
+      expect(voice.silent).toBe(false);
+    }
+    // The swung voice's hits sit later than the straight voice's identical steps.
+    const [straight, swung] = hats.voices! as [VoiceAnalysis, VoiceAnalysis];
+    for (const [index, position] of straight.onsets.expectedPositions.entries()) {
+      expect(swung.onsets.expectedPositions[index]!).toBeGreaterThan(position);
+    }
+    expect(report.master.clipping.clipped).toBe(false);
+    expect(report.warnings).toEqual([]);
   });
 
   it("is byte-identical for the same seed and changes when probability outcomes change", () => {
@@ -220,6 +370,32 @@ function run(args: string[]): { code: number; stdout: string; stderr: string } {
     stderr: { write: (value) => (stderr += value) },
   };
   return { code: runCli(args, io), stdout, stderr };
+}
+
+function voiceOf(track: TrackAnalysis, voice: string): VoiceAnalysis {
+  const found = track.voices?.find((candidate) => candidate.voice === voice);
+  if (found === undefined) throw new Error(`track "${track.id}" has no analysis for voice "${voice}"`);
+  return found;
+}
+
+/** Sample positions of the given grid steps, derived from tempo rather than read back. */
+function stepPositions(bars: number, steps: readonly number[]): number[] {
+  const positions: number[] = [];
+  for (let bar = 0; bar < bars; bar++) {
+    for (const step of steps) {
+      positions.push(Math.round((bar * STEPS_PER_BAR + step) * TICKS_PER_STEP * SAMPLES_PER_TICK));
+    }
+  }
+  return positions;
+}
+
+function setKickSteps(root: string, steps: string): void {
+  const path = join(root, "patterns", "drums-verse.json");
+  const pattern = readJson<{ lanes: { lane: string; steps: string }[] }>(path);
+  for (const lane of pattern.lanes) {
+    if (lane.lane === "kick") lane.steps = steps;
+  }
+  writeJson(path, pattern);
 }
 
 function copyFixture(): string {

@@ -27,7 +27,13 @@ export interface RenderOptions {
   sampleRate: number;
   seed: number;
   barRange?: { start: number; end: number };
-  /** When true, also return per-track stems. */
+  /**
+   * When true, also return the isolated buffers: one stem per track and, for
+   * drumkit tracks, one buffer per kit voice. Isolation is independent of
+   * writing files — the CLI always asks for it so `--analyze` can measure a
+   * single lane whether or not `--stems` was given. The cost is memory: one
+   * full-length stereo buffer per track and per kit voice.
+   */
   stems: boolean;
   /** Extra time rendered past the last event so releases/tails are not truncated. */
   tailSeconds: number;
@@ -43,6 +49,17 @@ export interface RenderedAudio {
   sampleRate: number;
   master: StereoAudio;
   stems?: Map<string, StereoAudio>;
+  /**
+   * Per-kit-voice audio for drumkit tracks: track id, then voice name in kit
+   * order. Present exactly when `stems` are; synth tracks never appear, since a
+   * synth track has no voices to separate.
+   *
+   * A track's voices reproduce its stem bit for bit when accumulated at float32
+   * precision in this map's iteration order, which is how the mix itself is
+   * summed (see `DrumkitProcessor`). Summed in float64 instead they agree to
+   * within float32 rounding rather than exactly.
+   */
+  voices?: Map<string, Map<string, StereoAudio>>;
   totalSamples: number;
 }
 
@@ -65,17 +82,36 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
     left: new Float32Array(totalSamples),
     right: new Float32Array(totalSamples),
   };
-  const stems = resolved.stems ? new Map<string, StereoAudio>() : undefined;
+  const isolated = resolved.stems
+    ? { stems: new Map<string, StereoAudio>(), voices: new Map<string, Map<string, StereoAudio>>() }
+    : undefined;
   const sampleCache = new Map<string, ReturnType<typeof decodeWav>>();
 
   for (const compiledTrack of schedule.tracks) {
     const instrument = project.instruments.get(compiledTrack.instrumentId);
     if (instrument === undefined) throw new Error(`cannot render: instrument "${compiledTrack.instrumentId}" is missing`);
-    const stem =
-      instrument.type === "synth"
-        ? renderSynthTrack(compiledTrack, instrument, totalSamples, resolved.sampleRate)
-        : renderDrumTrack(project, compiledTrack, instrument, totalSamples, resolved.sampleRate, sampleCache);
-    if (stems !== undefined) stems.set(compiledTrack.trackId, stem);
+    let stem: StereoAudio;
+    if (instrument.type === "synth") {
+      stem = renderSynthTrack(compiledTrack, instrument, totalSamples, resolved.sampleRate);
+    } else {
+      const trackVoices =
+        isolated === undefined
+          ? undefined
+          : new Map(Object.keys(instrument.kit).map((voice) => [voice, emptyStereo(totalSamples)] as const));
+      stem = renderDrumTrack(
+        project,
+        compiledTrack,
+        instrument,
+        totalSamples,
+        resolved.sampleRate,
+        sampleCache,
+        trackVoices,
+      );
+      if (isolated !== undefined && trackVoices !== undefined) {
+        isolated.voices.set(compiledTrack.trackId, trackVoices);
+      }
+    }
+    isolated?.stems.set(compiledTrack.trackId, stem);
     // The float master deliberately remains unclipped so later analysis can
     // detect overloads. Integer WAV quantisation is where clamping occurs.
     for (let sample = 0; sample < totalSamples; sample++) {
@@ -84,9 +120,9 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
     }
   }
 
-  return stems === undefined
+  return isolated === undefined
     ? { sampleRate: resolved.sampleRate, master, totalSamples }
-    : { sampleRate: resolved.sampleRate, master, stems, totalSamples };
+    : { sampleRate: resolved.sampleRate, master, ...isolated, totalSamples };
 }
 
 function resolveOptions(options: Partial<RenderOptions>): RenderOptions {
@@ -137,6 +173,7 @@ function renderDrumTrack(
   totalSamples: number,
   sampleRate: number,
   sampleCache: Map<string, ReturnType<typeof decodeWav>>,
+  voiceOutputs: ReadonlyMap<string, StereoAudio> | undefined,
 ): StereoAudio {
   const settings: Record<string, DrumVoiceSettings> = {};
   const staticValues: Record<string, number> = {};
@@ -179,7 +216,20 @@ function renderDrumTrack(
     const ramps = automation.ramps(Object.keys(staticValues), staticValues, blockStart, length);
     const left = output.left.subarray(blockStart, blockStart + length);
     const right = output.right.subarray(blockStart, blockStart + length);
-    processor.processBlock(left, right, length, commands, ramps);
+    if (voiceOutputs === undefined) {
+      processor.processBlock(left, right, length, commands, ramps);
+    } else {
+      const blocks: Record<string, { left: Float32Array; right: Float32Array }> = {};
+      for (const voice of processor.getVoiceNames()) {
+        const voiceAudio = voiceOutputs.get(voice);
+        if (voiceAudio === undefined) throw new Error(`cannot render: no buffer for kit voice "${voice}"`);
+        blocks[voice] = {
+          left: voiceAudio.left.subarray(blockStart, blockStart + length),
+          right: voiceAudio.right.subarray(blockStart, blockStart + length),
+        };
+      }
+      processor.processBlock(left, right, length, commands, ramps, blocks);
+    }
   }
   return output;
 }

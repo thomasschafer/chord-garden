@@ -56,12 +56,32 @@ export interface CompiledSchedule {
   tracks: CompiledTrack[]; // in project.trackOrder order
 }
 
+/**
+ * Bar and beat boundaries of a compiled range, in samples from the start of the
+ * range. Boundaries use the same tick-to-sample rounding as events, so an event
+ * scheduled on a beat carries exactly that beat's sample position and alignment
+ * can be checked by comparison rather than arithmetic.
+ *
+ * V1 reads `tempoMap[0]` and `meterMap[0]` only (see `compile`), so the grid is
+ * uniform across the range.
+ */
+export interface MusicalGrid {
+  /** Zero-based bar number of the first bar in the range: the `--bars` start. */
+  startBar: number;
+  beatsPerBar: number;
+  /** One entry per bar starting inside the range; `[0]` is 0 when non-empty. */
+  barStarts: number[];
+  /** One entry per beat starting inside the range; `[0]` is 0 when non-empty. */
+  beatStarts: number[];
+}
+
 interface CompileContext {
   project: Project;
   sampleRate: number;
   seed: number;
   samplesPerTick: number;
   barTicks: number;
+  beatsPerBar: number;
   rangeStartTick: number;
   rangeEndTick: number;
   totalSamples: number;
@@ -114,6 +134,44 @@ type PatternEventKey =
   | { kind: "note"; startTick: number; midi: number; durationTicks: number };
 
 export function compile(project: Project, options: Partial<CompileOptions> = {}): CompiledSchedule {
+  const context = compileContext(project, options);
+  const tracks = context.project.project.trackOrder.map((trackId) => compileTrack(context, trackId));
+  return {
+    sampleRate: context.sampleRate,
+    seed: context.seed,
+    totalSamples: context.totalSamples,
+    tracks,
+  };
+}
+
+/**
+ * The bar and beat grid of the range `compile` would produce for the same
+ * options. Kept beside the compiler so both speak one tick-to-sample rule.
+ */
+export function musicalGrid(project: Project, options: Partial<CompileOptions> = {}): MusicalGrid {
+  const context = compileContext(project, options);
+  const beatTicks = context.barTicks / context.beatsPerBar;
+  return {
+    startBar: context.rangeStartTick / context.barTicks,
+    beatsPerBar: context.beatsPerBar,
+    barStarts: gridStarts(context, context.barTicks),
+    beatStarts: gridStarts(context, beatTicks),
+  };
+}
+
+/** Sample positions of every `stepTicks` boundary starting inside the range. */
+function gridStarts(context: CompileContext, stepTicks: number): number[] {
+  const starts: number[] = [];
+  if (stepTicks <= 0) throw new Error(`cannot build musical grid: step of ${stepTicks} ticks is not positive`);
+  for (let index = 0; ; index++) {
+    // Multiplied rather than accumulated so a fractional step cannot drift.
+    const tick = context.rangeStartTick + index * stepTicks;
+    if (tick >= context.rangeEndTick) return starts;
+    starts.push(tickToSample(tick - context.rangeStartTick, context.samplesPerTick));
+  }
+}
+
+function compileContext(project: Project, options: Partial<CompileOptions>): CompileContext {
   const sampleRate = options.sampleRate ?? 48_000;
   const seed = options.seed ?? 0;
   checkOptions(sampleRate, seed, options.barRange);
@@ -145,18 +203,17 @@ export function compile(project: Project, options: Partial<CompileOptions> = {})
     }
   }
 
-  const context: CompileContext = {
+  return {
     project,
     sampleRate,
     seed,
     samplesPerTick,
     barTicks,
+    beatsPerBar: meter.timeSignature[0],
     rangeStartTick,
     rangeEndTick,
     totalSamples: tickToSample(rangeEndTick - rangeStartTick, samplesPerTick),
   };
-  const tracks = project.project.trackOrder.map((trackId) => compileTrack(context, trackId));
-  return { sampleRate, seed, totalSamples: context.totalSamples, tracks };
 }
 
 function checkOptions(

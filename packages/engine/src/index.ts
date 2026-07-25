@@ -1,10 +1,12 @@
 export {
   compile,
+  musicalGrid,
   type CompileOptions,
   type CompiledAutomationLane,
   type CompiledNoteEvent,
   type CompiledSchedule,
   type CompiledTrack,
+  type MusicalGrid,
 } from "./compiler.js";
 export * from "./dsp/index.js";
 export {

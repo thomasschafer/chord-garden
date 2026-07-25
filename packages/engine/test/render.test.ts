@@ -13,6 +13,8 @@ import { CONTROL_BLOCK_SIZE, compile, decodeWav, encodeWav, render, writeWav } f
 import { valueAt } from "../src/render/automation.js";
 
 const FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/first-track", import.meta.url));
+/** One LSB of 24-bit PCM: a difference this small cannot survive being written out. */
+const VOICE_SUM_TOLERANCE = 2 ** -23;
 
 function synthProject(
   automation?: AutomationDoc,
@@ -201,6 +203,88 @@ describe("offline renderer", () => {
     const project = synthProject();
     const audio = render(project, { barRange: { start: 0, end: 1 }, tailSeconds: 0.25 });
     expect(audio.totalSamples).toBe(96_000 + 12_000);
+  });
+
+  /**
+   * Two claims, because they are not the same claim. Accumulated the way the mix
+   * itself is — float32, in kit order — the voices reproduce the stem bit for
+   * bit, which is what catches a dropped voice or a gain applied twice. Summed
+   * naively in float64 they only agree to within float32 rounding, so that half
+   * asserts a stated tolerance instead: VOICE_SUM_TOLERANCE, one LSB of the
+   * 24-bit output the stems are written as, which the two-voice fixture comes in
+   * an order of magnitude under.
+   */
+  it("sums each drumkit voice back to its track stem, bit-exactly in float32 and within a 24-bit LSB in float64", () => {
+    const project = loadProject(FIXTURE).project!;
+    const audio = render(project, { barRange: { start: 0, end: 2 }, stems: true, tailSeconds: 0 });
+    const voices = audio.voices!.get("drums")!;
+    const stem = audio.stems!.get("drums")!;
+    let worstFloat64Difference = 0;
+
+    expect([...voices.keys()]).toEqual(["hat", "kick"]);
+    expect(audio.voices!.has("bass")).toBe(false);
+    for (let sample = 0; sample < audio.totalSamples; sample++) {
+      let left = 0;
+      let right = 0;
+      let naiveLeft = 0;
+      let naiveRight = 0;
+      for (const voice of voices.values()) {
+        left = Math.fround(left + voice.left[sample]!);
+        right = Math.fround(right + voice.right[sample]!);
+        naiveLeft += voice.left[sample]!;
+        naiveRight += voice.right[sample]!;
+      }
+      expect(stem.left[sample]).toBe(left);
+      expect(stem.right[sample]).toBe(right);
+      worstFloat64Difference = Math.max(
+        worstFloat64Difference,
+        Math.abs(stem.left[sample]! - naiveLeft),
+        Math.abs(stem.right[sample]! - naiveRight),
+      );
+    }
+
+    expect(worstFloat64Difference).toBeGreaterThan(0);
+    expect(worstFloat64Difference).toBeLessThanOrEqual(VOICE_SUM_TOLERANCE);
+  });
+
+  /**
+   * Choke groups reach across voices, so a voice cannot be isolated by rendering
+   * it through a processor of its own. This pins that: the hat's own buffer must
+   * change when the kick chokes it, and the voices must still reproduce the stem
+   * bit for bit.
+   */
+  it("keeps cross-voice chokes inside the isolated voices", () => {
+    const barRange = { start: 0, end: 2 };
+    const plain = render(loadProject(FIXTURE).project!, { barRange, stems: true, tailSeconds: 0 });
+    const project = loadProject(FIXTURE).project!;
+    const kit = project.instruments.get("drumkit-main")!;
+    project.instruments.set("drumkit-main", {
+      ...kit,
+      params: { "hat.chokeGroup": 1, "kick.chokeGroup": 1 },
+    });
+    const choked = render(project, { barRange, stems: true, tailSeconds: 0 });
+    const chokedVoices = choked.voices!.get("drums")!;
+    const stem = choked.stems!.get("drums")!;
+
+    expect(chokedVoices.get("hat")!.left).not.toEqual(plain.voices!.get("drums")!.get("hat")!.left);
+    for (let sample = 0; sample < choked.totalSamples; sample++) {
+      let left = 0;
+      for (const voice of chokedVoices.values()) left = Math.fround(left + voice.left[sample]!);
+      expect(stem.left[sample]).toBe(left);
+    }
+  });
+
+  it("is bit-identical per voice for the same project and seed", () => {
+    const project = loadProject(FIXTURE).project!;
+    const options = { barRange: { start: 0, end: 2 }, stems: true, tailSeconds: 0 };
+    const first = render(project, options).voices!.get("drums")!;
+    const second = render(project, options).voices!.get("drums")!;
+
+    expect([...second.keys()]).toEqual([...first.keys()]);
+    for (const [voice, audio] of first) {
+      expect(new Uint8Array(second.get(voice)!.left.buffer)).toEqual(new Uint8Array(audio.left.buffer));
+      expect(new Uint8Array(second.get(voice)!.right.buffer)).toEqual(new Uint8Array(audio.right.buffer));
+    }
   });
 
   it("renders the worked fixture with audible drums and bass at schedule-plus-tail length", () => {

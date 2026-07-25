@@ -10,13 +10,14 @@ import {
   type DescribeReport,
   type LoadResult,
 } from "@chord-garden/format";
-import { compile, render, writeWav } from "@chord-garden/engine";
+import { compile, musicalGrid, render, writeWav } from "@chord-garden/engine";
 import { analyzeRender, type AnalysisReport } from "./analysis.js";
 import { fmtAspects, type FmtAspect } from "./fmtAspects.js";
 
 const RENDER_FLAGS = `  --out <path>         master WAV path (default: <project>/render/master.wav)
   --bars <start>-<end> render zero-based bars in [start, end); start inclusive, end exclusive
-  --stems              also write <outdir>/stems/<track>.wav
+  --stems              also write <outdir>/stems/<track>.wav, plus
+                       <outdir>/stems/<track>.<voice>.wav per drumkit voice
   --seed <n>           integer probability seed (default: 0)
   --analyze            write <outdir>/analysis.json and print an analysis summary
   --json               with --analyze, print the analysis JSON instead of the summary
@@ -45,7 +46,8 @@ flags:
 ${RENDER_FLAGS}
 analysis report (--analyze) — written to <outdir>/analysis.json and printed by
 --json. The signal fields appear both on "master" and on each entry of
-"tracks"; the onset, event, and spectral fields are per track:
+"tracks"; the onset, event, and spectral fields are per track, and a drumkit
+track repeats the onset, event, and level fields per kit voice under "voices":
   warnings           the list to read first; empty means nothing was flagged
   peakDb             loudest sample, dBFS; measured before WAV quantisation
   rmsDb              average level, dBFS; null means exactly silent
@@ -61,10 +63,26 @@ analysis report (--analyze) — written to <outdir>/analysis.json and printed by
   onsets.spurious    detected attacks matching no scheduled position (a
                      doubled clip, a runaway ratchet); .spuriousPositions
                      gives sample offsets to seek to
+  onsets.expectedPositions
+                     the scheduled positions themselves, in samples, capped by
+                     parameters.onset.expectedPositionsLimit. The matched ones
+                     are these minus .unmatchedExpected
   silent             peak below parameters.silencePeakThreshold. Silent with a
                      nonzero eventCount is a warning; silent with zero events
                      is normal
   spectral           .centroidHz and energy .share per band in .bands
+  voices             drumkit tracks only: one entry per kit voice, measured on
+                     that voice's own audio, with .voice, .eventCount, .peakDb,
+                     .silent and its own .onsets. A voice is a kit entry and the
+                     pattern lane that drives it, under one name. A track mixes
+                     its voices and collapses coincident hits, so a kick landing
+                     on a hat is invisible in the track numbers and visible
+                     here. This is where you check "the kick is on every beat",
+                     and it needs no --stems
+  musicalGrid        .barPositions and .beatPositions in samples for the
+                     rendered range, plus .startBar and .beatsPerBar. Compare a
+                     voice's onsets.expectedPositions against .beatPositions
+                     instead of computing sample offsets by hand
   parameters         every threshold, window, and band edge the report used,
                      so the numbers above are self-describing
   seed, barRange     what was rendered, echoed back
@@ -249,11 +267,20 @@ function runRender(args: readonly string[], io: CliIo): number {
       stems: true,
       tailSeconds: parsed.tailSeconds,
     });
-    if (rendered.stems === undefined) throw new Error("renderer did not return the stems required for analysis");
-    const report = analyzeRender(rendered.master, rendered.stems, schedule, {
-      seed: parsed.seed,
-      ...(parsed.barRange === undefined ? {} : { barRange: parsed.barRange }),
-    });
+    if (rendered.stems === undefined || rendered.voices === undefined) {
+      throw new Error("renderer did not return the isolated buffers required for analysis");
+    }
+    const report = analyzeRender(
+      rendered.master,
+      rendered.stems,
+      schedule,
+      {
+        seed: parsed.seed,
+        ...(parsed.barRange === undefined ? {} : { barRange: parsed.barRange }),
+        musicalGrid: musicalGrid(loaded.project, scheduleOptions),
+      },
+      rendered.voices,
+    );
 
     mkdirSync(dirname(parsed.out), { recursive: true });
     writeWav(parsed.out, rendered);
@@ -261,11 +288,14 @@ function runRender(args: readonly string[], io: CliIo): number {
       const stemsDirectory = join(dirname(parsed.out), "stems");
       mkdirSync(stemsDirectory, { recursive: true });
       for (const [trackId, stem] of rendered.stems) {
-        writeWav(join(stemsDirectory, `${trackId}.wav`), {
-          sampleRate: rendered.sampleRate,
-          left: stem.left,
-          right: stem.right,
-        });
+        writeStem(join(stemsDirectory, `${trackId}.wav`), rendered.sampleRate, stem);
+      }
+      // Flat names rather than a stems/<track>/ directory, which would collide
+      // with the stems/<track>.wav file the same track already writes.
+      for (const [trackId, trackVoices] of rendered.voices) {
+        for (const [voice, audio] of trackVoices) {
+          writeStem(join(stemsDirectory, `${trackId}.${voice}.wav`), rendered.sampleRate, audio);
+        }
       }
     }
     if (parsed.analyze) {
@@ -420,6 +450,10 @@ function renderCompileOptions(options: RenderCliOptions): {
     : { sampleRate: options.sampleRate, seed: options.seed, barRange: options.barRange };
 }
 
+function writeStem(path: string, sampleRate: number, audio: { left: Float32Array; right: Float32Array }): void {
+  writeWav(path, { sampleRate, left: audio.left, right: audio.right });
+}
+
 function printHumanAnalysis(report: AnalysisReport, out: string, io: CliIo): void {
   io.stdout.write(
     `rendered ${report.totalSamples} samples (${formatSeconds(report.durationSeconds)} s) to ${out}\n`,
@@ -427,10 +461,21 @@ function printHumanAnalysis(report: AnalysisReport, out: string, io: CliIo): voi
   io.stdout.write(
     `master: peak ${formatDb(report.master.peakDb)}, RMS ${formatDb(report.master.rmsDb)}, clipping ${report.master.clipping.clipped ? `yes (${report.master.clipping.sampleCount})` : "no"}\n`,
   );
+  if (report.musicalGrid !== null) {
+    const grid = report.musicalGrid;
+    io.stdout.write(
+      `grid: bars ${grid.startBar}-${grid.startBar + grid.bars} (${grid.bars} bar${grid.bars === 1 ? "" : "s"}, ${grid.beats} beats at ${grid.beatsPerBar} per bar); bar and beat sample positions in analysis.json\n`,
+    );
+  }
   for (const track of report.tracks) {
     io.stdout.write(
       `  ${track.id}: ${track.eventCount} events, peak ${formatDb(track.peakDb)}, onsets ${track.onsets.matched}/${track.onsets.expected}, spurious ${track.onsets.spurious}, silent ${track.silent ? "yes" : "no"}\n`,
     );
+    for (const voice of track.voices ?? []) {
+      io.stdout.write(
+        `    voice ${voice.voice}: ${voice.eventCount} events, peak ${formatDb(voice.peakDb)}, onsets ${voice.onsets.matched}/${voice.onsets.expected}, spurious ${voice.onsets.spurious}, silent ${voice.silent ? "yes" : "no"}\n`,
+      );
+    }
   }
   if (report.warnings.length === 0) {
     io.stdout.write("warnings: none\n");
