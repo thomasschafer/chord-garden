@@ -1,4 +1,6 @@
 import { ProjectClient, WriteConflict } from "@chord-garden/dev-server/client";
+import { connectAudioToDocument } from "./audio/documentBridge";
+import { LivePlayer } from "./audio/livePlayer";
 import {
   createDocumentStore,
   WriteConflictError,
@@ -37,6 +39,17 @@ const sink: DocumentSink = {
 };
 
 export const documentStore: DocumentStore = createDocumentStore({ sink });
+
+/**
+ * The one player for this window, and its link to the document.
+ *
+ * Module scope rather than a component's `useMemo`: an `AudioContext` is a scarce
+ * per-page resource, and the bridge below has to exist whether or not any
+ * particular editor is mounted.
+ */
+export const livePlayer = new LivePlayer("/worklet.js", (path) => client.asset(projectName, path));
+
+connectAudioToDocument(documentStore, livePlayer);
 
 /**
  * Fetch the project and hand it to the store.

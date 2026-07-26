@@ -28,6 +28,23 @@ export interface LiveSessionOptions {
 }
 
 /**
+ * What a document edit means to a running transport, as classified by whoever made
+ * it (PLAN.md §12 step 6). `none` never reaches here — an edit with no audible
+ * consequence has no reason to recompile anything.
+ */
+export type LiveEditEffect = "parameters" | "structural";
+
+/** What the transport did with an edit, so a UI can say when it will be heard. */
+export interface LiveEditOutcome {
+  effect: LiveEditEffect;
+  /**
+   * Sample position the edit takes effect at, or `null` for "at the next block" —
+   * a parameter change, or a structural change made while stopped.
+   */
+  atSample: number | null;
+}
+
+/**
  * Everything between "here is a validated project and a running AudioContext"
  * and "the transport is ready to play it".
  *
@@ -44,25 +61,55 @@ export interface LiveSessionOptions {
  * post commands to, and a sample rate.
  */
 export class LiveSession {
-  readonly schedule: CompiledSchedule;
-  readonly barStarts: readonly number[];
   readonly transport: LiveTransport;
   readonly sampleRate: number;
+  private project: Project;
+  private readonly seed: number;
+  private readonly fetchSample: SampleFetcher;
+  private readonly post: (command: LiveCommand) => void;
+  private readonly onSampleLoaded: LiveSessionOptions["onSampleLoaded"];
+  private currentSchedule: CompiledSchedule;
+  private currentBarStarts: readonly number[];
   /** Content hash per project-relative sample path, as sent to the worklet. */
-  readonly sampleHashes: ReadonlyMap<string, string>;
+  private readonly hashes: Map<string, string>;
+  /** Serializes `update`, whose sample loading is asynchronous. */
+  private updating: Promise<void> = Promise.resolve();
 
-  private constructor(
-    schedule: CompiledSchedule,
-    barStarts: readonly number[],
-    transport: LiveTransport,
-    sampleRate: number,
-    sampleHashes: Map<string, string>,
-  ) {
-    this.schedule = schedule;
-    this.barStarts = barStarts;
-    this.transport = transport;
-    this.sampleRate = sampleRate;
-    this.sampleHashes = sampleHashes;
+  private constructor(init: {
+    project: Project;
+    seed: number;
+    fetchSample: SampleFetcher;
+    post: (command: LiveCommand) => void;
+    onSampleLoaded: LiveSessionOptions["onSampleLoaded"];
+    schedule: CompiledSchedule;
+    barStarts: readonly number[];
+    transport: LiveTransport;
+    sampleRate: number;
+    hashes: Map<string, string>;
+  }) {
+    this.project = init.project;
+    this.seed = init.seed;
+    this.fetchSample = init.fetchSample;
+    this.post = init.post;
+    this.onSampleLoaded = init.onSampleLoaded;
+    this.currentSchedule = init.schedule;
+    this.currentBarStarts = init.barStarts;
+    this.transport = init.transport;
+    this.sampleRate = init.sampleRate;
+    this.hashes = init.hashes;
+  }
+
+  /** The schedule currently rendering, or the one queued to replace it. */
+  get schedule(): CompiledSchedule {
+    return this.currentSchedule;
+  }
+
+  get barStarts(): readonly number[] {
+    return this.currentBarStarts;
+  }
+
+  get sampleHashes(): ReadonlyMap<string, string> {
+    return this.hashes;
   }
 
   /**
@@ -81,10 +128,14 @@ export class LiveSession {
     const post = (command: LiveCommand): void => {
       sink.postMessage(command);
     };
-    const hashes = await loadSamples(project, schedule, options.fetchSample, post, options.onSampleLoaded);
-
+    const hashes = new Map<string, string>();
+    // Declared before the graph builder so the builder can close over the
+    // session's *current* project rather than the one it was created with: a
+    // document edit replaces it, and a stale instrument map would keep playing
+    // the old kit under the new events.
+    let session: LiveSession | undefined;
     const graphOf = (target: CompiledSchedule): LiveGraph =>
-      liveGraph(project, target, (path) => {
+      liveGraph(session?.project ?? project, target, (path) => {
         const hash = hashes.get(path);
         // Not defensive noise: a configure naming content the worklet was never
         // sent is rejected by the worklet, and the failure is far easier to read
@@ -92,6 +143,8 @@ export class LiveSession {
         if (hash === undefined) throw new Error(`no content hash was loaded for sample "${path}"`);
         return hash;
       });
+
+    await loadSamples(project, schedule, options.fetchSample, post, options.onSampleLoaded, hashes);
 
     const scheduler = new LiveScheduler(schedule, barStarts, lookaheadSamples(sampleRate));
     const transport = new LiveTransport({
@@ -104,7 +157,75 @@ export class LiveSession {
     });
     transport.sendConfigure({ generation: 0, atSample: null, schedule }, graphOf(schedule));
 
-    return new LiveSession(schedule, barStarts, transport, sampleRate, hashes);
+    session = new LiveSession({
+      project,
+      seed,
+      fetchSample: options.fetchSample,
+      post,
+      onSampleLoaded: options.onSampleLoaded,
+      schedule,
+      barStarts,
+      transport,
+      sampleRate,
+      hashes,
+    });
+    return session;
+  }
+
+  /**
+   * Adopt an edited document while the session is live.
+   *
+   * The recompile is unconditional and whole-project: the compiler is the only
+   * thing that knows how a document becomes events, and asking it again is both
+   * cheaper than a patch and impossible to get subtly wrong. What the caller
+   * supplies is `effect` — the §12-step-6 classification — because it made the
+   * edit and knows what it touched, whereas this method would have to diff two
+   * documents to find out (PLAN.md §12 step 5, deferred to Phase 4).
+   *
+   * Timing is the scheduler's, not this method's: a structural change lands at the
+   * next bar boundary while playing and immediately while stopped, and a parameter
+   * change takes effect in the next scheduling window.
+   *
+   * Calls are serialized against each other because sample loading is
+   * asynchronous, so a burst of edits cannot interleave two configures for the
+   * same generation.
+   */
+  update(project: Project, effect: LiveEditEffect): Promise<LiveEditOutcome> {
+    const run = this.updating.then(() => this.applyUpdate(project, effect));
+    // Kept in the chain even when it rejects, so one failed edit does not wedge
+    // every later one behind a permanently rejected promise.
+    this.updating = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async applyUpdate(project: Project, effect: LiveEditEffect): Promise<LiveEditOutcome> {
+    const schedule = compile(project, { sampleRate: this.sampleRate, seed: this.seed });
+    const barStarts = musicalGrid(project, { sampleRate: this.sampleRate, seed: this.seed }).barStarts;
+    // An edit may name sample content the worklet has never been sent — a lane
+    // for a kit voice that was not in the graph before. Loaded before the project
+    // is adopted, so a fetch that fails leaves the session playing what it was.
+    await loadSamples(project, schedule, this.fetchSample, this.post, this.onSampleLoaded, this.hashes);
+    this.project = project;
+    this.currentSchedule = schedule;
+    this.currentBarStarts = barStarts;
+    if (effect === "structural") {
+      const change = this.transport.applyStructuralChange(schedule, barStarts);
+      return { effect, atSample: change.atSample };
+    }
+    this.transport.applyParameterChange(
+      schedule,
+      schedule.tracks.map((track, trackIndex) => {
+        const instrument = project.instruments.get(track.instrumentId);
+        if (instrument === undefined) {
+          throw new Error(`cannot apply a parameter change: instrument "${track.instrumentId}" is missing`);
+        }
+        return { trackIndex, instrument, automation: track.automation };
+      }),
+    );
+    return { effect, atSample: null };
   }
 
   /** Total scheduled length in samples, before any release tail. */
@@ -139,16 +260,24 @@ export class LiveSession {
   }
 }
 
-/** Fetch, hash, decode and post every sample the schedule needs. */
+/**
+ * Fetch, hash, decode and post every sample the schedule needs and `hashes` does
+ * not already hold, recording each one in `hashes`.
+ *
+ * Skipping what is already loaded is what makes this reusable for a document
+ * edit: re-posting a multi-megabyte sample on every keystroke would be the
+ * obvious way to make editing during playback glitch.
+ */
 async function loadSamples(
   project: Project,
   schedule: CompiledSchedule,
   fetchSample: SampleFetcher,
   post: (command: LiveCommand) => void,
   onLoaded: LiveSessionOptions["onSampleLoaded"],
-): Promise<Map<string, string>> {
-  const hashes = new Map<string, string>();
+  hashes: Map<string, string>,
+): Promise<void> {
   for (const path of requiredSamplePaths(project, schedule)) {
+    if (hashes.has(path)) continue;
     const bytes = await fetchSample(path);
     // Hashed over the bytes as delivered, exactly as the offline path hashes the
     // bytes on disk, so a replaced sample invalidates identically (PLAN.md §14).
@@ -173,7 +302,6 @@ async function loadSamples(
       channels: decoded.channels.length,
     });
   }
-  return hashes;
 }
 
 /**

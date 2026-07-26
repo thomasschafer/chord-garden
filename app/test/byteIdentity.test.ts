@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli, type CliIo } from "@chord-garden/cli";
-import { canonicalFiles, loadProject } from "@chord-garden/format";
+import { canonicalFiles, loadProject, serializeCanonical } from "@chord-garden/format";
 import { createAssetServer } from "@chord-garden/dev-server";
 import { TOKEN_HEADER, WRITE_CONFLICT_STATUS } from "@chord-garden/dev-server/api";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -157,6 +157,61 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     expect(pattern.kind === "grid" && pattern.lanes[0]!.steps).toBe("x... x... x... x...");
   });
 
+  /**
+   * The grid editor's version of the same guarantee. Worth its own case because a
+   * `steps` string is the one field whose canonical form `fmt` computes from the
+   * project (grouping depends on `stepsPerBar` and the pattern's bar count), so it is
+   * the field a UI is most likely to write in a form the CLI would rewrite — and the
+   * write endpoint's canonical check cannot catch it, because that check sees one
+   * document with no project around it.
+   */
+  it("leaves the project already canonical after toggling grid steps", async () => {
+    store.getState().toggleGridStep("drums-verse", "hat", 5, 16);
+    store.getState().toggleGridStep("drums-verse", "kick", 8, 16);
+    await store.getState().flushNow();
+
+    const check = fmtCheck();
+    expect(check.stdout).toBe("already canonical\n");
+    expect(check.code).toBe(0);
+
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(onDisk()).toEqual(canonicalFiles(reloaded.project!));
+    const pattern = reloaded.project!.patterns.get("drums-verse")!;
+    if (pattern.kind !== "grid") throw new Error("the pattern stopped being a grid");
+    expect(pattern.lanes.find((lane) => lane.lane === "hat")!.steps).toBe("x.x. xxx. x.x. x.x.");
+    // The lane's other content came back exactly as it went in.
+    expect(pattern.lanes.find((lane) => lane.lane === "hat")!.stepEvents).toEqual([
+      { step: 2, velocity: 350, probability: 800 },
+      { step: 8, microTicks: -12, gateTicks: 120, ratchet: 2 },
+    ]);
+  });
+
+  it("leaves the project already canonical after adding, moving, resizing and deleting notes", async () => {
+    store.getState().addNote("bass-main", { pitch: "F#2", startTick: 5760, durationTicks: 480, velocity: 640 });
+    store.getState().updateNote("bass-main", 0, { startTick: 3360, pitch: "Eb2" });
+    store.getState().updateNote("bass-main", 2, { durationTicks: 1200 });
+    store.getState().deleteNote("bass-main", 1);
+    await store.getState().flushNow();
+
+    const check = fmtCheck();
+    expect(check.stdout).toBe("already canonical\n");
+    expect(check.code).toBe(0);
+
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(onDisk()).toEqual(canonicalFiles(reloaded.project!));
+    const pattern = reloaded.project!.patterns.get("bass-main")!;
+    if (pattern.kind !== "notes") throw new Error("the pattern stopped being a note list");
+    // Canonical order is start, then pitch as a MIDI number, then length — and the
+    // flat spelling the edit asked for survived, because `fmt` never respells.
+    expect(pattern.notes).toEqual([
+      { pitch: "C2", startTick: 2400, durationTicks: 1200, velocity: 800, probability: 800 },
+      { pitch: "Eb2", startTick: 3360, durationTicks: 720, velocity: 900 },
+      { pitch: "F#2", startTick: 5760, durationTicks: 480, velocity: 640 },
+    ]);
+  });
+
   it("writes exactly the bytes the store held, with no server-side reformatting", async () => {
     store.getState().setProjectName("Byte for byte");
     const expected = store.getState().canonical.get("project.json");
@@ -198,6 +253,44 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     expect(response.body).toContain("canonical");
     expect(readFileSync(join(root, "project.json"), "utf8")).toBe(before);
     expect(fmtCheck().stdout).toBe("already canonical\n");
+  });
+
+  /**
+   * The grid assertions above are only worth anything if `fmt --check` would notice
+   * a wrongly grouped `steps` string. This writes exactly what a UI that formatted
+   * the string itself would produce — a valid 16-step lane with the spaces in the
+   * wrong places — and confirms the check names it.
+   */
+  it("bites for the grid: a valid but wrongly grouped steps string is reported as a steps-grouping change", () => {
+    const path = join(root, "patterns/drums-verse.json");
+    const ungrouped = readFileSync(path, "utf8").replace('"x.x. x.x. x.x. x.x."', '"x.x.x.x.x.x.x.x."');
+    expect(ungrouped).toContain('"x.x.x.x.x.x.x.x."');
+    writeFileSync(path, ungrouped);
+
+    // Still a project the loader accepts: this is a formatting difference, not a
+    // broken document, which is exactly why only `fmt` can catch it.
+    expect(loadProject(root).ok).toBe(true);
+    const check = fmtCheck();
+
+    expect(check.code).toBe(1);
+    expect(check.stdout).toContain("would rewrite patterns/drums-verse.json");
+    expect(check.stdout).toContain("steps grouping");
+  });
+
+  it("bites for notes: a note list in the wrong order is reported as a sort-order change", () => {
+    const path = join(root, "patterns/bass-main.json");
+    const doc = JSON.parse(readFileSync(path, "utf8")) as { notes: unknown[] };
+    doc.notes.reverse();
+    // Serialized canonically apart from the order, so `sort order` is the only
+    // aspect that can be reported and the assertion cannot pass on a stray space.
+    writeFileSync(path, serializeCanonical(doc as never, "pattern.notes"));
+
+    expect(loadProject(root).ok).toBe(true);
+    const check = fmtCheck();
+
+    expect(check.code).toBe(1);
+    expect(check.stdout).toContain("would rewrite patterns/bass-main.json");
+    expect(check.stdout).toContain("sort order");
   });
 
   it("bites the other way: a non-canonical file on disk is reported by fmt, so the check is not vacuous", () => {

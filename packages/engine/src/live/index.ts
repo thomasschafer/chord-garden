@@ -25,6 +25,12 @@ export {
   type LiveTrackConfig,
 } from "./protocol.js";
 export { hashContent, SampleStore } from "./sampleCache.js";
-export { LiveSession, type LiveSessionOptions, type SampleFetcher } from "./session.js";
+export {
+  LiveSession,
+  type LiveEditEffect,
+  type LiveEditOutcome,
+  type LiveSessionOptions,
+  type SampleFetcher,
+} from "./session.js";
 export { LiveScheduler, nextBarBoundary, type SliceAction, type StructuralChange } from "./scheduler.js";
 export { ScheduleSlicer, firstEventAtOrAfter, type ScheduleSlice } from "./slicer.js";

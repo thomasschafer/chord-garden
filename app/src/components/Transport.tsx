@@ -1,7 +1,7 @@
 import type { Project } from "@chord-garden/format/pure";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { LivePlayer, type PlayerStatus } from "../audio/livePlayer";
-import { client, projectName, seed } from "../session";
+import { useCallback, useEffect, useState } from "react";
+import type { PlayerStatus } from "../audio/livePlayer";
+import { livePlayer, seed } from "../session";
 
 /**
  * Play/stop and a position readout driven by the live engine.
@@ -9,19 +9,32 @@ import { client, projectName, seed } from "../session";
  * The start button is the user gesture the browser requires before an
  * `AudioContext` may make sound (PLAN.md §14), so it is the literal entry point
  * to audio rather than something the app attempts on load and recovers from.
+ *
+ * The player itself lives in `session.ts`, not here: the editors' changes reach it
+ * through the document store (see `audio/documentBridge.ts`), which has to work
+ * whether or not this component happens to be mounted.
  */
-export function Transport({ project }: { project: Project }): React.JSX.Element {
-  const player = useMemo(
-    () => new LivePlayer("/worklet.js", (path) => client.asset(projectName, path)),
-    [],
-  );
-  const [status, setStatus] = useState<PlayerStatus>(() => player.getStatus());
+export function Transport({
+  project,
+  onStatus,
+}: {
+  project: Project;
+  onStatus: (status: PlayerStatus) => void;
+}): React.JSX.Element {
+  const [status, setStatus] = useState<PlayerStatus>(() => livePlayer.getStatus());
 
-  useEffect(() => player.subscribe(setStatus), [player]);
+  useEffect(
+    () =>
+      livePlayer.subscribe((next) => {
+        setStatus(next);
+        onStatus(next);
+      }),
+    [onStatus],
+  );
 
   const start = useCallback(() => {
-    void player.start(project, seed);
-  }, [player, project]);
+    void livePlayer.start(project, seed);
+  }, [project]);
 
   const rate = status.sampleRate ?? 0;
   const seconds = rate === 0 ? 0 : status.positionSample / rate;
@@ -34,7 +47,7 @@ export function Transport({ project }: { project: Project }): React.JSX.Element 
         <button type="button" onClick={start} disabled={status.phase === "starting" || status.phase === "playing"}>
           {status.phase === "idle" ? "click to start audio" : "play"}
         </button>{" "}
-        <button type="button" onClick={() => player.stop()} disabled={status.phase !== "playing"}>
+        <button type="button" onClick={() => livePlayer.stop()} disabled={status.phase !== "playing"}>
           stop
         </button>
       </p>
@@ -59,8 +72,26 @@ export function Transport({ project }: { project: Project }): React.JSX.Element 
           {status.reports > 0 &&
             ` — ${status.reportsWithSound} of ${status.reports} reports carried signal`}
         </span>
+        <span>live edits</span>
+        <span>{describeEdits(status)}</span>
       </div>
       {status.error !== undefined && <p className="error">audio error: {status.error}</p>}
     </section>
   );
+}
+
+/**
+ * What the engine did with the edits made since the transport was loaded.
+ *
+ * Worth showing rather than inferring by ear: PLAN.md §12 step 6 defers a
+ * structural change to a bar line, so between the click and the bar the file and the
+ * sound genuinely disagree, and a person who cannot see that reasonably concludes
+ * the edit did not work.
+ */
+function describeEdits(status: PlayerStatus): string {
+  if (status.phase === "idle") return "press play; edits made now are in the model the engine will compile";
+  if (status.lastEdit === undefined) return `${status.editsApplied} applied`;
+  const { effect, bar, atSample } = status.lastEdit;
+  const when = atSample === null ? "applied immediately" : `queued for bar ${bar} (sample ${atSample})`;
+  return `${status.editsApplied} applied — last was ${effect}, ${when}`;
 }

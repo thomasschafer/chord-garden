@@ -1,9 +1,17 @@
 import {
   canonicalFiles,
+  formatSteps,
+  HIGHEST_MIDI,
+  LOWEST_MIDI,
   parseSteps,
+  pitchToMidi,
   ticksPerBar,
+  type GridLane,
   type GridPatternDoc,
+  type NoteEvent,
+  type NotesPatternDoc,
   type Project,
+  type StepEvent,
 } from "@chord-garden/format/pure";
 import { hashContent } from "@chord-garden/engine/live";
 import { createStore, type StoreApi } from "zustand/vanilla";
@@ -47,6 +55,41 @@ export class WriteConflictError extends Error {
     this.name = "WriteConflictError";
     this.paths = paths;
   }
+}
+
+/**
+ * What an edit means to a running transport (PLAN.md §12 step 6).
+ *
+ * - `none` — nothing an engine can hear. A project's name.
+ * - `parameters` — the same events, rendered differently: an instrument param or
+ *   an automation point. Takes effect in the next scheduling window.
+ * - `structural` — the events themselves moved, appeared or vanished. Queued to
+ *   the next bar boundary while playing; immediate while stopped.
+ *
+ * **This is the seam.** PLAN.md §12 step 5 defers "compute semantic model-domain
+ * patches" to Phase 4, and classifying an arbitrary before/after pair of documents
+ * is that work. Nothing here does it: each action states its own effect, because
+ * the action already knows what it changed and a lookup table beats a diff it
+ * cannot yet compute. When the Phase 4 differ lands it replaces the literals in
+ * `applyEdit` calls and nothing downstream of `audioEdit` changes.
+ *
+ * The line between `parameters` and `structural` is not a judgement call: the
+ * engine's `LiveScheduler.updateParameters` re-checks it against the recompiled
+ * schedule and throws if a caller claimed `parameters` for an edit that moved an
+ * event. So a misclassification in this direction is loud, not silent. Note where
+ * that puts velocity — it is carried by the compiled event, so editing it is
+ * `structural` even though a musician would call it expression.
+ */
+export type AudioEffect = "none" | "parameters" | "structural";
+
+/**
+ * The most recent edit, for the audio layer. Carries its own project snapshot so
+ * a consumer reacting to it cannot pick up a later edit's model by accident.
+ */
+export interface AudioEdit {
+  revision: number;
+  effect: AudioEffect;
+  project: Project;
 }
 
 /** A validation message about the project, from whoever last looked at it. */
@@ -122,14 +165,73 @@ export interface DocumentState {
   conflict: { paths: readonly string[]; message: string } | undefined;
   /** Project diagnostics, refreshed by the server after every write. */
   diagnostics: readonly DocumentDiagnostic[];
+  /**
+   * The last edit and what it means to a running transport. `undefined` until the
+   * first edit of a session, and reset by `open`.
+   */
+  audioEdit: AudioEdit | undefined;
 
   open(loaded: OpenedProject): void;
   setProjectName(name: string): void;
   setTempoBpmX100(bpm: number): void;
   setPatternLaneSteps(patternId: string, lane: string, steps: string): void;
+  /**
+   * Turn one grid step of one lane on or off.
+   *
+   * The step index is the unit the grammar defines — zero-based across the whole
+   * pattern — and never a character offset into `steps`, where a space or a `|`
+   * would make it mean a different step (docs/format-spec.md §5). The string is
+   * re-derived from the parsed hit set by `formatSteps`, so the UI cannot invent a
+   * spacing `fmt` disagrees with.
+   *
+   * `stepsPerBar` is only consulted when the lane does not exist yet, in which
+   * case it is created empty; an existing lane keeps its own grid.
+   */
+  toggleGridStep(patternId: string, lane: string, step: number, stepsPerBar: number): void;
+  /**
+   * Set, change or clear the per-step expression overrides of one hit. A field
+   * given as `undefined` is removed, and an entry left with nothing but its
+   * `step` is dropped, because `fmt` does not emit empty overrides.
+   */
+  setStepEvent(patternId: string, lane: string, step: number, patch: StepEventPatch): void;
+  /** Append a note. Its array position is a handle for this session only. */
+  addNote(patternId: string, note: NoteEvent): void;
+  /** Change one note in place, by its position in the in-memory `notes` array. */
+  updateNote(patternId: string, index: number, changes: NotePatch): void;
+  deleteNote(patternId: string, index: number): void;
   /** Write every dirty file now, cancelling any pending debounce. */
   flushNow(): Promise<void>;
 }
+
+/**
+ * Step overrides to apply. Present-and-`undefined` means "remove this field",
+ * absent means "leave it alone" — which is why `exactOptionalPropertyTypes` is on
+ * and the type says so explicitly.
+ */
+export type StepEventPatch = {
+  [K in keyof Omit<StepEvent, "step">]?: number | undefined;
+};
+
+/** Fields every note must have, which a patch may change but not remove. */
+export const REQUIRED_NOTE_FIELDS = ["pitch", "startTick", "durationTicks", "velocity"] as const;
+/** Fields a note may carry, which a patch may also remove by passing `undefined`. */
+export const OPTIONAL_NOTE_FIELDS = ["microTicks", "probability", "ratchet"] as const;
+
+export type RequiredNoteField = (typeof REQUIRED_NOTE_FIELDS)[number];
+export type OptionalNoteField = (typeof OPTIONAL_NOTE_FIELDS)[number];
+
+/**
+ * Changes to one note.
+ *
+ * The asymmetry is the point, and it is in the type rather than only in a runtime
+ * check: an optional field may be cleared by passing `undefined`, and a required one
+ * may not, because a note without a pitch or a velocity is not a note. `updateNote`
+ * still refuses it at run time — a JS caller can reach it — but a TypeScript caller
+ * cannot express the mistake.
+ */
+export type NotePatch = { [K in RequiredNoteField]?: NoteEvent[K] } & {
+  [K in OptionalNoteField]?: number | undefined;
+};
 
 export type DocumentStore = StoreApi<DocumentState>;
 
@@ -174,7 +276,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
      * where the format demands an integer) throws before anything is committed
      * and leaves the store on its last good state.
      */
-    function applyEdit(mutate: (draft: Project) => void): void {
+    function applyEdit(effect: AudioEffect, mutate: (draft: Project) => void): void {
       const current = get().project;
       if (current === undefined) throw new Error("cannot edit: no project is open");
       const draft = structuredClone(current);
@@ -187,7 +289,8 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         // paper over.
         throw new Error(`edit would remove ${removed.join(", ")}, which the write path cannot express`);
       }
-      set({ project: draft, canonical, dirty, revision: get().revision + 1 });
+      const revision = get().revision + 1;
+      set({ project: draft, canonical, dirty, revision, audioEdit: { revision, effect, project: draft } });
       scheduleFlush();
     }
 
@@ -277,6 +380,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
       lastWriteError: undefined,
       conflict: undefined,
       diagnostics: [],
+      audioEdit: undefined,
 
       open(loaded) {
         if (timer !== undefined) {
@@ -302,11 +406,12 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           lastWriteError: undefined,
           conflict: undefined,
           diagnostics: loaded.diagnostics ?? [],
+          audioEdit: undefined,
         });
       },
 
       setProjectName(name) {
-        applyEdit((draft) => {
+        applyEdit("none", (draft) => {
           draft.project.name = name;
         });
       },
@@ -315,7 +420,9 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         if (!Number.isInteger(bpm)) {
           throw new Error(`tempo must be an integer in bpm×100, got ${bpm}`);
         }
-        applyEdit((draft) => {
+        // Structural, not parametric: every event's sample position is derived
+        // from the tempo, so the whole schedule moves.
+        applyEdit("structural", (draft) => {
           const first = draft.project.tempoMap[0];
           if (first === undefined) throw new Error("cannot set tempo: the project has an empty tempoMap");
           first.bpm = bpm;
@@ -323,13 +430,8 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
       },
 
       setPatternLaneSteps(patternId, lane, steps) {
-        applyEdit((draft) => {
-          const pattern = draft.patterns.get(patternId);
-          if (pattern === undefined) throw new Error(`cannot edit steps: no pattern "${patternId}"`);
-          if (pattern.kind !== "grid") throw new Error(`cannot edit steps: pattern "${patternId}" is not a grid`);
-          const target = (pattern as GridPatternDoc).lanes.find((entry) => entry.lane === lane);
-          if (target === undefined) throw new Error(`cannot edit steps: pattern "${patternId}" has no lane "${lane}"`);
-          const bars = pattern.lengthTicks / ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
+        applyEdit("structural", (draft) => {
+          const { lane: target, bars } = gridLane(draft, patternId, lane);
           const parsed = parseSteps(steps, {
             file: `patterns/${patternId}.json`,
             pointer: "",
@@ -345,6 +447,113 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         });
       },
 
+      toggleGridStep(patternId, laneName, step, stepsPerBar) {
+        applyEdit("structural", (draft) => {
+          const pattern = gridPattern(draft, patternId);
+          const bars = barsOf(draft, pattern.lengthTicks);
+          let lane = pattern.lanes.find((entry) => entry.lane === laneName);
+          if (lane === undefined) {
+            assertVoiceExists(draft, patternId, laneName);
+            assertStepGrid(draft, stepsPerBar);
+            lane = { lane: laneName, grid: { stepsPerBar }, steps: formatSteps([], stepsPerBar, bars) };
+            pattern.lanes.push(lane);
+          }
+          const hits = new Set(hitsOf(lane, patternId, bars));
+          const total = lane.grid.stepsPerBar * bars;
+          if (!Number.isInteger(step) || step < 0 || step >= total) {
+            throw new Error(`cannot toggle step ${step} of lane "${laneName}": the lane has steps 0..${total - 1}`);
+          }
+          if (hits.has(step)) {
+            hits.delete(step);
+            // A `stepEvents` entry may only target a hit (`pattern.step-event-not-a-hit`),
+            // so clearing the hit has to take its overrides with it. There is no
+            // valid document in which they survive, which is why the UI marks a
+            // step that carries them before it is clicked off.
+            if (lane.stepEvents !== undefined) {
+              lane.stepEvents = lane.stepEvents.filter((entry) => entry.step !== step);
+              if (lane.stepEvents.length === 0) delete lane.stepEvents;
+            }
+          } else {
+            hits.add(step);
+          }
+          lane.steps = formatSteps([...hits].sort((a, b) => a - b), lane.grid.stepsPerBar, bars);
+        });
+      },
+
+      setStepEvent(patternId, laneName, step, patch) {
+        applyEdit("structural", (draft) => {
+          const { lane, bars } = gridLane(draft, patternId, laneName);
+          if (!hitsOf(lane, patternId, bars).includes(step)) {
+            throw new Error(
+              `cannot set overrides on step ${step} of lane "${laneName}": that step is a rest, and a stepEvents entry must target a hit`,
+            );
+          }
+          const existing = lane.stepEvents?.find((entry) => entry.step === step);
+          const merged: StepEvent = { ...(existing ?? { step }) };
+          for (const [field, value] of Object.entries(patch) as [keyof StepEventPatch, number | undefined][]) {
+            if (value === undefined) {
+              delete merged[field];
+              continue;
+            }
+            checkStepEventField(field, value);
+            merged[field] = value;
+          }
+          const rest = lane.stepEvents?.filter((entry) => entry.step !== step) ?? [];
+          // One key left means one key that is only the step index, which `fmt`
+          // would not write: the entry has stopped overriding anything.
+          const next = Object.keys(merged).length > 1 ? [...rest, merged] : rest;
+          if (next.length === 0) {
+            delete lane.stepEvents;
+          } else {
+            lane.stepEvents = next.sort((a, b) => a.step - b.step);
+          }
+        });
+      },
+
+      addNote(patternId, note) {
+        applyEdit("structural", (draft) => {
+          const pattern = notesPattern(draft, patternId);
+          checkNote(note, pattern);
+          pattern.notes.push({ ...note });
+        });
+      },
+
+      updateNote(patternId, index, changes) {
+        applyEdit("structural", (draft) => {
+          const pattern = notesPattern(draft, patternId);
+          const existing = pattern.notes[index];
+          if (existing === undefined) {
+            throw new Error(`cannot update note ${index} of "${patternId}": the pattern has ${pattern.notes.length} notes`);
+          }
+          const next: NoteEvent = { ...existing };
+          const required: readonly string[] = REQUIRED_NOTE_FIELDS;
+          for (const [field, value] of Object.entries(changes) as [keyof NoteEvent, NoteEvent[keyof NoteEvent]][]) {
+            if (value === undefined) {
+              // `NotePatch` already forbids this to a typed caller; this is the
+              // runtime half, for the callers types cannot reach.
+              if (required.includes(field)) throw new Error(`cannot remove required note field "${field}"`);
+              delete next[field];
+              continue;
+            }
+            // Assigning through a union of value types needs one cast; the
+            // per-field ranges are then checked by `checkNote` below.
+            (next[field] as NoteEvent[keyof NoteEvent]) = value;
+          }
+          checkNote(next, pattern);
+          pattern.notes[index] = next;
+        });
+      },
+
+      deleteNote(patternId, index) {
+        applyEdit("structural", (draft) => {
+          const pattern = notesPattern(draft, patternId);
+          if (pattern.notes[index] === undefined) {
+            throw new Error(`cannot delete note ${index} of "${patternId}": the pattern has ${pattern.notes.length} notes`);
+          }
+          pattern.notes.splice(index, 1);
+        });
+      },
+
       async flushNow() {
         if (timer !== undefined) {
           clearTimeout(timer);
@@ -356,6 +565,135 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
   });
 
   return store;
+}
+
+function gridPattern(draft: Project, patternId: string): GridPatternDoc {
+  const pattern = draft.patterns.get(patternId);
+  if (pattern === undefined) throw new Error(`no pattern "${patternId}"`);
+  if (pattern.kind !== "grid") throw new Error(`pattern "${patternId}" is a ${pattern.kind} pattern, not a grid`);
+  return pattern;
+}
+
+function notesPattern(draft: Project, patternId: string): NotesPatternDoc {
+  const pattern = draft.patterns.get(patternId);
+  if (pattern === undefined) throw new Error(`no pattern "${patternId}"`);
+  if (pattern.kind !== "notes") throw new Error(`pattern "${patternId}" is a ${pattern.kind} pattern, not a note list`);
+  return pattern;
+}
+
+function gridLane(draft: Project, patternId: string, laneName: string): { lane: GridLane; bars: number } {
+  const pattern = gridPattern(draft, patternId);
+  const lane = pattern.lanes.find((entry) => entry.lane === laneName);
+  if (lane === undefined) throw new Error(`pattern "${patternId}" has no lane "${laneName}"`);
+  return { lane, bars: barsOf(draft, pattern.lengthTicks) };
+}
+
+function barsOf(draft: Project, lengthTicks: number): number {
+  const barTicks = ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
+  const bars = lengthTicks / barTicks;
+  if (!Number.isInteger(bars)) {
+    throw new Error(`pattern length ${lengthTicks} is not a whole number of ${barTicks}-tick bars`);
+  }
+  return bars;
+}
+
+/**
+ * The lane's hit steps, from the grammar's own parser.
+ *
+ * Every edit reads the string back through `parseSteps` instead of remembering
+ * what it wrote, so a lane hand-edited to a different spacing — or to a different
+ * number of bars — is read exactly as the compiler reads it.
+ */
+function hitsOf(lane: GridLane, patternId: string, bars: number): number[] {
+  const parsed = parseSteps(lane.steps, {
+    file: `patterns/${patternId}.json`,
+    pointer: "",
+    stepsPerBar: lane.grid.stepsPerBar,
+    bars,
+  });
+  if (parsed.hits === undefined) {
+    throw new Error(
+      `lane "${lane.lane}" of "${patternId}" does not parse: ${parsed.diagnostics.map((d) => d.message).join("; ")}`,
+    );
+  }
+  return parsed.hits;
+}
+
+/**
+ * A lane name is a kit voice seen from the pattern side (docs/format-spec.md §5),
+ * so creating a lane for a name no playing kit has would write a document
+ * `validate` rejects as `pattern.lane-unknown-voice`. Checked against every track
+ * that references the pattern, exactly as the validator does; a pattern no track
+ * plays is not checked, because there is no kit to check against.
+ */
+function assertVoiceExists(draft: Project, patternId: string, laneName: string): void {
+  for (const track of draft.tracks.values()) {
+    if (!track.patterns.includes(patternId)) continue;
+    const instrument = draft.instruments.get(track.instrument);
+    if (instrument === undefined || instrument.type !== "drumkit") continue;
+    if (!(laneName in instrument.kit)) {
+      throw new Error(
+        `cannot add lane "${laneName}" to "${patternId}": drumkit "${instrument.id}" on track "${track.id}" has no such voice`,
+      );
+    }
+  }
+}
+
+/** Every grid step must be a whole number of ticks (docs/format-spec.md §5). */
+function assertStepGrid(draft: Project, stepsPerBar: number): void {
+  const barTicks = ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
+  if (!Number.isInteger(stepsPerBar) || stepsPerBar <= 0 || barTicks % stepsPerBar !== 0) {
+    throw new Error(`cannot use ${stepsPerBar} steps per bar: it must divide a bar's ${barTicks} ticks evenly`);
+  }
+}
+
+/** permille fields, per PLAN.md §6.2. */
+function checkPermille(field: string, value: number): void {
+  if (!Number.isInteger(value) || value < 0 || value > 1000) {
+    throw new Error(`${field} must be an integer permille in 0..1000, got ${value}`);
+  }
+}
+
+function checkStepEventField(field: keyof StepEventPatch, value: number): void {
+  if (!Number.isInteger(value)) throw new Error(`${field} must be an integer, got ${value}`);
+  if (field === "velocity" || field === "probability") return checkPermille(field, value);
+  if (field === "gateTicks" && value <= 0) throw new Error(`gateTicks must be a positive tick count, got ${value}`);
+  if (field === "ratchet" && value < 1) throw new Error(`ratchet must be at least 1, got ${value}`);
+}
+
+/**
+ * The note rules an editor can break, refused before the model moves.
+ *
+ * Deliberately narrow: these mirror the schema and the semantic checks
+ * (`note.pitch-out-of-range`, `note.start-out-of-range`) that `musictool validate`
+ * owns, and they exist because writing a document the validator would reject is a
+ * worse outcome than a thrown error the UI can show. The pitch rule is not
+ * restated — `pitchToMidi` and the range constants come from the format package,
+ * which is the only place that grammar lives.
+ */
+function checkNote(note: NoteEvent, pattern: NotesPatternDoc): void {
+  const midi = pitchToMidi(note.pitch);
+  if (midi === undefined) throw new Error(`"${note.pitch}" is not a pitch name this format accepts`);
+  if (midi < LOWEST_MIDI || midi > HIGHEST_MIDI) {
+    throw new Error(`pitch "${note.pitch}" is outside the MIDI range C-1..G9`);
+  }
+  if (!Number.isInteger(note.startTick) || note.startTick < 0) {
+    throw new Error(`startTick must be a non-negative integer tick, got ${note.startTick}`);
+  }
+  if (note.startTick >= pattern.lengthTicks) {
+    throw new Error(`startTick ${note.startTick} is past the end of a ${pattern.lengthTicks}-tick pattern`);
+  }
+  if (!Number.isInteger(note.durationTicks) || note.durationTicks <= 0) {
+    throw new Error(`durationTicks must be a positive integer, got ${note.durationTicks}`);
+  }
+  checkPermille("velocity", note.velocity);
+  if (note.probability !== undefined) checkPermille("probability", note.probability);
+  if (note.microTicks !== undefined && !Number.isInteger(note.microTicks)) {
+    throw new Error(`microTicks must be an integer, got ${note.microTicks}`);
+  }
+  if (note.ratchet !== undefined && (!Number.isInteger(note.ratchet) || note.ratchet < 1)) {
+    throw new Error(`ratchet must be an integer of at least 1, got ${note.ratchet}`);
+  }
 }
 
 /** Documents whose bytes on disk are valid but not the canonical form. */

@@ -1,4 +1,4 @@
-import { LIVE_PROCESSOR_NAME, LiveSession, type LiveEvent } from "@chord-garden/engine/live";
+import { LIVE_PROCESSOR_NAME, LiveSession, type LiveEditEffect, type LiveEvent } from "@chord-garden/engine/live";
 import type { Project } from "@chord-garden/format/pure";
 
 /** Everything a transport readout needs, pushed on each worklet report. */
@@ -22,6 +22,21 @@ export interface PlayerStatus {
   reportsWithSound: number;
   reports: number;
   error: string | undefined;
+  /**
+   * What became of the last document edit handed to the live engine, so the UI can
+   * say whether a change is already audible or is waiting for a bar line
+   * (PLAN.md §12 step 6). `undefined` before the first edit of a run.
+   */
+  lastEdit: EditStatus | undefined;
+  /** Document edits this run has fed to the engine. */
+  editsApplied: number;
+}
+
+export interface EditStatus {
+  effect: LiveEditEffect;
+  /** Bar number (1-based, as the UI counts) the change takes effect at. */
+  bar: number | null;
+  atSample: number | null;
 }
 
 const IDLE: PlayerStatus = {
@@ -36,6 +51,8 @@ const IDLE: PlayerStatus = {
   reportsWithSound: 0,
   reports: 0,
   error: undefined,
+  lastEdit: undefined,
+  editsApplied: 0,
 };
 
 /** Seconds of silence after the last event, so release tails are not cut off. */
@@ -147,6 +164,45 @@ export class LivePlayer {
     this.update({ ...this.status, phase: "stopped" });
   }
 
+  /**
+   * Hand an edited document to the running engine.
+   *
+   * Only while playing, and that is not a shortcut: `start` builds a fresh
+   * `AudioContext` and a fresh `LiveSession` from whatever the document says at the
+   * time, so an edit made while idle or stopped is already in the next run and
+   * telling the outgoing session about it would recompile the whole project to
+   * configure a graph about to be discarded. PLAN.md §12 step 6's "applies at once
+   * while stopped" is `LiveSession`'s rule, and it is the right one for a transport
+   * that resumes; this one does not.
+   */
+  async applyDocumentEdit(project: Project, effect: LiveEditEffect): Promise<void> {
+    const session = this.session;
+    if (session === undefined || this.status.phase !== "playing") return;
+    try {
+      const outcome = await session.update(project, effect);
+      this.endSample = session.totalSamples + TAIL_SECONDS * session.sampleRate;
+      this.update({
+        ...this.status,
+        totalSamples: session.totalSamples,
+        editsApplied: this.status.editsApplied + 1,
+        lastEdit: {
+          effect: outcome.effect,
+          atSample: outcome.atSample,
+          bar: outcome.atSample === null ? null : barOfSample(session.barStarts, outcome.atSample),
+        },
+      });
+    } catch (error) {
+      // Loud rather than silent: an edit the engine could not adopt means the
+      // sound and the document have diverged, which is the one state this app
+      // must never present as normal.
+      this.update({
+        ...this.status,
+        phase: "failed",
+        error: `the live engine refused an edit: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
   private handleEvent(event: LiveEvent): void {
     if (event.type === "error") {
       this.update({ ...this.status, phase: "failed", error: event.message });
@@ -175,4 +231,18 @@ export class LivePlayer {
     this.status = status;
     for (const listener of this.listeners) listener(status);
   }
+}
+
+/**
+ * The 1-based bar a sample position falls in. A structural change lands on the
+ * first render quantum at or after a bar line, so the position is at or just past
+ * the boundary and the last boundary not after it is the bar it starts.
+ */
+function barOfSample(barStarts: readonly number[], sample: number): number {
+  let bar = 1;
+  for (let index = 0; index < barStarts.length; index++) {
+    if (barStarts[index]! <= sample) bar = index + 1;
+    else break;
+  }
+  return bar;
 }

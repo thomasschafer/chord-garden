@@ -162,6 +162,27 @@ export function musicalGrid(project: Project, options: Partial<CompileOptions> =
   };
 }
 
+/**
+ * Samples per tick at the project's tempo — the one conversion between musical
+ * time and audio time.
+ *
+ * Exported because a UI showing a playhead has to turn a sample position back
+ * into a tick, and a second copy of this formula is how a playhead ends up drifting
+ * away from the sound it is supposed to be tracking. V1 has a single tempo point
+ * (docs/format-spec.md §3), so this is a constant for the whole project; when tempo
+ * ramps arrive it becomes a function of position and every caller of this will have
+ * to be revisited, which is easier to find than an inlined division.
+ */
+export function samplesPerTick(project: Project, sampleRate: number): number {
+  const tempo = project.project.tempoMap[0];
+  if (tempo === undefined) throw new Error("cannot convert ticks to samples: tempoMap has no first point");
+  return ticksToSamplesFactor(tempo.bpm, project.project.ppqn, sampleRate);
+}
+
+function ticksToSamplesFactor(bpmX100: number, ppqn: number, sampleRate: number): number {
+  return (60 / (bpmX100 / 100) / ppqn) * sampleRate;
+}
+
 /** Sample positions of every `stepTicks` boundary starting inside the range. */
 function gridStarts(context: CompileContext, stepTicks: number): number[] {
   const starts: number[] = [];
@@ -188,7 +209,7 @@ function compileContext(project: Project, options: Partial<CompileOptions>): Com
   if (!Number.isInteger(barTicks)) {
     throw new Error(`cannot compile project: meterMap[0] produces a non-integer bar length (${barTicks} ticks)`);
   }
-  const samplesPerTick = (60 / (tempo.bpm / 100) / project.project.ppqn) * sampleRate;
+  const samplesPerTick = ticksToSamplesFactor(tempo.bpm, project.project.ppqn, sampleRate);
   const rangeStartTick = options.barRange === undefined ? 0 : options.barRange.start * barTicks;
   const rangeEndTick = options.barRange === undefined ? project.arrangement.lengthTicks : options.barRange.end * barTicks;
   if (rangeEndTick > project.arrangement.lengthTicks) {

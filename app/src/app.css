@@ -1,13 +1,43 @@
 /*
- * Plain on purpose. Stage 1 is the shell, the store and the write path; the
- * sequencer and piano roll arrive next and can bring a real visual design with
- * them. Everything here is in service of being able to read what the model says.
+ * Plain on purpose: no design system, no component library, nothing that animates
+ * for its own sake. What the editors do spend effort on is the part that has to be
+ * right to make music — bar and beat divisions you can see at a glance, cells big
+ * enough to hit, a playhead you can follow, and enough contrast in both colour
+ * schemes to tell a hit from a rest without looking twice.
  */
 :root {
   color-scheme: light dark;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 14px;
   line-height: 1.5;
+
+  --surface: #ffffff;
+  --sunken: #f2f2f0;
+  --line: #d8d8d4;
+  --line-beat: #b4b4ae;
+  --line-bar: #6f6f6a;
+  --hit: #2f6f4f;
+  --hit-text: #ffffff;
+  --note: #3d6ea8;
+  --note-selected: #b4531f;
+  --playhead: #cc3322;
+  --black-key: #e6e6e2;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #16171a;
+    --sunken: #1e2024;
+    --line: #33363c;
+    --line-beat: #4b4f57;
+    --line-bar: #808691;
+    --hit: #4f9f74;
+    --hit-text: #08120c;
+    --note: #6f9fd8;
+    --note-selected: #e08040;
+    --playhead: #ef5a44;
+    --black-key: #191b1f;
+  }
 }
 
 body {
@@ -87,4 +117,305 @@ button {
 ul {
   margin: 0.25rem 0;
   padding-left: 1.2rem;
+}
+
+/* --- pattern editors ------------------------------------------------------- */
+
+h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 1.25rem 0 0.35rem;
+}
+
+/*
+ * The editors are wider than the prose sections, and a pattern longer than the
+ * window scrolls sideways inside itself rather than making the page scroll.
+ */
+section:has(.editor) {
+  max-width: none;
+}
+
+.editor {
+  margin-bottom: 0.75rem;
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.35rem;
+}
+
+/*
+ * Hugs its content so the frame ends where the pattern ends — a box drawn to the
+ * window's width past the last bar reads as "there is more here", and there is not.
+ * The cap keeps a long pattern scrolling inside `.lane-scroll` rather than making the
+ * page scroll.
+ */
+.editor-grid {
+  display: flex;
+  align-items: flex-start;
+  border: 1px solid var(--line-bar);
+  background: var(--surface);
+  width: fit-content;
+  max-width: 100%;
+}
+
+.lane-scroll {
+  overflow-x: auto;
+  flex: 1;
+}
+
+.lane-stack,
+.roll-canvas {
+  position: relative;
+}
+
+/* Row labels: a fixed column that does not scroll with the cells. */
+.lane-labels {
+  flex: none;
+  border-right: 1px solid var(--line-bar);
+  background: var(--sunken);
+}
+
+.ruler-label,
+.lane-label {
+  height: 1.5rem;
+  min-width: 6rem;
+  padding: 0 0.4rem;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.ruler-label {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.lane-label:last-child,
+.lane:last-child {
+  border-bottom: none;
+}
+
+.ruler {
+  display: flex;
+  height: 1.5rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--sunken);
+}
+
+.ruler-cell {
+  flex: none;
+  font-size: 0.75rem;
+  padding-left: 0.2rem;
+  opacity: 0.75;
+  border-left: 1px solid var(--line);
+}
+
+.ruler-cell.bar-start {
+  border-left: 1px solid var(--line-bar);
+  opacity: 1;
+  font-weight: 600;
+}
+
+.lane {
+  display: flex;
+  height: 1.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+/*
+ * A cell is a button, so it is reachable by keyboard and announces its own state;
+ * everything below is undoing the fact that a button looks like a button.
+ */
+.cell {
+  flex: none;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cell.beat-start {
+  border-left: 1px solid var(--line-beat);
+}
+
+.cell.bar-start {
+  border-left: 2px solid var(--line-bar);
+}
+
+.cell:hover {
+  background: var(--sunken);
+}
+
+.cell.hit {
+  background: var(--hit);
+  color: var(--hit-text);
+}
+
+.cell.hit:hover {
+  filter: brightness(1.15);
+}
+
+/* A step carrying `stepEvents` overrides. The dot is the content, this is the ring. */
+.cell.has-override {
+  box-shadow: inset 0 0 0 2px var(--note-selected);
+}
+
+.cell.selected {
+  outline: 2px solid var(--note-selected);
+  outline-offset: -2px;
+}
+
+.playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--playhead);
+  pointer-events: none;
+}
+
+/* --- piano roll ----------------------------------------------------------- */
+
+.keys {
+  flex: none;
+  border-right: 1px solid var(--line-bar);
+  background: var(--sunken);
+}
+
+.key {
+  height: 15px;
+  min-width: 4rem;
+  padding: 0 0.3rem;
+  font-size: 0.65rem;
+  line-height: 15px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.key.black {
+  background: var(--black-key);
+}
+
+/* Vertical beat lines and horizontal octave lines, as one repeating background. */
+.roll-canvas {
+  background-image:
+    repeating-linear-gradient(to right, var(--line-beat) 0 1px, transparent 1px 100%),
+    repeating-linear-gradient(to bottom, var(--line) 0 1px, transparent 1px 100%);
+  background-repeat: repeat;
+}
+
+.roll-row {
+  box-sizing: border-box;
+}
+
+.roll-row.black {
+  background: var(--black-key);
+}
+
+.bar-line {
+  position: absolute;
+  top: 0;
+  width: 0;
+  border-left: 2px solid var(--line-bar);
+  pointer-events: none;
+}
+
+.bar-line span {
+  position: absolute;
+  top: 0;
+  left: 3px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+.note {
+  position: absolute;
+  box-sizing: border-box;
+  padding: 0 0 0 2px;
+  margin: 0;
+  border: 1px solid color-mix(in srgb, var(--note) 60%, black);
+  border-radius: 2px;
+  background: var(--note);
+  color: var(--hit-text);
+  font: inherit;
+  font-size: 0.6rem;
+  line-height: 1;
+  text-align: left;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.note.selected {
+  background: var(--note-selected);
+  border-color: color-mix(in srgb, var(--note-selected) 60%, black);
+  z-index: 2;
+}
+
+/* A note carrying microTicks, probability or a ratchet. */
+.note.expressive {
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.35) 0 3px,
+    transparent 3px 6px
+  );
+}
+
+.note-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: ew-resize;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.note-label {
+  pointer-events: none;
+}
+
+/* --- inspectors ----------------------------------------------------------- */
+
+.inspector {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  background: var(--sunken);
+}
+
+.inspector-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+  flex-wrap: wrap;
+}
+
+.inspector .fields {
+  gap: 0.35rem 0;
+}
+
+.inspector label {
+  gap: 0.3rem;
+  margin-right: 1rem;
+}
+
+.inspector input {
+  width: 5.5rem;
+}
+
+select {
+  font: inherit;
 }

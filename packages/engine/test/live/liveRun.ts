@@ -18,14 +18,23 @@ export interface LiveRunOptions {
   lookaheadSamples?: number;
 }
 
-export interface LiveRun {
+/**
+ * What `renderLive` needs to drive a live path: a worklet, something to schedule
+ * into it, and a clock. Narrower than `LiveRun` so a test that builds its transport
+ * through `LiveSession` — as the app does — can be rendered by the same function
+ * rather than a second copy of the render loop.
+ */
+export interface LiveRenderTarget {
   harness: WorkletHarness;
   transport: LiveTransport;
+  clock: { currentTime: number };
+  sampleRate: number;
+}
+
+export interface LiveRun extends LiveRenderTarget {
   scheduler: LiveScheduler;
   schedule: CompiledSchedule;
   barStarts: readonly number[];
-  clock: { currentTime: number };
-  sampleRate: number;
   /** Every command the transport posted, in order, for protocol assertions. */
   posted: LiveCommand[];
   graphOf: (schedule: CompiledSchedule) => LiveGraph;
@@ -128,7 +137,7 @@ export interface LiveRenderResult {
  * path only ever renders whole quanta, and pretending otherwise would hide the one
  * real difference from the offline renderer, whose final block may be short.
  */
-export function renderLive(run: LiveRun, totalSamples: number, options: LiveRenderOptions = {}): LiveRenderResult {
+export function renderLive(run: LiveRenderTarget, totalSamples: number, options: LiveRenderOptions = {}): LiveRenderResult {
   if (totalSamples % CONTROL_BLOCK_SIZE !== 0) {
     throw new Error(`live render length ${totalSamples} is not a whole number of ${CONTROL_BLOCK_SIZE}-sample quanta`);
   }
