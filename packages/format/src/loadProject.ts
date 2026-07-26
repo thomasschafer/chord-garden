@@ -16,6 +16,16 @@ export interface LoadedFile {
   kind: DocKind;
   value: JsonValue;
   locs: Map<string, Loc>;
+  /**
+   * The exact bytes this document was read with.
+   *
+   * Kept because a caller that has to *report* what it validated cannot re-read
+   * the file to find out: the sidecar's watcher validates a snapshot and pushes
+   * the same bytes to the browser, and a second read could pick up a newer
+   * version, leaving the browser holding a document that was never part of the
+   * snapshot the diagnostics describe (PLAN.md §12).
+   */
+  text: string;
 }
 
 export interface LoadResult {
@@ -111,7 +121,7 @@ function loadFile(
   diags.addAll(schemaValidate(parsed.value, kind, path, parsed.locs));
   checkFileNameMatchesId(path, kind, parsed.value, parsed.locs, diags);
 
-  files.set(path, { path, kind, value: parsed.value, locs: parsed.locs });
+  files.set(path, { path, kind, value: parsed.value, locs: parsed.locs, text });
   return parsed.value;
 }
 

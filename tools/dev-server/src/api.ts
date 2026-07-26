@@ -82,5 +82,122 @@ export interface WriteResponse {
  */
 export const TOKEN_HEADER = "x-chord-garden-token";
 
+/** Path, under a project mount, that upgrades to the sync WebSocket. */
+export const SOCKET_PATH = "socket";
+
+/**
+ * Version of the sync protocol below. Bumped when a message shape changes, and
+ * checked in the handshake: a page left open across a rebuild is told to reload
+ * rather than left silently misreading a message it half understands.
+ */
+export const SYNC_PROTOCOL = 1;
+
+/** Largest client→server message the socket will read (PLAN.md §10). */
+export const MAX_SOCKET_MESSAGE_BYTES = 64 * 1024;
+
+/**
+ * How long a socket may stay silent after connecting before it must have
+ * authenticated. An unauthenticated socket costs a file descriptor and can do
+ * nothing, so it is not allowed to sit there.
+ */
+export const HELLO_TIMEOUT_MS = 10_000;
+
+/**
+ * The client's first and only pre-authentication message (PLAN.md §10: prefer
+ * first-message authentication over a token in the URL query string).
+ */
+export interface HelloMessage {
+  type: "hello";
+  protocol: number;
+  token: string;
+  project: string;
+}
+
+export type ClientMessage = HelloMessage;
+
+/** One document in a pushed snapshot, with the bytes the server validated. */
+export interface SnapshotFile {
+  path: string;
+  kind: DocKind;
+  contentHash: string;
+}
+
+export interface ChangedFile extends SnapshotFile {
+  /** Exactly the bytes the sidecar read and validated. */
+  text: string;
+}
+
+/**
+ * An external edit that the sidecar read, validated as a whole project, and is
+ * handing to the browser (PLAN.md §12 step 4).
+ *
+ * PLAN.md §11 sketches per-file `fileChanged`/`fileRemoved`/`diagnosticsChanged`
+ * pushes. This is deliberately one message instead: an agent's edit routinely
+ * touches several files, per-file messages cannot say "these landed together and
+ * the result validates", and §12 requires the browser to accept a snapshot only
+ * after project-level validation passes. So the unit of push is the snapshot,
+ * with the changed files named inside it.
+ */
+export interface ProjectChangedMessage {
+  type: "projectChanged";
+  /**
+   * Every document on disk after the change, so the browser can prove its own
+   * copy is complete rather than assume it. A path the browser cannot account
+   * for is a desynchronised browser, which it must say out loud.
+   */
+  files: SnapshotFile[];
+  /** Documents whose bytes differ from what the sidecar last established. */
+  changed: ChangedFile[];
+  /** Documents that were part of the last snapshot and are gone. */
+  removed: string[];
+  /** Warnings from the validated snapshot; errors would make it unsendable. */
+  diagnostics: ApiDiagnostic[];
+}
+
+/**
+ * The project on disk does not currently validate, so there is no snapshot to
+ * adopt. Sent rather than swallowed: a half-finished multi-file agent edit is
+ * expected and transient, but the browser still has to show why it has stopped
+ * following the disk, and its write preconditions are now deliberately stale.
+ */
+export interface ProjectInvalidMessage {
+  type: "projectInvalid";
+  diagnostics: ApiDiagnostic[];
+}
+
+export interface WelcomeMessage {
+  type: "welcome";
+  protocol: number;
+  project: string;
+}
+
+/**
+ * The handshake was refused. Carries a human-readable reason because every case
+ * — wrong token, wrong protocol, project already open elsewhere — is something
+ * the person looking at the page has to be told (PLAN.md §12 single-writer).
+ */
+export interface RejectedMessage {
+  type: "rejected";
+  reason: string;
+}
+
+/** A protocol violation. The socket is closed immediately afterwards. */
+export interface SocketErrorMessage {
+  type: "error";
+  message: string;
+}
+
+export type ServerMessage =
+  | WelcomeMessage
+  | RejectedMessage
+  | SocketErrorMessage
+  | ProjectChangedMessage
+  | ProjectInvalidMessage;
+
+/** Close code for "this project is already open in another window". */
+export const CLOSE_ALREADY_OPEN = 4001;
+/** Close code for a refused handshake that is not a single-writer rejection. */
+export const CLOSE_UNAUTHORIZED = 4003;
+
 /** Global the served HTML defines so a page's own scripts can authenticate. */
 export const TOKEN_GLOBAL = "__CHORD_GARDEN_TOKEN__";

@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildWebBundles, REPO_ROOT } from "./bundle.js";
 import { createAssetServer, summarise, type ProjectMount } from "./server.js";
+import { ProjectSync } from "./sync.js";
 
 const DEFAULT_PORT = 4173;
 const DEFAULT_PROJECT = "fixtures/valid/first-track";
@@ -105,13 +106,29 @@ export async function main(argv: readonly string[]): Promise<void> {
   const token = randomBytes(32).toString("hex");
   const appRoot = join(REPO_ROOT, "app/dist");
 
+  const log = (line: string): void => {
+    process.stdout.write(`${line}\n`);
+  };
+
+  // One watcher per open project (PLAN.md §12). Sync logging is not tied to
+  // `--verbose`: an external edit arriving, or a project on disk that stopped
+  // validating, is the kind of thing you want in the terminal by default when
+  // an agent is editing the files underneath you.
+  const syncs = new Map(
+    options.projects.map((project) => [project.name, new ProjectSync({ mount: project, token, log })]),
+  );
+
   const server = createAssetServer({
     projects: options.projects,
     webRoot: join(REPO_ROOT, "tools/dev-server/web"),
     bundleRoot,
     token,
+    syncs,
     ...(existsSync(appRoot) ? { appRoot } : {}),
-    ...(options.verbose ? { log: (line: string) => process.stdout.write(`${line}\n`) } : {}),
+    ...(options.verbose ? { log } : {}),
+  });
+  server.on("close", () => {
+    for (const sync of syncs.values()) sync.close();
   });
 
   await new Promise<void>((resolveListen) => {

@@ -149,7 +149,31 @@ Three things about the render that look like bugs and aren't:
 ## What you never need to do
 
 There is no agent-specific integration to wire up. You edit files with
-`Read`/`Write`/`Edit`; if the desktop UI has the project open, a file watcher
-(Phase 4) picks up your changes and reconciles them automatically. You don't
-call an API, don't need a special mode, and don't coordinate with the UI
-beyond making sure `validate` passes before you consider the edit finished.
+`Read`/`Write`/`Edit`; if the app has the project open, a file watcher picks up
+your changes and the UI updates live, without a reload. You don't call an API,
+don't need a special mode, and don't coordinate with the UI beyond making sure
+`validate` passes when you're done.
+
+## Editing while the app has the project open
+
+This works, and you don't need permission for it — but four things are worth
+knowing so nothing surprises you.
+
+**Leaving the project temporarily invalid is fine.** A multi-file edit isn't
+atomic on disk, so the app expects to see broken intermediate states. It adopts
+nothing until the whole project validates: it keeps the last good version on
+screen and shows your diagnostics. Finish the edit and it catches up by itself.
+You don't need to sequence your writes to keep every intermediate state valid.
+
+**If someone has unsaved UI edits to a file you write, theirs are dropped.** The
+disk wins, because your edit landed and theirs never did. It's reported visibly
+rather than silently, and their unsaved edits to files you *didn't* touch
+survive. Nothing for you to do — just don't be surprised.
+
+**The app never reformats files it hasn't edited.** If you write valid but
+non-canonical JSON, it will adopt it as-is and leave the formatting alone. So
+`fmt` is still your job; opening the app is not a substitute for running it.
+
+**One browser window edits a project at a time.** A second window is refused.
+This doesn't constrain you — it means there is only ever one UI whose unsaved
+state you could collide with.

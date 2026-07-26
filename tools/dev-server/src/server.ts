@@ -1,9 +1,21 @@
 import { createReadStream, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import type { Duplex } from "node:stream";
 import { loadProject } from "@chord-garden/format";
-import { TOKEN_GLOBAL, TOKEN_HEADER, type ProjectSummary, type WriteRequest, type WriteResponse } from "./api.js";
+import {
+  MAX_SOCKET_MESSAGE_BYTES,
+  SOCKET_PATH,
+  TOKEN_GLOBAL,
+  TOKEN_HEADER,
+  type ProjectSummary,
+  type WriteRequest,
+  type WriteResponse,
+} from "./api.js";
 import { resolveProjectAsset, resolveStaticAsset } from "./paths.js";
+import type { ProjectSync } from "./sync.js";
+import { constantTimeEquals } from "./token.js";
+import { acceptUpgrade, refuseUpgrade } from "./websocket.js";
 import { MAX_BODY_BYTES, writeBatch } from "./write.js";
 
 /** One project directory, exposed under `/api/projects/<name>`. */
@@ -27,6 +39,18 @@ export interface AssetServerOptions {
   token: string;
   /** Directory holding the built web app (`app/dist`), served under `/app/`. */
   appRoot?: string;
+  /**
+   * The watcher/push layer for each project, by mount name (PLAN.md §12). When a
+   * project has one, `/api/projects/<name>/socket` upgrades to its WebSocket and
+   * every write through this server is reported to it for echo detection. A
+   * project without one is served exactly as before, which is what the harness
+   * page and the read-only tests want.
+   *
+   * Constructed by the caller rather than here so that the thing which decides
+   * *when* a scan happens can be replaced in a test without stubbing an HTTP
+   * server, and so the sidecar's lifetime is owned by whoever owns the process.
+   */
+  syncs?: ReadonlyMap<string, ProjectSync>;
   log?: (line: string) => void;
 }
 
@@ -64,7 +88,7 @@ export function createAssetServer(options: AssetServerOptions): Server {
     throw new Error(`session token must be at least 16 characters; got ${options.token.length}`);
   }
 
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     try {
       const finished = handle(req, res, mounts, options, log);
       if (finished instanceof Promise) {
@@ -76,6 +100,72 @@ export function createAssetServer(options: AssetServerOptions): Server {
       fail(req, res, log, error);
     }
   });
+
+  server.on("upgrade", (req, socket, head) => {
+    try {
+      handleUpgrade(req, socket, head, mounts, options, log);
+    } catch (error) {
+      log(`upgrade failed: ${error instanceof Error ? error.message : String(error)}`);
+      socket.destroy();
+    }
+  });
+
+  return server;
+}
+
+/**
+ * Turn an upgrade request into a sync socket, or refuse it.
+ *
+ * The same three gates as an HTTP request, in the same order, because a
+ * WebSocket is not less dangerous than a GET (PLAN.md §10): loopback `Host`,
+ * matching `Origin`, and confinement to a project that is actually mounted. The
+ * token is the one difference — it arrives in the socket's first message rather
+ * than in a header or a query parameter, so `ProjectSync` completes the
+ * authentication after this function has handed the socket over.
+ */
+function handleUpgrade(
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  mounts: Map<string, ProjectMount>,
+  options: AssetServerOptions,
+  log: (line: string) => void,
+): void {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const match = new RegExp(`^/api/projects/([^/]+)/${SOCKET_PATH}$`).exec(url.pathname);
+  if (match === null) {
+    log(`404 upgrade ${url.pathname}`);
+    refuseUpgrade(socket, { status: 404, message: `no socket at ${url.pathname}` });
+    return;
+  }
+  const name = decodeURIComponent(match[1]!);
+  const sync = options.syncs?.get(name);
+  if (sync === undefined || !mounts.has(name)) {
+    log(`404 upgrade ${url.pathname}`);
+    refuseUpgrade(socket, {
+      status: 404,
+      message: mounts.has(name)
+        ? `project "${name}" is served without a watcher, so it has no sync socket`
+        : `no project named "${name}"`,
+    });
+    return;
+  }
+
+  const connection = acceptUpgrade(req, socket, {
+    maxMessageBytes: MAX_SOCKET_MESSAGE_BYTES,
+    check: (request) => {
+      if (!hostIsLoopback(request.headers.host)) {
+        return { status: 403, message: `refusing upgrade for host "${String(request.headers.host)}"` };
+      }
+      const originError = checkOrigin(request);
+      return originError === undefined ? undefined : { status: 403, message: originError };
+    },
+  });
+  if (connection === undefined) return;
+
+  log(`upgrade ${url.pathname}`);
+  sync.attach(connection);
+  if (head.length > 0) connection.ingest(head);
 }
 
 /**
@@ -186,7 +276,7 @@ function handle(
       sendText(res, 404, `no project named "${decodeURIComponent(write[1]!)}"`);
       return;
     }
-    return handleWrite(req, res, mount, log);
+    return handleWrite(req, res, mount, options.syncs?.get(mount.name), log);
   }
 
   if (method !== "GET" && method !== "HEAD") {
@@ -230,6 +320,7 @@ async function handleWrite(
   req: IncomingMessage,
   res: ServerResponse,
   mount: ProjectMount,
+  sync: ProjectSync | undefined,
   log: (line: string) => void,
 ): Promise<void> {
   const type = req.headers["content-type"] ?? "";
@@ -258,7 +349,7 @@ async function handleWrite(
     return;
   }
 
-  const result = writeBatch(mount.root, request.files);
+  const result = writeBatch(mount.root, request.files, (path, contents) => sync?.noteWrite(path, contents));
   if (!result.ok) {
     log(`${result.status} write ${mount.name} ${result.message}`);
     sendText(res, result.status, result.message);
@@ -412,15 +503,6 @@ function requireOrigin(req: IncomingMessage): string | undefined {
   return req.headers.origin === undefined
     ? "a write needs an Origin header; this server only accepts writes from its own pages"
     : undefined;
-}
-
-/** Length-independent compare, so a wrong token leaks nothing through timing. */
-function constantTimeEquals(a: string, b: string): boolean {
-  let diff = a.length ^ b.length;
-  for (let index = 0; index < a.length; index++) {
-    diff |= a.charCodeAt(index) ^ b.charCodeAt(index % b.length);
-  }
-  return diff === 0;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, method = "GET"): void {

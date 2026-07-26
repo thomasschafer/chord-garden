@@ -1,5 +1,5 @@
 import { midiToPitch, pitchToMidi, type NoteEvent, type NotesPatternDoc, type Project } from "@chord-garden/format/pure";
-import { memo, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "zustand";
 import { documentStore } from "../session";
 import type { NotePatch, OptionalNoteField, RequiredNoteField } from "../store/documentStore";
@@ -63,6 +63,25 @@ export function PianoRoll({
   const [drag, setDrag] = useState<Drag | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
   const rangeRef = useRef<{ patternId: string; range: PitchRange } | undefined>(undefined);
+
+  /**
+   * Drop the selection when an external edit lands on *this* pattern.
+   *
+   * PLAN.md §12 step 4 asks for UI state to be preserved by stable id where it
+   * reasonably can be. A note has no id: the selection is an index into
+   * `pattern.notes`, documented as a handle for this session only. After an agent
+   * rewrites the pattern that index means a different note, and the inspector
+   * would then be editing a note nobody selected — a wrong write, arrived at
+   * silently. Clearing is the honest reading of "where possible". A step
+   * sequencer selection survives, because a lane name and a step index are
+   * musical coordinates rather than array positions.
+   */
+  const external = useStore(documentStore, (state) => state.lastExternalEdit);
+  useEffect(() => {
+    if (external === undefined || !external.adopted.includes(`patterns/${pattern.id}.json`)) return;
+    setSelected(undefined);
+    setDrag(undefined);
+  }, [external, pattern.id]);
 
   /**
    * The rows on show, widened but never narrowed for as long as this pattern is open.

@@ -58,7 +58,11 @@ export function hashOnDisk(path: string): string | null {
  * across someone else's edit from silently overwriting it — the failure mode
  * PLAN.md §3 least tolerates, because it makes the two editors unequal.
  */
-export function writeBatch(root: string, files: readonly WriteRequestFile[]): WriteBatchResult {
+export function writeBatch(
+  root: string,
+  files: readonly WriteRequestFile[],
+  onWritten?: (path: string, contents: string) => void,
+): WriteBatchResult {
   if (files.length === 0) {
     return { ok: false, status: 400, message: "write batch contained no files" };
   }
@@ -121,6 +125,12 @@ export function writeBatch(root: string, files: readonly WriteRequestFile[]): Wr
   const acks: WriteAck[] = [];
   for (const entry of planned) {
     writeFileAtomically(entry.target, entry.contents);
+    // Reported here, inside the same synchronous block as the write, rather than
+    // by the caller afterwards. The watcher's echo detection depends on knowing
+    // these bytes before it can possibly scan them, and "the caller remembers to
+    // tell the watcher" is exactly the kind of ordering assumption that decays
+    // into an infinite write/watch loop (PLAN.md §18).
+    onWritten?.(entry.relative, entry.contents);
     acks.push({ path: entry.relative, bytes: Buffer.byteLength(entry.contents, "utf8"), contentHash: entry.hash });
   }
   return { ok: true, acks };

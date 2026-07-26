@@ -83,6 +83,17 @@ export class ProjectClient {
     return new ProjectClient(token);
   }
 
+  /**
+   * The session token this client authenticates with.
+   *
+   * Exposed because the sync socket authenticates with the same token in its
+   * first message (PLAN.md §10) and there should be one place that knows how a
+   * page comes by it — not two readers of the same injected global.
+   */
+  get sessionToken(): string {
+    return this.token;
+  }
+
   async listProjects(): Promise<ProjectList> {
     return this.json<ProjectList>("/api/projects");
   }

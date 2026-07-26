@@ -13,8 +13,12 @@ import {
   type Project,
   type StepEvent,
 } from "@chord-garden/format/pure";
-import { hashContent } from "@chord-garden/engine/live";
 import { createStore, type StoreApi } from "zustand/vanilla";
+import { hashText } from "./hash";
+import { reconcileExternalChange, type ExternalChange } from "./reconcile";
+
+export { hashText } from "./hash";
+export type { ExternalChange } from "./reconcile";
 
 /** Debounce window for writes (PLAN.md §12 step 1). */
 export const WRITE_DEBOUNCE_MS = 250;
@@ -30,17 +34,6 @@ export interface PendingFile {
    * overwriting it.
    */
   expectedHash: string | null;
-}
-
-/**
- * Content hash of a document's text, over UTF-8 bytes.
- *
- * The engine's hash, not a second one: the server hashes the file on disk with
- * exactly this function, and two implementations of "the hash of these bytes"
- * would be a precondition that fails for no reason.
- */
-export function hashText(text: string): string {
-  return hashContent(new TextEncoder().encode(text));
 }
 
 /**
@@ -160,11 +153,42 @@ export interface DocumentState {
    * Set when the server refused a write because a file changed underneath. While
    * it is set the store writes nothing: the edits are still here and still
    * dirty, but sending them again would overwrite whoever else edited the file.
-   * Only `open` clears it — which is the reload the UI asks the human for.
+   *
+   * With the Phase 4 watcher this is no longer a dead end. A 409 means the disk
+   * moved, and the watcher is about to say how — so `applyExternalChange` clears
+   * the conflict once it has re-established every file the conflict named, and
+   * writing resumes on its own. It stays set only while the disagreement is
+   * unexplained: a project that does not validate on disk, or a desynchronised
+   * window, both of which need the human. `open` still clears it, which is the
+   * reload the UI offers as the manual way out.
    */
   conflict: { paths: readonly string[]; message: string } | undefined;
   /** Project diagnostics, refreshed by the server after every write. */
   diagnostics: readonly DocumentDiagnostic[];
+  /**
+   * False while the project *on disk* does not validate, which is a normal,
+   * transient state in the middle of a multi-file agent edit (PLAN.md §12). The
+   * model in memory is the last valid one and stays playable; `diagnostics` says
+   * what is wrong on disk. Nothing is adopted until it validates again.
+   */
+  diskValid: boolean;
+  /**
+   * Set when this window can no longer prove its copy matches the disk, which is
+   * unrecoverable without a reload. Loud on purpose: the alternative to saying so
+   * is adopting a model that was never validated as a whole.
+   */
+  outOfSync: string | undefined;
+  /**
+   * The last external edit this window accepted, for UI that has to react to it —
+   * clearing a selection whose meaning has moved, above all. `discarded` names
+   * files whose unsaved local edits the external version replaced (PLAN.md §12's
+   * last-writer-wins warning), and is retained until the next external edit.
+   */
+  lastExternalEdit:
+    | { revision: number; adopted: readonly string[]; removed: readonly string[]; discarded: readonly string[] }
+    | undefined;
+  /** External snapshots accepted this session. */
+  externalEditsAccepted: number;
   /**
    * The last edit and what it means to a running transport. `undefined` until the
    * first edit of a session, and reset by `open`.
@@ -201,6 +225,20 @@ export interface DocumentState {
   deleteNote(patternId: string, index: number): void;
   /** Write every dirty file now, cancelling any pending debounce. */
   flushNow(): Promise<void>;
+
+  /**
+   * Fold an external edit — an agent's, or a hand edit — into the model
+   * (PLAN.md §12 step 4). Only ever called with a snapshot the sidecar has
+   * already validated as a whole project.
+   */
+  applyExternalChange(change: ExternalChange): void;
+  /**
+   * Note that the project on disk does not currently validate. The model is left
+   * exactly as it is; the diagnostics are shown.
+   */
+  noteDiskInvalid(diagnostics: readonly DocumentDiagnostic[]): void;
+  /** Note that this window can no longer trust its copy. Needs a reload. */
+  noteOutOfSync(message: string): void;
 }
 
 /**
@@ -327,6 +365,13 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         return { path, contents, expectedHash: believed === undefined ? null : hashText(believed) };
       });
 
+      // What this editor believed about disk when the batch left, per path. Only
+      // an accepted external edit can change that while a batch is open, and an
+      // external edit is *newer news about the disk* than the ack of a write that
+      // was already in flight. So the ack is not allowed to overwrite it — see
+      // the filter in the success handler.
+      const believedAtSend = new Map(files.map((file) => [file.path, onDisk.get(file.path)]));
+
       set({ writing: dirty, lastWriteError: undefined });
       const run = options.sink
         .write(files)
@@ -338,6 +383,14 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           const persisted = new Map(get().persisted);
           const written = new Map(get().onDisk);
           for (const file of files) {
+            if (written.get(file.path) !== believedAtSend.get(file.path)) {
+              // An external edit to this file was adopted while the write was in
+              // flight. Disk holds *its* bytes, not ours; recording ours here
+              // would leave a precondition that is a lie and a "dirty" flag that
+              // reads as an edit to re-send, which is how a lost agent edit turns
+              // into an overwrite.
+              continue;
+            }
             persisted.set(file.path, file.contents);
             written.set(file.path, file.contents);
           }
@@ -380,6 +433,10 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
       lastWriteError: undefined,
       conflict: undefined,
       diagnostics: [],
+      diskValid: true,
+      outOfSync: undefined,
+      lastExternalEdit: undefined,
+      externalEditsAccepted: 0,
       audioEdit: undefined,
 
       open(loaded) {
@@ -406,6 +463,9 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           lastWriteError: undefined,
           conflict: undefined,
           diagnostics: loaded.diagnostics ?? [],
+          diskValid: true,
+          outOfSync: undefined,
+          lastExternalEdit: undefined,
           audioEdit: undefined,
         });
       },
@@ -560,6 +620,106 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           timer = undefined;
         }
         await flush();
+      },
+
+      applyExternalChange(change) {
+        const state = get();
+        if (state.project === undefined) {
+          // Nothing is open yet, so there is no model to fold this into. Not a
+          // loss: every session loads the project over HTTP after connecting, and
+          // that load reads the disk this change is already part of.
+          return;
+        }
+        if (state.outOfSync !== undefined) return;
+
+        const result = reconcileExternalChange({
+          project: state.project,
+          canonical: state.canonical,
+          onDisk: state.onDisk,
+          dirty: state.dirty,
+          change,
+        });
+        if (result.kind === "noop") {
+          // Bytes this editor already had. Still worth recording that the disk
+          // validates, since a `projectInvalid` may have said otherwise, and its
+          // diagnostics would otherwise stay on screen describing a disk state
+          // that has since been fixed.
+          set({ diskValid: true, diagnostics: [...change.diagnostics] });
+          return;
+        }
+        if (result.kind === "outOfSync") {
+          set({ outOfSync: result.message });
+          return;
+        }
+
+        const canonical = canonicalFiles(result.project);
+        const persisted = new Map(state.persisted);
+        const onDisk = new Map(state.onDisk);
+        for (const path of result.removed) {
+          persisted.delete(path);
+          onDisk.delete(path);
+        }
+        for (const [path, text] of result.adopted) {
+          const bytes = canonical.get(path);
+          if (bytes === undefined) {
+            throw new Error(`internal error: adopted "${path}" has no canonical bytes`);
+          }
+          // The canonical form is the baseline, and the disk bytes are the belief
+          // about disk — exactly as `open` does it. Setting the baseline to the
+          // raw disk bytes instead would mark every non-canonical external edit
+          // dirty, and the UI would write it straight back: the write/watch loop
+          // PLAN.md §18 warns about, arriving through the front door.
+          persisted.set(path, bytes);
+          onDisk.set(path, text);
+        }
+        const { dirty } = diffAgainst(persisted, canonical);
+        const revision = state.revision + 1;
+
+        // The conflict was "the disk moved under us and we do not know how". Now
+        // we know, for these files, so it stops applying to them.
+        const conflict =
+          state.conflict === undefined ||
+          state.conflict.paths.every((path) => result.adopted.has(path) || result.removed.includes(path))
+            ? undefined
+            : state.conflict;
+
+        set({
+          project: result.project,
+          canonical,
+          persisted,
+          onDisk,
+          dirty,
+          unformatted: unformattedIn(onDisk, canonical),
+          revision,
+          conflict,
+          diskValid: true,
+          outOfSync: undefined,
+          diagnostics: [...change.diagnostics],
+          externalEditsAccepted: state.externalEditsAccepted + 1,
+          lastExternalEdit: {
+            revision,
+            adopted: [...result.adopted.keys()].sort(),
+            removed: result.removed,
+            discarded: result.discarded,
+          },
+          // Always structural: an external edit can have moved anything, and the
+          // scheduler's own check (PLAN.md §12 step 6) would reject a softer
+          // claim it could not substantiate.
+          audioEdit: { revision, effect: "structural", project: result.project },
+        });
+
+        // A file the external edit took over may have been dirty, and now is not.
+        // Anything still dirty is an edit to a file the agent did not touch, so it
+        // is still owed a write.
+        if (dirty.length > 0) scheduleFlush();
+      },
+
+      noteDiskInvalid(diagnostics) {
+        set({ diskValid: false, diagnostics });
+      },
+
+      noteOutOfSync(message) {
+        set({ outOfSync: message });
       },
     };
   });

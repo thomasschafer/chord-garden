@@ -10,5 +10,5 @@
     // bundle, which is exactly the mistake this project keeps hitting.
     "types": []
   },
-  "include": ["web", "src/api.ts", "src/client.ts"]
+  "include": ["web", "src/api.ts", "src/client.ts", "src/socket.ts"]
 }
