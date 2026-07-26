@@ -46,11 +46,15 @@ export interface ProjectSocketHandlers {
    * The session is live. `reconnected` is false only for the first connection of
    * the page's life.
    *
-   * The caller must load the project over HTTP here, every time. Changes that
-   * landed while the socket was down were announced to nobody, and the sidecar
-   * does not replay them — it announces differences from what it last
-   * established, which it has no reason to think a new session lacks. A full
-   * load is the only honest way back in.
+   * On the first connection the caller must load the project over HTTP: it holds
+   * nothing, and the sidecar has nothing to compare it against.
+   *
+   * On a reconnect it need not. The hello carried this page's inventory (see
+   * `ProjectSocketOptions.inventory`), so the sidecar has already decided whether
+   * the disk moved while the socket was down and pushes a full snapshot if it did.
+   * That matters because the caller may hold unsaved edits, and an HTTP reload
+   * discards them — which used to leave the only options as "lose the edits" or
+   * "sit here out of date until a human chooses".
    */
   ready(reconnected: boolean): void;
   changed(message: ProjectChangedMessage): void;
@@ -73,6 +77,15 @@ export interface ProjectSocketOptions {
   token: string;
   factory: SyncTransportFactory;
   handlers: ProjectSocketHandlers;
+  /**
+   * What this page currently holds, as an `inventoryHash`, or `undefined` when it
+   * holds nothing yet.
+   *
+   * Consulted on every connection attempt rather than once, because the answer is
+   * exactly "the disk state this page is caught up to at this moment", and that is
+   * what lets the sidecar replay what a dropped connection missed.
+   */
+  inventory?: () => string | undefined;
   /** Retry delays, in order; the last one repeats. */
   retryDelaysMs?: readonly number[];
   setTimer?: (callback: () => void, ms: number) => unknown;
@@ -87,6 +100,7 @@ export class ProjectSocket {
   private connections = 0;
   private retry: unknown;
   private stopped = false;
+  private sessionId: string | undefined;
   private readonly retryDelays: readonly number[];
   private readonly setTimer: (callback: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
@@ -101,6 +115,15 @@ export class ProjectSocket {
     return `/api/projects/${encodeURIComponent(this.options.project)}/${SOCKET_PATH}`;
   }
 
+  /**
+   * The read-write session id for this connection, or `undefined` while there is
+   * no live session (PLAN.md §12). Every write must present it, so a page whose
+   * socket has dropped — or that was refused as a second window — cannot write.
+   */
+  get session(): string | undefined {
+    return this.sessionId;
+  }
+
   connect(): void {
     if (this.stopped || this.transport !== undefined) return;
     let settled = false;
@@ -109,11 +132,13 @@ export class ProjectSocket {
       open: () => {
         // First-message authentication (PLAN.md §10): the token goes in a frame,
         // never in the URL, so it cannot end up in a log or a Referer.
+        const inventory = this.options.inventory?.();
         const hello: HelloMessage = {
           type: "hello",
           protocol: SYNC_PROTOCOL,
           token: this.options.token,
           project: this.options.project,
+          ...(inventory === undefined ? {} : { inventory }),
         };
         transport.send(JSON.stringify(hello));
       },
@@ -124,6 +149,10 @@ export class ProjectSocket {
       },
       closed: (code, reason) => {
         this.transport = undefined;
+        // The session died with the socket. Kept out of the way rather than left
+        // behind, so a write attempted while disconnected fails locally instead of
+        // presenting a credential the sidecar has already retired.
+        this.sessionId = undefined;
         if (this.stopped) return;
         if (code === CLOSE_ALREADY_OPEN) {
           // Handled when the `rejected` message arrived; retrying would be a
@@ -150,6 +179,7 @@ export class ProjectSocket {
   /** Stop for good: no retries, no callbacks. */
   close(): void {
     this.stopped = true;
+    this.sessionId = undefined;
     if (this.retry !== undefined) {
       this.clearTimer(this.retry);
       this.retry = undefined;
@@ -182,6 +212,17 @@ export class ProjectSocket {
           this.close();
           return;
         }
+        if (typeof message.session !== "string" || message.session.length === 0) {
+          // Without it this page cannot write at all, so it is not a field to
+          // shrug at: a welcome without one is a sidecar this page cannot work with.
+          this.options.handlers.rejected({
+            kind: "refused",
+            message: "the sidecar's welcome carried no write session id; reload the page",
+          });
+          this.close();
+          return;
+        }
+        this.sessionId = message.session;
         this.attempt = 0;
         this.connections += 1;
         this.options.handlers.ready(this.connections > 1);
@@ -203,6 +244,15 @@ export class ProjectSocket {
       case "projectChanged":
         if (!Array.isArray(message.files) || !Array.isArray(message.changed) || !Array.isArray(message.removed)) {
           this.options.handlers.protocolError("a projectChanged message was missing its file lists");
+          return;
+        }
+        if (message.scope !== "diff" && message.scope !== "full") {
+          // The two scopes need opposite treatment of a file the inventory does not
+          // name — removed, or evidence of a desync — so a message that does not say
+          // which it is cannot be applied at all.
+          this.options.handlers.protocolError(
+            `a projectChanged message did not say whether it carries the whole project (scope ${JSON.stringify(message.scope)})`,
+          );
           return;
         }
         this.options.handlers.changed(message);

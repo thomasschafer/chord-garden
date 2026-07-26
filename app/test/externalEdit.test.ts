@@ -64,11 +64,36 @@ function externalChange(
   for (const path of removed) disk.delete(path);
   for (const [path, text] of Object.entries(edits)) disk.set(path, text);
   return {
+    scope: "diff",
     files: [...disk].map(([path, text]) => ({ path, contentHash: hashText(text) })),
     changed: Object.entries(edits).map(([path, text]) => ({ path, text, contentHash: hashText(text) })),
     removed,
     diagnostics,
   };
+}
+
+/**
+ * The full snapshot the sidecar sends a reconnecting window: every document on the
+ * disk it just read, with its bytes, and no `removed` list — the inventory is what
+ * says a document is gone (PLAN.md §12).
+ *
+ * `disk` is the whole disk, not a set of edits, because that is what the message
+ * means; a helper that took edits would hide the case this exists to test.
+ */
+function fullSnapshot(disk: Record<string, string>): ExternalChange {
+  const files = Object.entries(disk).map(([path, text]) => ({ path, text, contentHash: hashText(text) }));
+  return {
+    scope: "full",
+    files: files.map(({ path, contentHash }) => ({ path, contentHash })),
+    changed: files,
+    removed: [],
+    diagnostics: [],
+  };
+}
+
+/** Every document this window believes is on disk, as the sidecar would read them. */
+function diskOf(store: DocumentStore): Record<string, string> {
+  return Object.fromEntries(store.getState().onDisk);
 }
 
 /**
@@ -181,6 +206,7 @@ describe("adopting an external edit", () => {
     const store = createDocumentStore({ sink: new RecordingSink() });
 
     store.getState().applyExternalChange({
+      scope: "diff",
       files: [{ path: "project.json", contentHash: "whatever" }],
       changed: [{ path: "project.json", text: "{}", contentHash: "whatever" }],
       removed: [],
@@ -492,5 +518,89 @@ describe("refusing to guess", () => {
     store.getState().open(openedFrom(FIXTURE));
 
     expect(store.getState().outOfSync).toBeUndefined();
+  });
+});
+
+describe("catching up after a dropped connection", () => {
+  /**
+   * The sidecar sends a full snapshot when a reconnecting window says it holds a
+   * disk state that has since moved (PLAN.md §12). It is the same reconcile — the
+   * one difference is that the inventory, rather than `removed`, is what says a
+   * document is gone, because the sidecar cannot know which removals this window
+   * already saw.
+   */
+  it("adopts what moved and keeps unsaved edits to what did not", async () => {
+    const sink = new RecordingSink();
+    const store = open(sink);
+    store.getState().setPatternLaneSteps("drums-verse", "hat", "x.x. x.x. x.x. x.xx");
+    expect(store.getState().dirty).toEqual(["patterns/drums-verse.json"]);
+    const agentText = renamed(store, "Renamed while this window was offline");
+
+    store.getState().applyExternalChange(fullSnapshot({ ...diskOf(store), "project.json": agentText }));
+
+    const state = store.getState();
+    expect(state.project!.project.name).toBe("Renamed while this window was offline");
+    // The pattern edit was never on disk and the disk did not touch that file, so it
+    // survives and is still owed a write.
+    expect(state.dirty).toEqual(["patterns/drums-verse.json"]);
+    expect(state.lastExternalEdit?.adopted).toEqual(["project.json"]);
+    expect(state.lastExternalEdit?.discarded).toEqual([]);
+    expect(state.outOfSync).toBeUndefined();
+    await store.getState().flushNow();
+    expect(sink.paths).toEqual([["patterns/drums-verse.json"]]);
+  });
+
+  it("treats a document the snapshot does not name as removed", async () => {
+    // Deleted while this window was disconnected, so nothing ever told it. In a diff
+    // this would be a desync — the test above in "refusing to guess" holds that — but
+    // a full snapshot's inventory is the authority on what exists.
+    const sink = new RecordingSink();
+    const store = open(sink);
+    expect(store.getState().project!.automation.has("pad")).toBe(true);
+
+    const disk = diskOf(store);
+    delete disk["automation/pad.json"];
+    store.getState().applyExternalChange(fullSnapshot(disk));
+
+    const state = store.getState();
+    expect(state.project!.automation.has("pad")).toBe(false);
+    expect(state.canonical.has("automation/pad.json")).toBe(false);
+    expect(state.lastExternalEdit?.removed).toEqual(["automation/pad.json"]);
+    expect(state.outOfSync).toBeUndefined();
+    await store.getState().flushNow();
+    expect(sink.batches).toEqual([]);
+  });
+
+  it("does nothing at all when the window was in step after all", async () => {
+    const sink = new RecordingSink();
+    const store = open(sink);
+    store.getState().setProjectName("Typed while offline");
+    const revision = store.getState().revision;
+
+    store.getState().applyExternalChange(fullSnapshot(diskOf(store)));
+
+    // Every byte in it is a byte this window already had, so there is nothing to
+    // adopt and — the property that matters — nothing to discard.
+    expect(store.getState().revision).toBe(revision);
+    expect(store.getState().project!.project.name).toBe("Typed while offline");
+    expect(store.getState().dirty).toEqual(["project.json"]);
+    expect(store.getState().lastExternalEdit).toBeUndefined();
+  });
+
+  it("still refuses a full snapshot it cannot account for", async () => {
+    const store = open(new RecordingSink());
+    const before = store.getState().project;
+    const snapshot = fullSnapshot({ ...diskOf(store), "project.json": renamed(store, "Something moved") });
+
+    // A document named in the inventory whose bytes the snapshot did not carry. A
+    // full snapshot that is not actually full is not something to adopt half of:
+    // the model would be built from a disk state nobody validated.
+    store.getState().applyExternalChange({
+      ...snapshot,
+      files: [...snapshot.files, { path: "patterns/appeared.json", contentHash: "abc-1" }],
+    });
+
+    expect(store.getState().outOfSync).toContain("patterns/appeared.json");
+    expect(store.getState().project).toBe(before);
   });
 });

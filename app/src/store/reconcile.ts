@@ -18,6 +18,19 @@ import { hashText } from "./hash";
  * validation (PLAN.md §12), which is what makes adopting it safe.
  */
 export interface ExternalChange {
+  /**
+   * Whether `changed` carries every document on disk (`full`) or only the ones the
+   * sidecar believes this editor has not seen (`diff`).
+   *
+   * It decides what a document this editor holds and the inventory does not name
+   * means. In a diff it means desynchronised — the sidecar names every removal it
+   * knows about, so a file missing from the inventory and from `removed` is a
+   * disagreement this window cannot explain. In a full snapshot — sent when this
+   * window reconnected holding a state the sidecar had moved past — the sidecar
+   * cannot know which removals this window already saw, so the inventory is the
+   * authority and a document missing from it is gone.
+   */
+  scope: "diff" | "full";
   /** Every document on disk after the change. */
   files: readonly { path: string; contentHash: string }[];
   /** Documents whose bytes the sidecar believes this editor has not seen. */
@@ -98,15 +111,23 @@ export type ReconcileResult =
 export function reconcileExternalChange(input: ReconcileInput): ReconcileResult {
   const { change, onDisk, canonical } = input;
 
+  const inventory = new Map(change.files.map((file) => [file.path, file.contentHash]));
   const newly = change.changed.filter((file) => onDisk.get(file.path) !== file.text);
-  const removed = change.removed.filter((path) => canonical.has(path) || onDisk.has(path));
+  // A full snapshot's inventory is the authority on which documents exist, so a
+  // document this window holds that it does not name is a removal this window was
+  // never told about — a file deleted while its socket was down. In a diff only
+  // `removed` may say that.
+  const gone =
+    change.scope === "full" ? [...canonical.keys()].filter((path) => !inventory.has(path)) : [];
+  const removed = [...new Set([...change.removed, ...gone])].filter(
+    (path) => canonical.has(path) || onDisk.has(path),
+  );
   if (newly.length === 0 && removed.length === 0) return { kind: "noop" };
 
   const texts = new Map(canonical);
   for (const path of removed) texts.delete(path);
   for (const file of newly) texts.set(file.path, file.text);
 
-  const inventory = new Map(change.files.map((file) => [file.path, file.contentHash]));
   const unaccounted = [...inventory.keys()].filter((path) => !texts.has(path)).sort();
   const unexpected = [...texts.keys()].filter((path) => !inventory.has(path)).sort();
   if (unaccounted.length > 0 || unexpected.length > 0) {

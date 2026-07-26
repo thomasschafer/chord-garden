@@ -593,11 +593,15 @@ Cross-file transactions: some UI operations must update multiple files. The side
 
 Echo detection is the linchpin. Get it right first in Phase 4, and encode every race in tests (§16): this code will not be human-reviewed, so the race tests *are* the correctness argument.
 
-Three things learned building it, recorded because each one is a trap that passes a naive test:
+Five things learned building it, recorded because each one is a trap that passes a naive test:
 
 - **Compare content, never elapsed time.** "Ignore watcher events for N ms after our own write" passes every obvious echo test and *silently eats* an agent edit that lands inside that window. The sidecar instead remembers the exact bytes it last established for each file and compares; matching bytes are an echo, differing bytes are external. Time is not an input.
 - **Decide identity on full bytes, not on the hash.** The content hash is right for write preconditions and for telling the browser what changed, but a 64-bit hash collision in the *identity* decision silently discards an agent's edit. The sidecar holds both strings already, so comparing them costs nothing worth saving.
 - **The infinite loop and the lost edit have different causes, so they need different guards.** Mistaking your own write for an external edit causes a reconcile storm and can drop unsaved work, but it does *not* loop, because adopting your own canonical bytes yields zero dirty files and therefore no write. The loop needs a distinct bug: making the raw disk bytes the persisted baseline, so every valid-but-non-canonical external edit reads as dirty → write → watch → adopt → forever. Test that mistake separately from echo detection.
+- **A retraction is a message, not the absence of one.** If content is the only identity, an invalid state that is fixed by restoring a file *byte-identically* leaves nothing to report — and the UI sits insisting the project is broken forever. The sidecar must remember that it reported an invalid state and always announce the first validating snapshot afterwards, even when that snapshot carries no changed files. Silence cannot clear a warning.
+- **A diff and a full snapshot need opposite readings of an absent file.** In a diff, a document the inventory does not name is evidence the client is out of sync; in a full snapshot it is a deletion the client was never told about. A protocol that does not distinguish the two either loses a file or reports a false desync, so the message carries an explicit scope.
+
+Loading the project must also be atomic with respect to the watcher. Fetching documents one at a time lets an agent's edit land mid-load, and the resulting mixed model is *not* reliably caught later — the next push names a file the torn read already picked up, so the client sees nothing new and returns early before any inventory check. One request returning every document from a single `loadProject` removes the race rather than detecting it.
 
 ## 13. The CLI (agent's feedback loop + the test harness)
 

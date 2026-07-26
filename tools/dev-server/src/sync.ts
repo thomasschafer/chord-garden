@@ -1,13 +1,16 @@
+import { randomBytes } from "node:crypto";
 import { hashContent } from "@chord-garden/engine/live";
 import { loadProject } from "@chord-garden/format";
 import {
   CLOSE_ALREADY_OPEN,
   CLOSE_UNAUTHORIZED,
   HELLO_TIMEOUT_MS,
+  inventoryHash,
   SYNC_PROTOCOL,
   type ApiDiagnostic,
-  type ChangedFile,
+  type HelloMessage,
   type ServerMessage,
+  type SnapshotDocument,
   type SnapshotFile,
 } from "./api.js";
 import type { ProjectMount } from "./server.js";
@@ -29,6 +32,8 @@ export interface ProjectSyncOptions {
   token: string;
   settleMs?: number;
   maxSettleMs?: number;
+  /** How often the watcher re-scans an idle project (see `IDLE_RESCAN_MS`). */
+  rescanMs?: number;
   keepaliveMs?: number;
   /** How long an unauthenticated socket may stay silent. */
   helloTimeoutMs?: number;
@@ -69,12 +74,33 @@ export interface ProjectSyncOptions {
  *
  * ## Validity
  *
- * `established` only advances on a snapshot that validates as a whole project, or
- * on a write. A half-finished multi-file agent edit therefore does not consume
- * the changes it contains: the UI is told the project is invalid, nothing is
- * adopted, and when the edit finishes the *whole* set of changed files arrives in
- * one snapshot. Cross-file edits reconcile atomically as a consequence rather
- * than by special-casing them (PLAN.md §12, cross-file transactions).
+ * `established` only advances on a snapshot that validates as a whole project, on
+ * a write, or on a snapshot served over HTTP to the session holder. A half-finished
+ * multi-file agent edit therefore does not consume the changes it contains: the UI
+ * is told the project is invalid, nothing is adopted, and when the edit finishes
+ * the *whole* set of changed files arrives in one snapshot. Cross-file edits
+ * reconcile atomically as a consequence rather than by special-casing them
+ * (PLAN.md §12, cross-file transactions).
+ *
+ * ## Deletion and recreation
+ *
+ * Nothing here tracks a file's *existence* over time, and that is the whole
+ * answer to delete/recreate — an agent moving a file, or a tool that writes by
+ * unlinking and creating rather than renaming. A file that vanishes and comes back
+ * with the same bytes inside one settle window is a non-event, because the bytes on
+ * disk when the dust settles are the bytes already established; one that comes
+ * back different is an ordinary external edit; one that is still gone is a removal.
+ * Existence is just another thing the settled disk is asked about, so there is no
+ * event sequence to get wrong.
+ *
+ * The one case that needs its own state is a delete whose *intermediate* state was
+ * reported. A removal that makes the project invalid — deleting a pattern a clip
+ * plays — is reported as any other invalid state is: keep the last good model, show
+ * diagnostics, adopt nothing. If the file then returns byte-identical, the disk now
+ * matches `established` exactly, so a purely content-based diff would say nothing
+ * and leave the UI insisting the project is broken forever. So a snapshot that
+ * validates after an invalid one was reported is always announced, even when it
+ * carries no changed files: the announcement is what retracts the diagnostics.
  */
 export class ProjectSync {
   private readonly established = new Map<string, string>();
@@ -86,6 +112,23 @@ export class ProjectSync {
    * set: a second editing browser is refused, not queued.
    */
   private editor: WebSocketConnection | undefined;
+  /** The write credential of the current session, minted when it is admitted. */
+  private session: string | undefined;
+  /**
+   * Whether the last thing said about the disk was "it does not validate". While
+   * it is set, the next validating snapshot is announced even if it changed
+   * nothing, so a retracted invalid state cannot stay on screen.
+   */
+  private reportedInvalid = false;
+  /**
+   * Set when the current session asked to be caught up — it arrived holding an
+   * inventory that is not the one established here — and has not been. The next
+   * validating snapshot is then sent in full rather than as a diff. Retained
+   * across invalid states so that a reconnect landing mid-edit still gets its
+   * catch-up when the edit finishes, rather than a diff against a state it never
+   * had.
+   */
+  private owedFullSnapshot = false;
   private closed = false;
 
   constructor(private readonly options: ProjectSyncOptions) {
@@ -99,6 +142,7 @@ export class ProjectSync {
         onError: (message) => this.log(`watch ${options.mount.name}: ${message}`),
         ...(options.settleMs === undefined ? {} : { settleMs: options.settleMs }),
         ...(options.maxSettleMs === undefined ? {} : { maxSettleMs: options.maxSettleMs }),
+        ...(options.rescanMs === undefined ? {} : { rescanMs: options.rescanMs }),
       });
     }
   }
@@ -106,6 +150,19 @@ export class ProjectSync {
   /** True while a browser holds this project's read-write session. */
   get hasEditor(): boolean {
     return this.editor !== undefined && this.editor.isOpen;
+  }
+
+  /**
+   * Whether `session` is the credential of the browser that currently holds this
+   * project's read-write session (PLAN.md §12).
+   *
+   * The write endpoint asks this before it touches the disk. Without it,
+   * single-writer is enforced only at the socket, and a window that was *told* the
+   * project is open elsewhere can still POST a write: refusing the socket takes
+   * away the pushes, not the writing. Constant-time because it costs nothing.
+   */
+  holdsSession(session: string): boolean {
+    return this.hasEditor && this.session !== undefined && constantTimeEquals(session, this.session);
   }
 
   /**
@@ -135,9 +192,9 @@ export class ProjectSync {
           this.refuse(connection, CLOSE_PROTOCOL_ERROR, "this protocol accepts no messages after \"hello\"");
           return;
         }
-        const outcome = this.handleHello(text);
-        if (outcome !== undefined) {
-          this.refuse(connection, outcome.close, outcome.reason, outcome.kind);
+        const outcome = this.readHello(text);
+        if ("refusal" in outcome) {
+          this.refuse(connection, outcome.refusal.close, outcome.refusal.reason, outcome.refusal.kind);
           return;
         }
         if (this.hasEditor) {
@@ -154,14 +211,25 @@ export class ProjectSync {
         authenticated = true;
         clearTimeout(timeout);
         this.editor = connection;
+        this.session = randomBytes(16).toString("hex");
         connection.startKeepalive(this.keepaliveMs);
-        this.send(connection, { type: "welcome", protocol: SYNC_PROTOCOL, project: this.options.mount.name });
+        this.send(connection, {
+          type: "welcome",
+          protocol: SYNC_PROTOCOL,
+          project: this.options.mount.name,
+          session: this.session,
+        });
         this.log(`sync ${this.options.mount.name}: editor session opened`);
+        this.catchUp(outcome.hello.inventory);
       },
       closed: (reason) => {
         clearTimeout(timeout);
         if (this.editor === connection) {
           this.editor = undefined;
+          this.session = undefined;
+          // Whatever this session was owed dies with it: the next one states what
+          // it holds in its own hello.
+          this.owedFullSnapshot = false;
           this.log(`sync ${this.options.mount.name}: editor session ended (${reason})`);
         }
       },
@@ -181,6 +249,60 @@ export class ProjectSync {
   }
 
   /**
+   * Record bytes this sidecar just served to the session holder as a whole-project
+   * snapshot, for the same reason `noteWrite` records bytes it wrote: the browser
+   * now has them, so re-announcing them would be a push with nothing in it.
+   *
+   * Only ever called for the holder of the read-write session, and only for a
+   * snapshot that validated. A snapshot served to anything else — the engine
+   * harness, a second window that was refused, `curl` — must not advance this, or
+   * that read would swallow the editor's next push and lose an agent's edit.
+   *
+   * Synchronous with the response for the same reason as `noteWrite`: no
+   * filesystem event can be delivered mid-block, so there is no window in which a
+   * scan could see bytes that were served but not yet established.
+   */
+  noteServed(documents: readonly { path: string; text: string }[]): void {
+    this.established.clear();
+    for (const document of documents) this.established.set(document.path, document.text);
+    // The holder has just read the whole project from disk, so it is caught up by
+    // definition and nothing about an earlier invalid state is still on its screen.
+    this.owedFullSnapshot = false;
+    this.reportedInvalid = false;
+  }
+
+  /**
+   * Deliver what a reconnecting page missed (PLAN.md §12).
+   *
+   * `inventory` is what the page says it holds. A page with nothing sends none, and
+   * loads over HTTP instead. A page whose inventory is the one established here
+   * missed nothing while it was away — the sidecar announces differences from what
+   * it established, and that is what this page has. Anything else means the disk
+   * moved without this page hearing about it, and only a full snapshot can say how:
+   * the sidecar keeps no history, and a diff against a state the page never had is
+   * how a browser ends up holding a model that never existed on disk.
+   */
+  private catchUp(inventory: string | undefined): void {
+    if (inventory === undefined) return;
+    if (inventory === this.establishedInventory()) {
+      this.log(`sync ${this.options.mount.name}: session reconnected in step with the disk`);
+      return;
+    }
+    this.log(`sync ${this.options.mount.name}: session reconnected behind the disk; sending a full snapshot`);
+    this.owedFullSnapshot = true;
+    // Sent now if the disk validates; if it does not, the flag keeps it owed and
+    // the next validating scan pays it.
+    this.scan();
+  }
+
+  /** The inventory hash of what this sidecar has established, for `catchUp`. */
+  private establishedInventory(): string {
+    return inventoryHash(
+      [...this.established].map(([path, text]) => ({ path, contentHash: hashContent(Buffer.from(text, "utf8")) })),
+    );
+  }
+
+  /**
    * Read the project, decide what changed, and push it. Called by the watcher
    * after a settle window, and directly by tests.
    */
@@ -192,17 +314,14 @@ export class ProjectSync {
     } catch (error) {
       // A project directory that cannot be read at all is not a state to guess
       // about; it is reported and the last good model stays where it is.
-      this.broadcast({
-        type: "projectInvalid",
-        diagnostics: [
-          {
-            severity: "error",
-            code: "project.unreadable",
-            file: "",
-            message: error instanceof Error ? error.message : String(error),
-          },
-        ],
-      });
+      this.reportInvalid([
+        {
+          severity: "error",
+          code: "project.unreadable",
+          file: "",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      ]);
       return;
     }
 
@@ -210,26 +329,30 @@ export class ProjectSync {
     if (!result.ok || result.project === undefined) {
       // Transient invalid states are expected mid-edit, so this is not an error
       // to recover from — it is a state to report and wait out. `established` is
-      // untouched, so nothing here is consumed.
+      // untouched, so nothing here is consumed. This is also where a deletion that
+      // breaks the project lands, which is why nothing below it treats a missing
+      // file as a special case.
       this.log(`sync ${this.options.mount.name}: disk does not validate; holding the last snapshot`);
-      this.broadcast({ type: "projectInvalid", diagnostics });
+      this.reportInvalid(diagnostics);
       return;
     }
 
-    const changed: ChangedFile[] = [];
+    const full = this.owedFullSnapshot;
+    const changed: SnapshotDocument[] = [];
     const files: SnapshotFile[] = [];
     for (const file of result.files.values()) {
       const contentHash = hashContent(Buffer.from(file.text, "utf8"));
       files.push({ path: file.path, kind: file.kind, contentHash });
-      if (this.established.get(file.path) !== file.text) {
+      if (full || this.established.get(file.path) !== file.text) {
         changed.push({ path: file.path, kind: file.kind, contentHash, text: file.text });
       }
     }
     const removed = [...this.established.keys()].filter((path) => !result.files.has(path)).sort();
 
-    if (changed.length === 0 && removed.length === 0) {
-      // Every byte on disk is a byte we put there or already announced: this was
-      // our own echo, or an event that changed nothing.
+    if (!full && !this.reportedInvalid && changed.length === 0 && removed.length === 0) {
+      // Every byte on disk is a byte we put there or already announced, and every
+      // document we knew about is still there: this was our own echo, an event that
+      // changed nothing, or a file that vanished and came back unchanged.
       return;
     }
 
@@ -239,11 +362,26 @@ export class ProjectSync {
     files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     changed.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     this.log(
-      `sync ${this.options.mount.name}: external edit — changed ${changed.map((file) => file.path).join(", ") || "none"}${
-        removed.length > 0 ? `, removed ${removed.join(", ")}` : ""
-      }`,
+      `sync ${this.options.mount.name}: ${full ? "full snapshot" : "external edit"} — changed ${
+        changed.map((file) => file.path).join(", ") || "none"
+      }${removed.length > 0 ? `, removed ${removed.join(", ")}` : ""}`,
     );
-    this.broadcast({ type: "projectChanged", files, changed, removed, diagnostics });
+    this.reportedInvalid = false;
+    this.owedFullSnapshot = false;
+    this.broadcast({ type: "projectChanged", scope: full ? "full" : "diff", files, changed, removed, diagnostics });
+  }
+
+  /**
+   * Say that the disk does not currently validate, and remember having said it.
+   *
+   * The remembering is what makes a retraction possible: if the disk returns to
+   * exactly the bytes already established — a delete-then-recreate, a broken edit
+   * reverted — there is no content difference left to report, and without this flag
+   * the UI would keep showing an error about a state that no longer exists.
+   */
+  private reportInvalid(diagnostics: ApiDiagnostic[]): void {
+    this.reportedInvalid = true;
+    this.broadcast({ type: "projectInvalid", diagnostics });
   }
 
   close(): void {
@@ -251,6 +389,7 @@ export class ProjectSync {
     this.watcher?.close();
     this.editor?.close(CLOSE_GOING_AWAY, "sidecar shutting down");
     this.editor = undefined;
+    this.session = undefined;
   }
 
   /** What the sidecar believes is on disk. For tests and diagnostics. */
@@ -259,44 +398,71 @@ export class ProjectSync {
   }
 
   /**
-   * Validate a `hello`, returning nothing when it is acceptable. Every refusal
-   * names its own reason: a page that cannot connect must be able to say why.
+   * Validate a `hello`, returning the message itself when it is acceptable. Every
+   * refusal names its own reason: a page that cannot connect must be able to say why.
    */
-  private handleHello(text: string):
-    | { close: number; reason: string; kind?: "rejected" }
-    | undefined {
+  private readHello(text: string): { hello: HelloMessage } | { refusal: Refusal } {
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch (error) {
-      return { close: CLOSE_PROTOCOL_ERROR, reason: `first message is not JSON: ${String(error)}` };
+      return { refusal: { close: CLOSE_PROTOCOL_ERROR, reason: `first message is not JSON: ${String(error)}` } };
     }
     if (parsed === null || typeof parsed !== "object") {
-      return { close: CLOSE_PROTOCOL_ERROR, reason: "first message must be a JSON object" };
+      return { refusal: { close: CLOSE_PROTOCOL_ERROR, reason: "first message must be a JSON object" } };
     }
     const message = parsed as Record<string, unknown>;
     if (message["type"] !== "hello") {
-      return { close: CLOSE_PROTOCOL_ERROR, reason: `expected a "hello" message, got ${JSON.stringify(message["type"])}` };
+      return {
+        refusal: {
+          close: CLOSE_PROTOCOL_ERROR,
+          reason: `expected a "hello" message, got ${JSON.stringify(message["type"])}`,
+        },
+      };
     }
     if (message["protocol"] !== SYNC_PROTOCOL) {
       return {
-        close: CLOSE_POLICY_VIOLATION,
-        reason: `this page speaks sync protocol ${JSON.stringify(message["protocol"])} and the sidecar speaks ${SYNC_PROTOCOL}; reload the page`,
-        kind: "rejected",
+        refusal: {
+          close: CLOSE_POLICY_VIOLATION,
+          reason: `this page speaks sync protocol ${JSON.stringify(message["protocol"])} and the sidecar speaks ${SYNC_PROTOCOL}; reload the page`,
+          kind: "rejected",
+        },
       };
     }
     const token = message["token"];
     if (typeof token !== "string" || !constantTimeEquals(token, this.options.token)) {
-      return { close: CLOSE_UNAUTHORIZED, reason: "the session token is missing or wrong", kind: "rejected" };
-    }
-    if (message["project"] !== this.options.mount.name) {
       return {
-        close: CLOSE_POLICY_VIOLATION,
-        reason: `this socket is for project "${this.options.mount.name}", not ${JSON.stringify(message["project"])}`,
-        kind: "rejected",
+        refusal: { close: CLOSE_UNAUTHORIZED, reason: "the session token is missing or wrong", kind: "rejected" },
       };
     }
-    return undefined;
+    const project = message["project"];
+    if (project !== this.options.mount.name) {
+      return {
+        refusal: {
+          close: CLOSE_POLICY_VIOLATION,
+          reason: `this socket is for project "${this.options.mount.name}", not ${JSON.stringify(project)}`,
+          kind: "rejected",
+        },
+      };
+    }
+    const inventory = message["inventory"];
+    if (inventory !== undefined && typeof inventory !== "string") {
+      return {
+        refusal: {
+          close: CLOSE_PROTOCOL_ERROR,
+          reason: `"inventory" must be a string if present, got ${JSON.stringify(inventory)}`,
+        },
+      };
+    }
+    return {
+      hello: {
+        type: "hello",
+        protocol: SYNC_PROTOCOL,
+        token,
+        project,
+        ...(inventory === undefined ? {} : { inventory }),
+      },
+    };
   }
 
   private refuse(
@@ -339,6 +505,13 @@ export class ProjectSync {
       this.log(`sync ${this.options.mount.name}: could not read the project at startup: ${String(error)}`);
     }
   }
+}
+
+/** Why a socket is being closed, and what to tell it first. */
+interface Refusal {
+  close: number;
+  reason: string;
+  kind?: "rejected";
 }
 
 function toApiDiagnostic(diagnostic: { severity: string; code: string; file: string; message: string }): ApiDiagnostic {

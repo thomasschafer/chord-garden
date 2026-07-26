@@ -1,3 +1,4 @@
+import { hashContent } from "@chord-garden/engine/live";
 import type { DocKind } from "@chord-garden/format/pure";
 
 /**
@@ -28,6 +29,27 @@ export interface ProjectSummary {
 
 export interface ProjectList {
   projects: { name: string; root: string }[];
+}
+
+/**
+ * Every document of a project, with its bytes, from one `loadProject` (PLAN.md
+ * §12).
+ *
+ * This exists because fetching the documents one at a time is not atomic with
+ * respect to the watcher: an agent editing during the load hands the browser a
+ * mixture of two disk states — a model no validation ever passed — and the
+ * mixture is only *detected* later, by the inventory check on the next push. One
+ * read of the disk, one response, and the torn state is unreachable rather than
+ * caught. It also turns N+1 round trips into one.
+ */
+export interface ProjectSnapshot {
+  name: string;
+  root: string;
+  /** True when the project loaded, validated, and can be played. */
+  ok: boolean;
+  /** Every document, sorted by path, with the exact bytes that were validated. */
+  files: SnapshotDocument[];
+  diagnostics: ApiDiagnostic[];
 }
 
 /** One document of a write batch: canonical bytes for a project-relative path. */
@@ -82,15 +104,31 @@ export interface WriteResponse {
  */
 export const TOKEN_HEADER = "x-chord-garden-token";
 
+/**
+ * Header carrying the read-write session id from `WelcomeMessage.session`.
+ *
+ * A header rather than a field of the write body, because the snapshot read wants
+ * it too: a snapshot served to the session holder is a snapshot that page has now
+ * seen, which is what lets the sidecar establish those bytes and not re-announce
+ * them.
+ */
+export const SESSION_HEADER = "x-chord-garden-session";
+
+/** HTTP status for a write from something that does not hold the session. */
+export const WRITE_SESSION_STATUS = 403;
+
 /** Path, under a project mount, that upgrades to the sync WebSocket. */
 export const SOCKET_PATH = "socket";
+
+/** Path, under a project mount, serving every document in one response. */
+export const SNAPSHOT_PATH = "snapshot";
 
 /**
  * Version of the sync protocol below. Bumped when a message shape changes, and
  * checked in the handshake: a page left open across a rebuild is told to reload
  * rather than left silently misreading a message it half understands.
  */
-export const SYNC_PROTOCOL = 1;
+export const SYNC_PROTOCOL = 2;
 
 /** Largest client→server message the socket will read (PLAN.md §10). */
 export const MAX_SOCKET_MESSAGE_BYTES = 64 * 1024;
@@ -111,20 +149,51 @@ export interface HelloMessage {
   protocol: number;
   token: string;
   project: string;
+  /**
+   * `inventoryHash` of what this page already holds, when it holds anything.
+   *
+   * Present only on a reconnect: a page with a project in memory is telling the
+   * sidecar which disk state it is caught up to, and asking to be sent a full
+   * snapshot if that is no longer the disk. Absent on a first connection, where
+   * the page has nothing and loads over HTTP instead.
+   */
+  inventory?: string;
 }
 
 export type ClientMessage = HelloMessage;
 
-/** One document in a pushed snapshot, with the bytes the server validated. */
+/** One document in a pushed snapshot, named and hashed but without its bytes. */
 export interface SnapshotFile {
   path: string;
   kind: DocKind;
   contentHash: string;
 }
 
-export interface ChangedFile extends SnapshotFile {
-  /** Exactly the bytes the sidecar read and validated. */
+/** A document with the exact bytes the sidecar read and validated. */
+export interface SnapshotDocument extends SnapshotFile {
   text: string;
+}
+
+/**
+ * A hash over a project's document inventory: which paths exist and what is in
+ * them, and nothing else.
+ *
+ * One value that answers "are these two views of the project the same?" — used by
+ * a reconnecting page to tell the sidecar what it holds, so the sidecar can push
+ * a full snapshot only when the disk has actually moved. Sorted internally, so
+ * the two sides cannot disagree by iterating in different orders, and defined
+ * here beside the messages that carry it so there is one definition of it.
+ */
+export function inventoryHash(files: Iterable<{ path: string; contentHash: string }>): string {
+  // NUL separates the two fields because it is the one byte a path cannot contain,
+  // so no path and hash can ever be mistaken for a different pair. Written as an
+  // escape: a literal NUL in a source file is invisible in every editor and makes
+  // git treat the file as binary.
+  const lines = [...files]
+    .map((file) => `${file.path}\u0000${file.contentHash}`)
+    .sort()
+    .join("\n");
+  return hashContent(new TextEncoder().encode(lines));
 }
 
 /**
@@ -141,13 +210,32 @@ export interface ChangedFile extends SnapshotFile {
 export interface ProjectChangedMessage {
   type: "projectChanged";
   /**
+   * How much of the disk `changed` carries.
+   *
+   * `diff` is the ordinary push: only documents whose bytes differ from what the
+   * sidecar last established, so `removed` is the only statement about deletions
+   * and a file the browser holds that the inventory does not name is a
+   * desynchronised browser.
+   *
+   * `full` carries *every* document's bytes, and is sent when a reconnecting page
+   * says it holds a different inventory than the sidecar has established (PLAN.md
+   * §12: changes made while a socket was down were announced to nobody). The
+   * inventory is then authoritative about deletions too — the sidecar cannot know
+   * which removals that page already saw — so the browser must treat a document
+   * it holds and the inventory does not name as removed. Stated rather than
+   * inferred from an empty `removed`, because the two cases need opposite
+   * responses and guessing between them either loses a file or reports a false
+   * desync.
+   */
+  scope: "diff" | "full";
+  /**
    * Every document on disk after the change, so the browser can prove its own
    * copy is complete rather than assume it. A path the browser cannot account
    * for is a desynchronised browser, which it must say out loud.
    */
   files: SnapshotFile[];
   /** Documents whose bytes differ from what the sidecar last established. */
-  changed: ChangedFile[];
+  changed: SnapshotDocument[];
   /** Documents that were part of the last snapshot and are gone. */
   removed: string[];
   /** Warnings from the validated snapshot; errors would make it unsendable. */
@@ -169,6 +257,17 @@ export interface WelcomeMessage {
   type: "welcome";
   protocol: number;
   project: string;
+  /**
+   * This session's write credential (PLAN.md §12, single-writer).
+   *
+   * The sidecar admits one read-write session per project, and this is the name of
+   * it: a write must present it in the `x-chord-garden-session` header, so a
+   * window that was *refused* the session cannot write at all. Minted per admitted
+   * socket, so it also changes across a reconnect and a stale one is refused
+   * rather than silently honoured. Not a secret — the token is what keeps other
+   * origins out; this is what keeps the second window out.
+   */
+  session: string;
 }
 
 /**

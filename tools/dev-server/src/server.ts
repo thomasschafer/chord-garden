@@ -3,11 +3,16 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import { loadProject } from "@chord-garden/format";
+import { hashContent } from "@chord-garden/engine/live";
 import {
   MAX_SOCKET_MESSAGE_BYTES,
+  SESSION_HEADER,
+  SNAPSHOT_PATH,
   SOCKET_PATH,
   TOKEN_GLOBAL,
   TOKEN_HEADER,
+  WRITE_SESSION_STATUS,
+  type ProjectSnapshot,
   type ProjectSummary,
   type WriteRequest,
   type WriteResponse,
@@ -41,10 +46,12 @@ export interface AssetServerOptions {
   appRoot?: string;
   /**
    * The watcher/push layer for each project, by mount name (PLAN.md §12). When a
-   * project has one, `/api/projects/<name>/socket` upgrades to its WebSocket and
-   * every write through this server is reported to it for echo detection. A
-   * project without one is served exactly as before, which is what the harness
-   * page and the read-only tests want.
+   * project has one, `/api/projects/<name>/socket` upgrades to its WebSocket, every
+   * write through this server is reported to it for echo detection, and every write
+   * must present the read-write session id it minted (PLAN.md §12's single-writer
+   * rule, enforced on the disk rather than only on the socket). A project without
+   * one has no sessions to hold, and is served exactly as before — which is what
+   * the harness page and the read-only tests want.
    *
    * Constructed by the caller rather than here so that the thing which decides
    * *when* a scan happens can be replaced in a test without stubbing an HTTP
@@ -251,8 +258,7 @@ function handle(
 
   // Everything below touches a project. PLAN.md §10: the token is required on
   // every one of these, read or write.
-  const presented = req.headers[TOKEN_HEADER];
-  const token = Array.isArray(presented) ? presented[0] : presented;
+  const token = header(req, TOKEN_HEADER);
   if (token === undefined || !constantTimeEquals(token, options.token)) {
     log(`401 ${method} ${path} ${token === undefined ? "no token" : "wrong token"}`);
     sendText(res, 401, `this endpoint needs the session token in the ${TOKEN_HEADER} header`);
@@ -276,7 +282,14 @@ function handle(
       sendText(res, 404, `no project named "${decodeURIComponent(write[1]!)}"`);
       return;
     }
-    return handleWrite(req, res, mount, options.syncs?.get(mount.name), log);
+    const sync = options.syncs?.get(mount.name);
+    const refusal = sync === undefined ? undefined : checkSession(req, sync, mount.name);
+    if (refusal !== undefined) {
+      log(`${WRITE_SESSION_STATUS} ${method} ${path} ${refusal}`);
+      sendText(res, WRITE_SESSION_STATUS, refusal);
+      return;
+    }
+    return handleWrite(req, res, mount, sync, log);
   }
 
   if (method !== "GET" && method !== "HEAD") {
@@ -286,6 +299,28 @@ function handle(
 
   if (path === "/api/projects") {
     sendJson(res, 200, { projects: [...mounts.values()].map((mount) => ({ name: mount.name, root: mount.root })) }, method);
+    return;
+  }
+
+  const snapshot = new RegExp(`^/api/projects/([^/]+)/${SNAPSHOT_PATH}$`).exec(path);
+  if (snapshot !== null) {
+    const name = decodeURIComponent(snapshot[1]!);
+    const mount = mounts.get(name);
+    if (mount === undefined) {
+      sendText(res, 404, `no project named "${name}"`);
+      return;
+    }
+    const body = readSnapshot(mount);
+    // Establishing what was served is only correct for the browser that holds the
+    // read-write session, and only for a snapshot that validated — see
+    // `ProjectSync.noteServed`. Done before the response is written, in the same
+    // synchronous block as the read, so no scan can slip between them.
+    const sync = options.syncs?.get(name);
+    const session = header(req, SESSION_HEADER);
+    if (sync !== undefined && body.ok && session !== undefined && sync.holdsSession(session)) {
+      sync.noteServed(body.files);
+    }
+    sendJson(res, 200, body, method);
     return;
   }
 
@@ -445,18 +480,29 @@ function readBody(req: IncomingMessage): Promise<BodyResult> {
 }
 
 /**
- * Load and validate a project for the browser. The browser gets each document's
- * resolved kind so it can index the bundle without re-running the schema
- * validation this side has just done.
+ * Load and validate a project, with every document's bytes, from one read of the
+ * disk (PLAN.md §12).
+ *
+ * One `loadProject` per response is the point, not an optimisation: a browser that
+ * assembled its model from several reads could be handed two halves of two
+ * different disk states, and the resulting model is one no validation ever passed.
+ * The bytes returned are the exact bytes that were validated — `loadProject` keeps
+ * them for this reason — rather than a re-read or a re-serialization, so the
+ * browser's write preconditions are made of what the server actually saw.
  */
-export function summarise(mount: ProjectMount): ProjectSummary {
+export function readSnapshot(mount: ProjectMount): ProjectSnapshot {
   const result = loadProject(mount.root);
   return {
     name: mount.name,
     root: mount.root,
     ok: result.ok,
     files: [...result.files.values()]
-      .map((file) => ({ path: file.path, kind: file.kind }))
+      .map((file) => ({
+        path: file.path,
+        kind: file.kind,
+        contentHash: hashContent(Buffer.from(file.text, "utf8")),
+        text: file.text,
+      }))
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
     diagnostics: result.diagnostics.map((diagnostic) => ({
       severity: diagnostic.severity,
@@ -465,6 +511,48 @@ export function summarise(mount: ProjectMount): ProjectSummary {
       message: diagnostic.message,
     })),
   };
+}
+
+/**
+ * The same project without the document bytes: what a caller that only needs to
+ * know the shape of the bundle and its diagnostics gets. Derived from
+ * `readSnapshot` rather than loading again, so the two cannot describe different
+ * disks.
+ */
+export function summarise(mount: ProjectMount): ProjectSummary {
+  const snapshot = readSnapshot(mount);
+  return {
+    name: snapshot.name,
+    root: snapshot.root,
+    ok: snapshot.ok,
+    files: snapshot.files.map((file) => ({ path: file.path, kind: file.kind })),
+    diagnostics: snapshot.diagnostics,
+  };
+}
+
+/**
+ * Refuse a write that does not hold the project's read-write session (PLAN.md §12).
+ *
+ * The socket refuses a second window, which stops it *hearing* about the disk; on
+ * its own that leaves the window able to write to it. So a write must present the
+ * session id the sidecar minted for the browser it admitted. Both refusals name
+ * what to do, because both are states a person can be sitting in front of: a second
+ * window that should be closed, and a page whose socket dropped and is reconnecting.
+ */
+function checkSession(req: IncomingMessage, sync: ProjectSync, name: string): string | undefined {
+  const session = header(req, SESSION_HEADER);
+  if (session === undefined) {
+    return `a write to "${name}" needs the ${SESSION_HEADER} header carrying the session id from the sync socket's welcome message`;
+  }
+  if (!sync.holdsSession(session)) {
+    return `this window does not hold the write session for "${name}": either the project is open in another window, or this page's sync socket dropped and it must reconnect before writing`;
+  }
+  return undefined;
+}
+
+function header(req: IncomingMessage, name: string): string | undefined {
+  const presented = req.headers[name];
+  return Array.isArray(presented) ? presented[0] : presented;
 }
 
 function hostIsLoopback(host: string | undefined): boolean {

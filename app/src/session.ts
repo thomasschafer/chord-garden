@@ -1,9 +1,11 @@
+import { inventoryHash } from "@chord-garden/dev-server/api";
 import { ProjectClient, WriteConflict } from "@chord-garden/dev-server/client";
 import { ProjectSocket, type SyncTransportFactory } from "@chord-garden/dev-server/socket";
 import { connectAudioToDocument } from "./audio/documentBridge";
 import { LivePlayer } from "./audio/livePlayer";
 import {
   createDocumentStore,
+  hashText,
   WriteConflictError,
   type DocumentSink,
   type DocumentStore,
@@ -28,6 +30,15 @@ export const client = ProjectClient.fromPage(window as unknown as Record<string,
 
 const sink: DocumentSink = {
   async write(files) {
+    if (projectSocket.session === undefined) {
+      // The sidecar only accepts writes from the window holding its read-write
+      // session, and this window does not hold one right now. Failing here rather
+      // than sending a write that will be refused keeps the reason accurate: the
+      // edits stay dirty and go out when the connection is back.
+      throw new Error(
+        "this window is not connected to the sidecar, so it cannot write; the edits are kept and will be written when the connection returns",
+      );
+    }
     try {
       const response = await client.write(projectName, files);
       return { diagnostics: response.summary.diagnostics };
@@ -112,21 +123,32 @@ export const projectSocket = new ProjectSocket({
   project: projectName,
   token: client.sessionToken,
   factory: transport,
+  /**
+   * What this window holds, hashed, so a reconnect can be replayed (PLAN.md §12).
+   *
+   * Built from the bytes this window believes are *on disk*, not from its canonical
+   * model, because that is what the sidecar hashes: unsaved local edits are this
+   * window's business and must not read as a disk state nobody else has.
+   */
+  inventory: () => {
+    const onDisk = documentStore.getState().onDisk;
+    if (onDisk.size === 0) return undefined;
+    return inventoryHash([...onDisk].map(([path, text]) => ({ path, contentHash: hashText(text) })));
+  },
   handlers: {
     ready(reconnected) {
       syncStore.setState({ connection: "live", detail: undefined });
-      if (reconnected && documentStore.getState().dirty.length > 0) {
-        // Reloading would throw the unsaved edits away, and this window cannot
-        // know what happened on disk while it was gone. Both facts are the
-        // human's to resolve; the write preconditions will refuse anything unsafe
-        // in the meantime.
-        syncStore.setState({
-          behind:
-            "the connection came back, but this window has unsaved edits and may have missed changes on disk while it was disconnected",
-        });
+      const dirty = documentStore.getState().dirty.length > 0;
+      if (reconnected && dirty) {
+        // Reloading would throw the unsaved edits away, and it is not needed: the
+        // hello told the sidecar which disk state this window holds, so anything
+        // that changed while the socket was down arrives as a full snapshot and
+        // reconciles under PLAN.md §12's last-writer-wins. What is owed is the other
+        // direction — the edits that could not be written while there was no
+        // session — so they go out now.
+        void documentStore.getState().flushNow();
         return;
       }
-      syncStore.setState({ behind: undefined });
       loadProjectIntoStore().catch((error: unknown) => {
         syncStore.setState({ loadError: error instanceof Error ? error.message : String(error) });
       });
@@ -150,6 +172,10 @@ export const projectSocket = new ProjectSocket({
     },
   },
 });
+
+// The client learns the write session id from the socket, read fresh on every
+// request: a reconnect mints a new one, and the sidecar refuses a stale one.
+client.useSession(() => projectSocket.session);
 
 let started = false;
 

@@ -14,6 +14,23 @@ export const SETTLE_MS = 100;
  */
 export const MAX_SETTLE_MS = 500;
 
+/**
+ * How often an idle project is re-scanned even though no event arrived.
+ *
+ * A safety net, not the primary path. Recursive `fs.watch` is not uniformly
+ * reliable: on Linux it is emulated by walking the tree, so a subdirectory created
+ * and populated quickly can be missed entirely, and on a network mount there may be
+ * no events at all. Both failures are silent — the UI simply stops following the
+ * disk — and both are cured by asking the disk again occasionally, because the scan
+ * this triggers reads and diffs the whole project rather than trusting an event.
+ *
+ * Slow on purpose: an event-driven scan is ~100 ms away, so this only has to bound
+ * how long a *missed* event can hide. Idle re-scans are also nearly free — a
+ * project's documents are a few kilobytes, and a scan that finds nothing new pushes
+ * nothing.
+ */
+export const IDLE_RESCAN_MS = 5_000;
+
 export interface DirectoryWatcherOptions {
   root: string;
   /** Called once per settled burst, never concurrently with itself. */
@@ -21,6 +38,7 @@ export interface DirectoryWatcherOptions {
   onError: (message: string) => void;
   settleMs?: number;
   maxSettleMs?: number;
+  rescanMs?: number;
 }
 
 /**
@@ -38,11 +56,16 @@ export interface DirectoryWatcherOptions {
  * project document (a `render/` WAV, an editor swap file, one of this server's
  * own `.tmp` files) is ignored, and a nameless event is *not*, because "we do
  * not know what changed" must mean "look", not "assume nothing".
+ *
+ * Because events are untrustworthy in the other direction too — some never arrive —
+ * an idle project is also re-scanned every `IDLE_RESCAN_MS` (see the constant).
  */
 export class DirectoryWatcher {
   private readonly watcher: FSWatcher;
   private readonly settleMs: number;
   private readonly maxSettleMs: number;
+  private readonly rescanMs: number;
+  private rescanTimer: ReturnType<typeof setTimeout> | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
   /** When the burst currently coalescing began, for the max-delay bound. */
   private burstStartedAt = 0;
@@ -51,6 +74,8 @@ export class DirectoryWatcher {
   constructor(private readonly options: DirectoryWatcherOptions) {
     this.settleMs = options.settleMs ?? SETTLE_MS;
     this.maxSettleMs = options.maxSettleMs ?? MAX_SETTLE_MS;
+    this.rescanMs = options.rescanMs ?? IDLE_RESCAN_MS;
+    this.armRescan();
     this.watcher = watch(options.root, { recursive: true, persistent: true });
     this.watcher.on("change", (_event, filename) => {
       this.touch(typeof filename === "string" ? filename : filename?.toString("utf8"));
@@ -93,11 +118,35 @@ export class DirectoryWatcher {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+    if (this.rescanTimer !== undefined) {
+      clearTimeout(this.rescanTimer);
+      this.rescanTimer = undefined;
+    }
     this.watcher.close();
+  }
+
+  /**
+   * Arm the idle safety net for `rescanMs` from now.
+   *
+   * Re-armed by every scan, whatever caused it, so the rule is simply "a scan
+   * happens at most `rescanMs` after the last one". A repeating interval would
+   * instead skip a tick that landed just after an event-driven scan and leave a gap
+   * of nearly twice the interval, which is a worse guarantee for no benefit.
+   */
+  private armRescan(): void {
+    if (this.rescanTimer !== undefined) clearTimeout(this.rescanTimer);
+    this.rescanTimer = setTimeout(() => {
+      // A burst that is still coalescing is about to scan on its own; reading the
+      // disk twice for the same news is exactly what the settle window prevents.
+      if (this.timer === undefined) this.fire();
+      else this.armRescan();
+    }, this.rescanMs);
+    this.rescanTimer.unref();
   }
 
   private fire(): void {
     if (this.closed) return;
+    this.armRescan();
     try {
       this.options.onSettle();
     } catch (error) {

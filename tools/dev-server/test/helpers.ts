@@ -1,5 +1,5 @@
 import { request } from "node:http";
-import { TOKEN_HEADER } from "../src/api.js";
+import { SESSION_HEADER, TOKEN_HEADER } from "../src/api.js";
 
 export interface RawResponse {
   status: number;
@@ -15,6 +15,8 @@ export interface RawOptions {
   origin?: string | undefined;
   /** Sends the session token. Omit to send none. */
   token?: string | undefined;
+  /** Sends the read-write session id from the socket's welcome. Omit to send none. */
+  session?: string | undefined;
   body?: string | undefined;
   contentType?: string | undefined;
 }
@@ -32,6 +34,7 @@ export function rawRequest(port: number, path: string, options: RawOptions = {})
     if (options.host !== undefined) headers["host"] = options.host;
     if (options.origin !== undefined) headers["origin"] = options.origin;
     if (options.token !== undefined) headers[TOKEN_HEADER] = options.token;
+    if (options.session !== undefined) headers[SESSION_HEADER] = options.session;
     if (options.body !== undefined) {
       headers["content-type"] = options.contentType ?? "application/json";
       headers["content-length"] = String(Buffer.byteLength(options.body));

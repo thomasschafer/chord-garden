@@ -8,13 +8,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonicalFiles, loadProject, serializeCanonical } from "@chord-garden/format";
 import {
   CLOSE_ALREADY_OPEN,
+  inventoryHash,
+  SNAPSHOT_PATH,
   SYNC_PROTOCOL,
   type ProjectChangedMessage,
   type ServerMessage,
   type WriteRequest,
   type WriteResponse,
 } from "../src/api.js";
-import { createAssetServer } from "../src/server.js";
+import { createAssetServer, readSnapshot } from "../src/server.js";
 import { ProjectSync } from "../src/sync.js";
 import { hashOnDisk } from "../src/write.js";
 import { rawRequest } from "./helpers.js";
@@ -33,6 +35,7 @@ const SILENCE_MS = 400;
 
 let server: Server;
 let sync: ProjectSync;
+let syncs: Map<string, ProjectSync>;
 let port: number;
 let root: string;
 const sockets: TestSocket[] = [];
@@ -47,16 +50,45 @@ beforeEach(async () => {
     maxSettleMs: 200,
     helloTimeoutMs: 300,
   });
+  // Held in a map the test can rewrite, so `manualSync` can swap the watcher out
+  // for one this file drives itself. The server reads it per request.
+  syncs = new Map([["p", sync]]);
   server = createAssetServer({
     projects: [{ name: "p", root }],
     webRoot: join(REPO_ROOT, "tools/dev-server/web"),
     bundleRoot: join(REPO_ROOT, "tools/dev-server/build"),
     token: TOKEN,
-    syncs: new Map([["p", sync]]),
+    syncs,
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = (server.address() as AddressInfo).port;
 });
+
+/**
+ * Replace this project's sync with one whose scans the test drives itself, and
+ * which therefore has no filesystem watcher at all. Must be called before any
+ * socket connects.
+ *
+ * This is how the race tests below stay deterministic. The settle window's entire
+ * job is to turn a burst of filesystem events into exactly one scan — proved with a
+ * fake clock in `watch.test.ts` — so "these things happened inside one settle
+ * window" *is*, to everything downstream of the watcher, "these things happened to
+ * the disk between two scans". Stating it that way costs nothing in fidelity and
+ * removes both the sleeping and the dependence on when the OS feels like reporting
+ * an unlink, which is precisely where a watcher test becomes flaky. Tests about
+ * whether the real watcher notices at all keep using the real one, above.
+ */
+function manualSync(): ProjectSync {
+  sync.close();
+  sync = new ProjectSync({
+    mount: { name: "p", root },
+    token: TOKEN,
+    helloTimeoutMs: 300,
+    watchFilesystem: false,
+  });
+  syncs.set("p", sync);
+  return sync;
+}
 
 afterEach(async () => {
   for (const socket of sockets.splice(0)) socket.dispose();
@@ -73,11 +105,14 @@ class TestSocket {
   private waiter: ((message: ServerMessage) => void) | undefined;
   private readonly socket: WebSocket;
   closed: { code: number; reason: string } | undefined;
+  /** The write credential from the welcome, which every write must present. */
+  session: string | undefined;
 
   constructor(port: number, path = "/api/projects/p/socket") {
     this.socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
     this.socket.addEventListener("message", (event: MessageEvent) => {
       const message = JSON.parse(String(event.data)) as ServerMessage;
+      if (message.type === "welcome") this.session = message.session;
       const waiter = this.waiter;
       if (waiter !== undefined) {
         this.waiter = undefined;
@@ -89,6 +124,12 @@ class TestSocket {
     this.socket.addEventListener("close", (event: CloseEvent) => {
       this.closed = { code: event.code, reason: event.reason };
     });
+  }
+
+  /** The session credential, or a loud failure: a test must not write without one. */
+  get writeSession(): string {
+    if (this.session === undefined) throw new Error("this socket never received a welcome, so it holds no session");
+    return this.session;
   }
 
   /** Send the handshake once the socket is open. */
@@ -176,19 +217,31 @@ function externalEdit(path: string, contents: string): void {
   writeFileSync(join(root, path), contents, "utf8");
 }
 
-/** Write through the sidecar, the way the UI does, precondition and all. */
-async function uiWrite(files: { path: string; contents: string }[]): Promise<WriteResponse> {
+/**
+ * Write through the sidecar, the way the UI does: precondition, and the session
+ * credential of the browser that holds this project.
+ */
+async function uiWrite(socket: TestSocket, files: { path: string; contents: string }[]): Promise<WriteResponse> {
+  const response = await postWrite(files, socket.writeSession);
+  if (response.status !== 200) throw new Error(`write failed: ${response.status} ${response.body}`);
+  return JSON.parse(response.body) as WriteResponse;
+}
+
+/** A raw write POST, so a test can present the wrong session — or none. */
+function postWrite(
+  files: { path: string; contents: string }[],
+  session: string | undefined,
+): Promise<{ status: number; body: string }> {
   const body: WriteRequest = {
     files: files.map((file) => ({ ...file, expectedHash: hashOnDisk(join(root, file.path)) })),
   };
-  const response = await rawRequest(port, "/api/projects/p/write", {
+  return rawRequest(port, "/api/projects/p/write", {
     method: "POST",
     body: JSON.stringify(body),
     token: TOKEN,
     origin: `http://127.0.0.1:${port}`,
+    ...(session === undefined ? {} : { session }),
   });
-  if (response.status !== 200) throw new Error(`write failed: ${response.status} ${response.body}`);
-  return JSON.parse(response.body) as WriteResponse;
 }
 
 /** A raw upgrade attempt, for the header checks a WebSocket client cannot forge. */
@@ -298,7 +351,7 @@ describe("echo detection", () => {
   it("does not report the sidecar's own write back to the UI", async () => {
     const socket = await editorSocket();
 
-    await uiWrite([{ path: "project.json", contents: renamedProject("Written by the UI") }]);
+    await uiWrite(socket, [{ path: "project.json", contents: renamedProject("Written by the UI") }]);
 
     // The watcher certainly saw that write. It must recognise the bytes as ones
     // it put there, or the UI reconciles its own edit and writes again, forever.
@@ -309,7 +362,7 @@ describe("echo detection", () => {
   it("does not report a multi-file batch it wrote itself", async () => {
     const socket = await editorSocket();
 
-    await uiWrite([
+    await uiWrite(socket, [
       { path: "project.json", contents: renamedProject("Batch") },
       { path: "patterns/drums-verse.json", contents: canonical("patterns/drums-verse.json").replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx") },
     ]);
@@ -323,7 +376,7 @@ describe("echo detection", () => {
     // passes every test above and silently eats this agent edit.
     const socket = await editorSocket();
 
-    await uiWrite([{ path: "project.json", contents: renamedProject("From the UI") }]);
+    await uiWrite(socket, [{ path: "project.json", contents: renamedProject("From the UI") }]);
     externalEdit("project.json", renamedProject("From the agent"));
 
     const message = changed(await socket.next());
@@ -334,7 +387,7 @@ describe("echo detection", () => {
   it("reports only the file the agent touched when a write and an edit interleave", async () => {
     const socket = await editorSocket();
 
-    await uiWrite([{ path: "project.json", contents: renamedProject("Ours") }]);
+    await uiWrite(socket, [{ path: "project.json", contents: renamedProject("Ours") }]);
     externalEdit(
       "patterns/drums-verse.json",
       readFileSync(join(root, "patterns/drums-verse.json"), "utf8").replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"),
@@ -530,5 +583,376 @@ describe("socket authentication and limits", () => {
       "sec-websocket-version": "8",
     });
     expect(refused.status).toBe(400);
+  });
+});
+
+describe("delete and recreate", () => {
+  /**
+   * The semantics under test, chosen because identity here is content and never
+   * existence-over-time (PLAN.md §16 names this case):
+   *
+   * - gone and back with the same bytes, within one settle window → a non-event;
+   * - gone and back with different bytes → an ordinary external edit;
+   * - still gone → a removal, if the project is still a project without it;
+   * - still gone and the project no longer validates → the last good model stays,
+   *   diagnostics say why, nothing is adopted;
+   * - and, because an intermediate state may have been reported, a return to the
+   *   established bytes is announced anyway so the diagnostics are retracted.
+   */
+  it("says nothing about a document that vanishes and returns unchanged", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const path = join(root, "patterns/drums-verse.json");
+    const before = readFileSync(path, "utf8");
+
+    // A tool that moves or rewrites a file by unlinking and creating it, rather
+    // than by renaming over it. Both events land inside one settle window.
+    unlinkSync(path);
+    writeFileSync(path, before, "utf8");
+    manual.scan();
+
+    await socket.expectSilence();
+    expect(manual.establishedText("patterns/drums-verse.json")).toBe(before);
+
+    // And the channel is not merely quiet because it is broken: the next real edit
+    // is the very next message, so nothing was queued behind it either.
+    externalEdit("project.json", renamedProject("Still listening"));
+    manual.scan();
+    expect(changed(await socket.next()).changed.map((file) => file.path)).toEqual(["project.json"]);
+  });
+
+  it("reports a document that vanishes and returns with different bytes as one edit", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const path = join(root, "patterns/drums-verse.json");
+    const edited = readFileSync(path, "utf8").replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx");
+
+    unlinkSync(path);
+    writeFileSync(path, edited, "utf8");
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.changed.map((file) => file.path)).toEqual(["patterns/drums-verse.json"]);
+    expect(message.changed[0]!.text).toBe(edited);
+    expect(message.removed).toEqual([]);
+    await socket.expectSilence();
+  });
+
+  it("reports a document that stays gone as a removal, when the project is still valid without it", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    unlinkSync(join(root, "automation/pad.json"));
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.removed).toEqual(["automation/pad.json"]);
+    expect(message.changed).toEqual([]);
+    expect(message.files.map((file) => file.path)).not.toContain("automation/pad.json");
+    expect(manual.establishedText("automation/pad.json")).toBeUndefined();
+  });
+
+  it("holds the last good model when a deletion breaks the project, and retracts it when the file returns", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const path = join(root, "patterns/drums-verse.json");
+    const before = readFileSync(path, "utf8");
+
+    // A removal that leaves a dangling reference is an invalid disk state, and gets
+    // exactly the treatment every other invalid state gets.
+    unlinkSync(path);
+    manual.scan();
+
+    const invalid = await socket.next();
+    expect(invalid.type).toBe("projectInvalid");
+    if (invalid.type !== "projectInvalid") return;
+    expect(invalid.diagnostics.map((diagnostic) => diagnostic.code)).toContain("ref.missing-pattern");
+    // Nothing was consumed, so the bytes are still there to come back to.
+    expect(manual.establishedText("patterns/drums-verse.json")).toBe(before);
+
+    // The file comes back byte-identical: there is now no content difference left
+    // to report, and yet the UI is sitting on an error about a state that no longer
+    // exists. So the recovery is announced with nothing changed in it.
+    writeFileSync(path, before, "utf8");
+    manual.scan();
+
+    const recovery = changed(await socket.next());
+    expect(recovery.changed).toEqual([]);
+    expect(recovery.removed).toEqual([]);
+    expect(recovery.scope).toBe("diff");
+    expect(recovery.files.map((file) => file.path)).toContain("patterns/drums-verse.json");
+    expect(recovery.diagnostics.filter((diagnostic) => diagnostic.severity === "error")).toEqual([]);
+    await socket.expectSilence();
+  });
+
+  it("reports a deletion and a recreation with new bytes together when the project broke in between", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const path = join(root, "patterns/drums-verse.json");
+    const before = readFileSync(path, "utf8");
+
+    unlinkSync(path);
+    manual.scan();
+    expect((await socket.next()).type).toBe("projectInvalid");
+
+    writeFileSync(path, before.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"), "utf8");
+    externalEdit("project.json", renamedProject("Moved a pattern about"));
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.changed.map((file) => file.path).sort()).toEqual(["patterns/drums-verse.json", "project.json"]);
+    await socket.expectSilence();
+  });
+
+  it("keeps the last good model when the whole project directory is emptied", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    rmSync(join(root, "project.json"));
+    rmSync(join(root, "patterns"), { recursive: true, force: true });
+    manual.scan();
+
+    const message = await socket.next();
+    expect(message.type).toBe("projectInvalid");
+    if (message.type !== "projectInvalid") return;
+    expect(message.diagnostics.map((diagnostic) => diagnostic.code)).toContain("project.missing-file");
+    // Not one file of it was consumed, so the model in the browser is still whole.
+    expect(manual.establishedText("project.json")).toBeDefined();
+    expect(manual.establishedText("patterns/drums-verse.json")).toBeDefined();
+  });
+});
+
+describe("writes bound to the session", () => {
+  it("accepts a write from the browser that holds the session", async () => {
+    const socket = await editorSocket();
+
+    const response = await postWrite([{ path: "project.json", contents: renamedProject("From the holder") }], socket.writeSession);
+
+    expect(response.status).toBe(200);
+    expect(loadProject(root).project!.project.name).toBe("From the holder");
+  });
+
+  it("refuses a write from a window that was refused the session", async () => {
+    const holder = await editorSocket();
+    const second = new TestSocket(port);
+    sockets.push(second);
+    await second.hello();
+    expect(await second.next()).toMatchObject({ type: "rejected" });
+    expect(second.session).toBeUndefined();
+
+    // The refused window has the page's token — it was served the same page — so
+    // the token is not what stops it. Nothing but the session can.
+    const response = await postWrite([{ path: "project.json", contents: renamedProject("From the second window") }], "not-the-session-id");
+
+    expect(response.status).toBe(403);
+    expect(response.body).toContain("another window");
+    expect(loadProject(root).project!.project.name).not.toBe("From the second window");
+    expect(holder.session).toBeDefined();
+  });
+
+  it("refuses a write that presents no session at all", async () => {
+    await editorSocket();
+
+    const response = await postWrite([{ path: "project.json", contents: renamedProject("No session") }], undefined);
+
+    expect(response.status).toBe(403);
+    expect(response.body).toContain("x-chord-garden-session");
+    expect(loadProject(root).project!.project.name).not.toBe("No session");
+  });
+
+  it("refuses a write on a session id that has ended", async () => {
+    const socket = await editorSocket();
+    const stale = socket.writeSession;
+    socket.dispose();
+    for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(sync.hasEditor).toBe(false);
+
+    const response = await postWrite([{ path: "project.json", contents: renamedProject("After the socket went") }], stale);
+
+    expect(response.status).toBe(403);
+    expect(loadProject(root).project!.project.name).not.toBe("After the socket went");
+  });
+
+  it("mints a different session for the next window", async () => {
+    const first = await editorSocket();
+    const firstSession = first.writeSession;
+    first.dispose();
+    for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const second = await editorSocket();
+
+    expect(second.writeSession).not.toBe(firstSession);
+    expect((await postWrite([{ path: "project.json", contents: renamedProject("Old id") }], firstSession)).status).toBe(403);
+    expect((await postWrite([{ path: "project.json", contents: renamedProject("New id") }], second.writeSession)).status).toBe(200);
+  });
+});
+
+/** The inventory hash of the project as it stands, as a page would compute it. */
+function currentInventory(): string {
+  return inventoryHash(readSnapshot({ name: "p", root }).files);
+}
+
+/** Wait for the editor slot to be released, which the socket closing does. */
+async function untilNoEditor(): Promise<void> {
+  for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(sync.hasEditor).toBe(false);
+}
+
+/** GET a project path with the token, and optionally a session id. */
+function get(path: string, session?: string): Promise<{ status: number; body: string }> {
+  return rawRequest(port, path, { token: TOKEN, ...(session === undefined ? {} : { session }) });
+}
+
+describe("catching a reconnecting session up", () => {
+  it("sends nothing to a page connecting for the first time", async () => {
+    // A first connection carries no inventory, because the page holds nothing and
+    // is about to load over HTTP. Pushing the bundle at it here would be a snapshot
+    // it cannot use, on every page load.
+    const socket = await editorSocket();
+
+    await socket.expectSilence();
+  });
+
+  it("sends nothing to a session that reconnects in step with the disk", async () => {
+    const manual = manualSync();
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+
+    await socket.hello({ inventory: currentInventory() });
+
+    expect(await socket.next()).toMatchObject({ type: "welcome" });
+    await socket.expectSilence();
+
+    // And the session is a working one: the next edit arrives as an ordinary diff.
+    externalEdit("project.json", renamedProject("After the reconnect"));
+    manual.scan();
+    const message = changed(await socket.next());
+    expect(message.scope).toBe("diff");
+    expect(message.changed.map((file) => file.path)).toEqual(["project.json"]);
+  });
+
+  it("sends a full snapshot to a session that reconnects behind the disk", async () => {
+    const manual = manualSync();
+    const stale = currentInventory();
+    const first = await editorSocket();
+    first.dispose();
+    await untilNoEditor();
+
+    // The edit nobody was listening for. The sidecar establishes it — it announces
+    // differences from what it established, and there was nobody to tell — so a
+    // reconnecting page would otherwise never hear about it.
+    externalEdit("project.json", renamedProject("While you were away"));
+    manual.scan();
+
+    const second = new TestSocket(port);
+    sockets.push(second);
+    await second.hello({ inventory: stale });
+    expect(await second.next()).toMatchObject({ type: "welcome" });
+
+    const message = changed(await second.next());
+    expect(message.scope).toBe("full");
+    // Everything, not just the file that moved: the sidecar keeps no history, so
+    // what it can honestly say is "here is the disk".
+    expect(message.changed.map((file) => file.path)).toEqual(message.files.map((file) => file.path));
+    expect(message.changed.find((file) => file.path === "project.json")!.text).toContain("While you were away");
+    await second.expectSilence();
+  });
+
+  it("keeps owing the full snapshot until the disk validates again", async () => {
+    const manual = manualSync();
+    const stale = currentInventory();
+    const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+    externalEdit("project.json", renamedProject("Changed while nobody was here"));
+    manual.scan();
+
+    // The page comes back while an agent is mid-edit, so there is no snapshot to
+    // hand it yet.
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x"));
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+    await socket.hello({ inventory: stale });
+    expect(await socket.next()).toMatchObject({ type: "welcome" });
+    expect((await socket.next()).type).toBe("projectInvalid");
+
+    // When the edit finishes, the catch-up it was owed is paid — in full, not as a
+    // diff against a disk state this page never held.
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"));
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.scope).toBe("full");
+    expect(message.changed.map((file) => file.path)).toEqual(message.files.map((file) => file.path));
+  });
+
+  it("refuses a hello whose inventory is not a string", async () => {
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+
+    await socket.hello({ inventory: 17 });
+
+    expect(await socket.next()).toMatchObject({ type: "error", message: expect.stringContaining("inventory") });
+    await socket.waitForClose();
+    expect(sync.hasEditor).toBe(false);
+  });
+});
+
+describe("the snapshot endpoint and the watcher", () => {
+  it("does not re-announce a snapshot it has served to the session holder", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    // An agent edit the watcher has not scanned yet, and then the holder loading the
+    // project over HTTP — the ordinary reconnect-then-reload sequence.
+    externalEdit("project.json", renamedProject("Read over HTTP"));
+    const response = await get(`/api/projects/p/${SNAPSHOT_PATH}`, socket.writeSession);
+    expect(response.status).toBe(200);
+    expect(response.body).toContain("Read over HTTP");
+
+    manual.scan();
+
+    await socket.expectSilence();
+    expect(manual.establishedText("project.json")).toContain("Read over HTTP");
+  });
+
+  it("still announces the edit when a snapshot was served without a session", async () => {
+    // The engine harness page, a second window, `curl`. None of them is the editor,
+    // so what they read says nothing about what the editor has seen — and treating
+    // it as if it did would swallow this push and lose the agent's edit.
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    externalEdit("project.json", renamedProject("Read by somebody else"));
+    expect((await get(`/api/projects/p/${SNAPSHOT_PATH}`)).status).toBe(200);
+
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.changed.map((file) => file.path)).toEqual(["project.json"]);
+  });
+
+  it("does not establish a snapshot that did not validate", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x"));
+    const response = await get(`/api/projects/p/${SNAPSHOT_PATH}`, socket.writeSession);
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body).ok).toBe(false);
+
+    // The browser could not have adopted that, so nothing about it is established:
+    // when the edit finishes, the whole thing still arrives.
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"));
+    manual.scan();
+
+    const message = changed(await socket.next());
+    expect(message.changed.map((file) => file.path)).toEqual(["patterns/drums-verse.json"]);
+    expect(manual.establishedText("patterns/drums-verse.json")).toContain("x..x ..x. x..x ..xx");
   });
 });

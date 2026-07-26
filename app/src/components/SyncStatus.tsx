@@ -13,12 +13,10 @@ import { documentStore, loadProjectIntoStore, syncStore } from "../session";
 export function SyncStatus(): React.JSX.Element {
   const connection = useStore(syncStore, (state) => state.connection);
   const detail = useStore(syncStore, (state) => state.detail);
-  const behind = useStore(syncStore, (state) => state.behind);
   const diskValid = useStore(documentStore, (state) => state.diskValid);
   const outOfSync = useStore(documentStore, (state) => state.outOfSync);
   const external = useStore(documentStore, (state) => state.lastExternalEdit);
   const accepted = useStore(documentStore, (state) => state.externalEditsAccepted);
-  const dirty = useStore(documentStore, (state) => state.dirty);
 
   return (
     <section>
@@ -48,20 +46,6 @@ export function SyncStatus(): React.JSX.Element {
         <p className="error">
           {external.discarded.join(", ")} changed on disk while this window had unsaved edits to{" "}
           {external.discarded.length === 1 ? "it" : "them"}. The version on disk won, and those unsaved edits are gone.
-        </p>
-      )}
-
-      {behind !== undefined && (
-        <p className="error">
-          {behind}.{" "}
-          <button
-            type="button"
-            onClick={() => {
-              void loadProjectIntoStore();
-            }}
-          >
-            reload from disk (discards {dirty.length} unsaved {dirty.length === 1 ? "file" : "files"})
-          </button>
         </p>
       )}
 
