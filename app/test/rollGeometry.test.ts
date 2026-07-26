@@ -46,6 +46,7 @@ function playingAt(positionSample: number): PlayerStatus {
     error: undefined,
     lastEdit: undefined,
     editsApplied: 0,
+    samplesReloaded: [],
   };
 }
 

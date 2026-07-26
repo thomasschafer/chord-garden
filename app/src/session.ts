@@ -135,6 +135,16 @@ export const projectSocket = new ProjectSocket({
     if (onDisk.size === 0) return undefined;
     return inventoryHash([...onDisk].map(([path, text]) => ({ path, contentHash: hashText(text) })));
   },
+  /**
+   * The sample content this window is playing, so a reconnect can be told about a
+   * file replaced while the socket was down.
+   *
+   * Not derivable from `inventory`: samples are not documents, and a page can hold a
+   * document state exactly in step with the disk while its audio is a version behind
+   * — which is the one case sample watching exists for, and the one a reconnect would
+   * otherwise walk straight past.
+   */
+  samples: () => livePlayer.sampleContent(),
   handlers: {
     ready(reconnected) {
       syncStore.setState({ connection: "live", detail: undefined });
@@ -155,6 +165,13 @@ export const projectSocket = new ProjectSocket({
     },
     changed(message) {
       documentStore.getState().applyExternalChange(message);
+    },
+    samplesChanged(message) {
+      // Straight to the audio engine, never through the document store: no document
+      // changed, so there is nothing here to reconcile, mark dirty or write back. The
+      // engine compares the announced content hashes against what it holds and fetches
+      // only what really moved.
+      void livePlayer.applySampleChange(message.samples);
     },
     invalid(message) {
       documentStore.getState().noteDiskInvalid(message.diagnostics);

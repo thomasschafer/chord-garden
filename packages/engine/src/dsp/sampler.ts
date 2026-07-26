@@ -26,6 +26,20 @@ interface PlaybackVoice {
   /** Index of the voice in `voiceNames`, so the mix loop needs no key lookup. */
   slot: number;
   settings: DrumVoiceSettings;
+  /**
+   * The audio this hit is playing, captured when it was triggered rather than
+   * read from `settings` each sample.
+   *
+   * That is what makes replacing a sample file inaudible as a glitch: swapping
+   * `settings.sample` under a hit that is already sounding changes the waveform
+   * mid-flight — a step discontinuity, so a click — and leaves `rate` describing
+   * the old file's sample rate. Holding the buffer here means a replacement is
+   * adopted by the *next* trigger, and a hit in progress finishes on what it
+   * started with (PLAN.md §14). The reference also bounds how long the old buffer
+   * lives: it is dropped when this playback ends, which is within the sample's own
+   * length.
+   */
+  sample: SampleData;
   position: number;
   rate: number;
   velocityGain: number;
@@ -99,7 +113,7 @@ export class DrumkitProcessor {
       this.slotLeft.fill(0);
       this.slotRight.fill(0);
       for (const playback of this.playbacks) {
-        const sample = interpolateSample(playback.settings.sample, playback.position);
+        const sample = interpolateSample(playback.sample, playback.position);
         if (sample === undefined) continue;
         let chokeGain = 1;
         if (playback.chokeSamplesRemaining > 0) {
@@ -175,14 +189,18 @@ export class DrumkitProcessor {
         }
       }
     }
+    // Read once here, so this hit's audio and the `rate` derived from its sample
+    // rate describe the same file even if the file is replaced while it sounds.
+    const sample = settings.sample;
     this.playbacks.push({
       voice: command.voice,
       slot,
       settings,
+      sample,
       position: 0,
       // Linear interpolation is deterministic and sufficient for v1, though
       // it is not an audiophile-grade resampler.
-      rate: (settings.sample.sampleRate / this.sampleRate) * centsToRatio(settings.pitchCents),
+      rate: (sample.sampleRate / this.sampleRate) * centsToRatio(settings.pitchCents),
       velocityGain: command.velocity / 1000,
       chokeSamplesRemaining: 0,
       chokeSamplesTotal: 1,
@@ -193,7 +211,7 @@ export class DrumkitProcessor {
     for (let index = this.playbacks.length - 1; index >= 0; index--) {
       const playback = this.playbacks[index]!;
       if (
-        playback.position >= playback.settings.sample.left.length ||
+        playback.position >= playback.sample.left.length ||
         (playback.chokeSamplesTotal > 1 && playback.chokeSamplesRemaining === 0)
       ) {
         this.playbacks.splice(index, 1);

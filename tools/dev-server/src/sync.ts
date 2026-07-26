@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { hashContent } from "@chord-garden/engine/live";
-import { loadProject } from "@chord-garden/format";
+import { loadProject, referencedSamplePaths, type Project } from "@chord-garden/format";
 import {
   CLOSE_ALREADY_OPEN,
   CLOSE_UNAUTHORIZED,
@@ -9,6 +11,7 @@ import {
   SYNC_PROTOCOL,
   type ApiDiagnostic,
   type HelloMessage,
+  type SampleFile,
   type ServerMessage,
   type SnapshotDocument,
   type SnapshotFile,
@@ -21,7 +24,7 @@ import {
   CLOSE_PROTOCOL_ERROR,
   type WebSocketConnection,
 } from "./websocket.js";
-import { DirectoryWatcher } from "./watch.js";
+import { couldBeSample, DirectoryWatcher } from "./watch.js";
 
 /** How often an authenticated socket is pinged, and how long a pong may take. */
 export const KEEPALIVE_MS = 15_000;
@@ -101,9 +104,41 @@ export interface ProjectSyncOptions {
  * and leave the UI insisting the project is broken forever. So a snapshot that
  * validates after an invalid one was reported is always announced, even when it
  * carries no changed files: the announcement is what retracts the diagnostics.
+ *
+ * ## Samples
+ *
+ * A replaced sample file is the one change that alters what the project *sounds*
+ * like without altering a single document (PLAN.md §14). It therefore gets its own
+ * inventory, `establishedSamples`, and its own message: there is no document to
+ * reconcile, no bytes for a write precondition, and a `projectChanged` carrying a
+ * change no document made would be a fiction the browser cannot check.
+ *
+ * The identity is the content hash rather than the full bytes, which is the one place
+ * this class knowingly departs from "decide identity on full bytes". Two reasons, and
+ * they both point the same way: holding a copy of every sample would mean carrying a
+ * project's entire audio in the sidecar's heap, for files the 50 MB-per-file cap
+ * bounds only loosely; and the content hash is *already* the identity end to end,
+ * because the engine's cache and the worklet's configure check are keyed by it
+ * (`sampleCache.ts`). A collision would serve the stale decode inside the engine
+ * whatever this class compared, so comparing bytes here would buy nothing.
+ *
+ * Time still never enters it. Nothing is compared against an mtime or a size, and
+ * `cp -p` preserving a timestamp changes nothing about what is noticed.
  */
 export class ProjectSync {
   private readonly established = new Map<string, string>();
+  /**
+   * Content hash of every sample path this sidecar has established, meaning it has
+   * already told the session holder about that content (or seeded it at startup).
+   *
+   * Entries are never removed. A kit voice can stop referencing a file and start
+   * again — an agent trying one kick against another — and a page's sample cache
+   * outlives the gap, so forgetting the path would let the file be replaced while
+   * unreferenced and then re-adopted with nothing said about it. Keeping the stale
+   * entry makes the return an ordinary difference. The map is one short string per
+   * path the project has ever referenced, so nothing is saved by pruning it.
+   */
+  private readonly establishedSamples = new Map<string, string>();
   private readonly watcher: DirectoryWatcher | undefined;
   private readonly keepaliveMs: number;
   private readonly log: (line: string) => void;
@@ -220,6 +255,7 @@ export class ProjectSync {
           session: this.session,
         });
         this.log(`sync ${this.options.mount.name}: editor session opened`);
+        this.catchUpSamples(outcome.hello.samples);
         this.catchUp(outcome.hello.inventory);
       },
       closed: (reason) => {
@@ -245,6 +281,18 @@ export class ProjectSync {
    * could scan a file this server has written but not yet established.
    */
   noteWrite(path: string, contents: string): void {
+    if (couldBeSample(path)) {
+      // Unreachable today: the write endpoint's path resolution admits documents only.
+      // It is a guard rather than a comment because the day sample writing is added,
+      // "documents are established as text, samples as a content hash" is precisely the
+      // distinction that would be forgotten — and the symptom would be the sidecar
+      // announcing its own write as an external change, on a path where the browser
+      // then re-fetches bytes it just sent. Failing here makes that omission
+      // impossible to ship instead of subtle to find.
+      throw new Error(
+        `cannot establish sample "${path}" as document text; a sample write must establish the content hash of its bytes`,
+      );
+    }
     this.established.set(path, contents);
   }
 
@@ -261,6 +309,12 @@ export class ProjectSync {
    * Synchronous with the response for the same reason as `noteWrite`: no
    * filesystem event can be delivered mid-block, so there is no window in which a
    * scan could see bytes that were served but not yet established.
+   *
+   * Samples are untouched, because the snapshot carries none: the page fetches those
+   * separately, and whatever it gets is hashed from the bytes that arrive. If the disk
+   * moved between this read and that fetch, the next scan announces a difference the
+   * page has already picked up, and the page's own content comparison makes that a
+   * no-op rather than a re-fetch.
    */
   noteServed(documents: readonly { path: string; text: string }[]): void {
     this.established.clear();
@@ -295,6 +349,41 @@ export class ProjectSync {
     this.scan();
   }
 
+  /**
+   * Tell a reconnecting page about sample content it is holding a stale copy of.
+   *
+   * The document `inventory` cannot answer this. A sample replaced while the socket
+   * was down is established with nobody listening, so the page's *documents* can be
+   * exactly in step with the disk — the quiet path through `catchUp` — while its
+   * audio is a version behind. Without this, the one case the whole sample-watching
+   * exercise exists for survives a reconnect.
+   *
+   * Answered from `establishedSamples` rather than by reading the disk: it is what
+   * this sidecar knows, the next scan corrects it within one idle interval at worst,
+   * and an admitted socket should not have to wait on a pass over every sample file.
+   * A page that declares nothing gets nothing, because whatever it fetches later will
+   * be whatever is on disk then.
+   */
+  private catchUpSamples(declared: readonly SampleFile[] | undefined): void {
+    if (declared === undefined || declared.length === 0) return;
+    const changed = declared
+      .filter((sample) => {
+        const established = this.establishedSamples.get(sample.path);
+        // A path this sidecar has never established says nothing about staleness, so
+        // it is not claimed to have changed; the page keeps what it has until a scan
+        // has something to say about it.
+        return established !== undefined && established !== sample.contentHash;
+      })
+      .map((sample) => sample.path);
+    if (changed.length === 0) return;
+    this.log(`sync ${this.options.mount.name}: session reconnected holding stale samples — ${changed.join(", ")}`);
+    this.broadcast({
+      type: "samplesChanged",
+      samples: [...this.establishedSamples].map(([path, contentHash]) => ({ path, contentHash })),
+      changed,
+    });
+  }
+
   /** The inventory hash of what this sidecar has established, for `catchUp`. */
   private establishedInventory(): string {
     return inventoryHash(
@@ -327,6 +416,12 @@ export class ProjectSync {
 
     const diagnostics = result.diagnostics.map(toApiDiagnostic);
     if (!result.ok || result.project === undefined) {
+      // Where an invalid *sample* lands, too, and deliberately by the same route: a
+      // replaced file that is not PCM WAV, is over the cap, or has been deleted while
+      // a kit voice still names it fails `semanticValidate`, so it arrives here as an
+      // invalid project. The last good audio keeps playing, the diagnostic names the
+      // file, and `establishedSamples` is untouched — so when the file is fixed, the
+      // difference is still there to announce.
       // Transient invalid states are expected mid-edit, so this is not an error
       // to recover from — it is a state to report and wait out. `established` is
       // untouched, so nothing here is consumed. This is also where a deletion that
@@ -336,6 +431,12 @@ export class ProjectSync {
       this.reportInvalid(diagnostics);
       return;
     }
+
+    // Before the documents, because the two can change together and a graph naming
+    // sample content the worklet has not been sent is refused by the worklet. Ordering
+    // it this way means a document edit that adds a kit voice pointing at a file that
+    // was *also* replaced finds the new content already on its way.
+    if (!this.scanSamples(result.project)) return;
 
     const full = this.owedFullSnapshot;
     const changed: SnapshotDocument[] = [];
@@ -372,6 +473,53 @@ export class ProjectSync {
   }
 
   /**
+   * Hash the project's referenced samples, announce the ones whose content moved,
+   * and establish them. Returns false when the samples could not be read, having
+   * reported that instead.
+   *
+   * Called on every scan, including the idle re-scan, and it reads every referenced
+   * sample to do it. That is the cost of content being the identity, and it is not a
+   * new cost: `semanticValidate` already reads each of them to check its WAV header,
+   * so a scan was O(all sample bytes) before this existed. If a project ever holds
+   * enough audio for that to matter, the fix is to hash during the load that is
+   * already reading the bytes — not to start trusting mtimes.
+   */
+  private scanSamples(project: Project): boolean {
+    const samples: SampleFile[] = [];
+    for (const path of referencedSamplePaths(project)) {
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(join(this.options.mount.root, path));
+      } catch (error) {
+        // The project validated a moment ago, so this is a file that vanished between
+        // that read and this one. Reported rather than skipped: a sample this sidecar
+        // cannot read is one whose content it cannot vouch for, and quietly leaving it
+        // out of the inventory is how a page keeps playing audio the disk no longer has.
+        this.reportInvalid([
+          {
+            severity: "error",
+            code: "sample.unreadable",
+            file: path,
+            message: `sample "${path}" could not be read: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ]);
+        return false;
+      }
+      samples.push({ path, contentHash: hashContent(bytes) });
+    }
+
+    const changed = samples
+      .filter((sample) => this.establishedSamples.get(sample.path) !== sample.contentHash)
+      .map((sample) => sample.path);
+    for (const sample of samples) this.establishedSamples.set(sample.path, sample.contentHash);
+    if (changed.length === 0) return true;
+
+    this.log(`sync ${this.options.mount.name}: samples changed — ${changed.join(", ")}`);
+    this.broadcast({ type: "samplesChanged", samples, changed });
+    return true;
+  }
+
+  /**
    * Say that the disk does not currently validate, and remember having said it.
    *
    * The remembering is what makes a retraction possible: if the disk returns to
@@ -395,6 +543,11 @@ export class ProjectSync {
   /** What the sidecar believes is on disk. For tests and diagnostics. */
   establishedText(path: string): string | undefined {
     return this.established.get(path);
+  }
+
+  /** The content hash the sidecar believes a sample holds. For tests and diagnostics. */
+  establishedSampleHash(path: string): string | undefined {
+    return this.establishedSamples.get(path);
   }
 
   /**
@@ -454,6 +607,8 @@ export class ProjectSync {
         },
       };
     }
+    const samples = readDeclaredSamples(message["samples"]);
+    if ("refusal" in samples) return samples;
     return {
       hello: {
         type: "hello",
@@ -461,6 +616,7 @@ export class ProjectSync {
         token,
         project,
         ...(inventory === undefined ? {} : { inventory }),
+        ...(samples.samples === undefined ? {} : { samples: samples.samples }),
       },
     };
   }
@@ -501,10 +657,60 @@ export class ProjectSync {
         return;
       }
       for (const file of result.files.values()) this.established.set(file.path, file.text);
+      if (result.project !== undefined) {
+        for (const path of referencedSamplePaths(result.project)) {
+          try {
+            this.establishedSamples.set(path, hashContent(readFileSync(join(this.options.mount.root, path))));
+          } catch (error) {
+            // A sample the project validated against and yet cannot be read now is a
+            // startup race, not a state to establish. Left unestablished, so the first
+            // scan announces it.
+            this.log(`sync ${this.options.mount.name}: could not hash sample ${path} at startup: ${String(error)}`);
+          }
+        }
+      }
     } catch (error) {
       this.log(`sync ${this.options.mount.name}: could not read the project at startup: ${String(error)}`);
     }
   }
+}
+
+/**
+ * Read the optional sample inventory out of a `hello`.
+ *
+ * Malformed is refused rather than ignored: a page whose declaration this sidecar
+ * silently dropped would be told nothing about its stale audio, which is the exact
+ * failure the field exists to prevent — so it must not be possible to half-send it.
+ */
+function readDeclaredSamples(
+  value: unknown,
+): { samples: SampleFile[] | undefined } | { refusal: Refusal } {
+  if (value === undefined) return { samples: undefined };
+  if (!Array.isArray(value)) {
+    return {
+      refusal: {
+        close: CLOSE_PROTOCOL_ERROR,
+        reason: `"samples" must be an array if present, got ${JSON.stringify(value)}`,
+      },
+    };
+  }
+  const samples: SampleFile[] = [];
+  for (const entry of value as unknown[]) {
+    if (entry === null || typeof entry !== "object") {
+      return { refusal: { close: CLOSE_PROTOCOL_ERROR, reason: `every "samples" entry must be an object, got ${JSON.stringify(entry)}` } };
+    }
+    const { path, contentHash } = entry as { path?: unknown; contentHash?: unknown };
+    if (typeof path !== "string" || typeof contentHash !== "string") {
+      return {
+        refusal: {
+          close: CLOSE_PROTOCOL_ERROR,
+          reason: `every "samples" entry needs a string "path" and "contentHash", got ${JSON.stringify(entry)}`,
+        },
+      };
+    }
+    samples.push({ path, contentHash });
+  }
+  return { samples };
 }
 
 /** Why a socket is being closed, and what to tell it first. */

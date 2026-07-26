@@ -7,6 +7,7 @@ import { ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
 import { pitchToMidi } from "./pitch.js";
 import { checkParamValue, resolveParam, validParamKeys } from "./registry.js";
+import { sampleReferences } from "./samples.js";
 import { closestMatch } from "./util.js";
 import { checkWavHeader } from "./wav.js";
 
@@ -471,46 +472,43 @@ function checkAutomation(project: Project, report: Report): void {
 function checkSamples(project: Project, report: Report): void {
   const referenced = new Map<string, { file: string; pointer: string }>();
 
-  for (const instrument of project.instruments.values()) {
-    if (instrument.type !== "drumkit") continue;
-    const file = `instruments/${instrument.id}.json`;
-    for (const [voice, { sample }] of Object.entries(instrument.kit)) {
-      const pointer = `/kit/${voice}/sample`;
-      if (isAbsolute(sample) || sample.split("/").includes("..")) {
-        report("error", "sample.path-invalid", file, pointer, `sample path "${sample}" must be project-relative (no absolute paths, no "..")`);
-        continue;
-      }
-      if (!sample.startsWith("samples/")) {
-        report("error", "sample.path-invalid", file, pointer, `sample path "${sample}" must live under samples/`);
-        continue;
-      }
-      if (!sample.endsWith(".wav")) {
-        report("error", "sample.not-wav", file, pointer, `sample "${sample}" must be an uncompressed PCM .wav file in v1`);
-        continue;
-      }
-      referenced.set(sample, { file, pointer });
+  // The enumeration is shared with the sidecar's sample watcher, so the set of
+  // files checked here is exactly the set watched for replacement.
+  for (const { path: sample, file, pointer } of sampleReferences(project)) {
+    if (isAbsolute(sample) || sample.split("/").includes("..")) {
+      report("error", "sample.path-invalid", file, pointer, `sample path "${sample}" must be project-relative (no absolute paths, no "..")`);
+      continue;
+    }
+    if (!sample.startsWith("samples/")) {
+      report("error", "sample.path-invalid", file, pointer, `sample path "${sample}" must live under samples/`);
+      continue;
+    }
+    if (!sample.endsWith(".wav")) {
+      report("error", "sample.not-wav", file, pointer, `sample "${sample}" must be an uncompressed PCM .wav file in v1`);
+      continue;
+    }
+    referenced.set(sample, { file, pointer });
 
-      let stat;
-      try {
-        stat = statSync(join(project.root, sample));
-      } catch {
-        report("error", "sample.missing", file, pointer, `sample file "${sample}" does not exist on disk`);
-        continue;
-      }
-      if (stat.size > MAX_SAMPLE_BYTES) {
-        report(
-          "error",
-          "sample.oversize",
-          file,
-          pointer,
-          `sample "${sample}" is ${stat.size} bytes; the per-sample cap is ${MAX_SAMPLE_BYTES}`,
-        );
-        continue;
-      }
-      const header = checkWavHeader(readFileSync(join(project.root, sample)));
-      if (!header.ok) {
-        report("error", "sample.not-wav", file, pointer, `sample "${sample}" is not a valid PCM WAV file: ${header.reason}`);
-      }
+    let stat;
+    try {
+      stat = statSync(join(project.root, sample));
+    } catch {
+      report("error", "sample.missing", file, pointer, `sample file "${sample}" does not exist on disk`);
+      continue;
+    }
+    if (stat.size > MAX_SAMPLE_BYTES) {
+      report(
+        "error",
+        "sample.oversize",
+        file,
+        pointer,
+        `sample "${sample}" is ${stat.size} bytes; the per-sample cap is ${MAX_SAMPLE_BYTES}`,
+      );
+      continue;
+    }
+    const header = checkWavHeader(readFileSync(join(project.root, sample)));
+    if (!header.ok) {
+      report("error", "sample.not-wav", file, pointer, `sample "${sample}" is not a valid PCM WAV file: ${header.reason}`);
     }
   }
 

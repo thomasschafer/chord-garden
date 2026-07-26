@@ -52,10 +52,10 @@ export interface DirectoryWatcherOptions {
  * *when* the dust has settled; the sync layer then reads the project from disk
  * and diffs it, which is a question the filesystem answers reliably.
  *
- * Events are filtered only where the filter is safe: a path that cannot be a
- * project document (a `render/` WAV, an editor swap file, one of this server's
- * own `.tmp` files) is ignored, and a nameless event is *not*, because "we do
- * not know what changed" must mean "look", not "assume nothing".
+ * Events are filtered only where the filter is safe: a path that can be neither a
+ * project document nor a sample (a `render/` WAV, an editor swap file, one of this
+ * server's own `.tmp` files) is ignored, and a nameless event is *not*, because "we
+ * do not know what changed" must mean "look", not "assume nothing".
  *
  * Because events are untrustworthy in the other direction too — some never arrive —
  * an idle project is also re-scanned every `IDLE_RESCAN_MS` (see the constant).
@@ -88,7 +88,7 @@ export class DirectoryWatcher {
   /** Note an event and (re)arm the settle timer. Exposed for tests. */
   touch(filename: string | undefined): void {
     if (this.closed) return;
-    if (filename !== undefined && !couldBeDocument(filename)) return;
+    if (filename !== undefined && !couldBeDocument(filename) && !couldBeSample(filename)) return;
 
     const now = Date.now();
     if (this.timer === undefined) {
@@ -159,18 +159,38 @@ export class DirectoryWatcher {
  * Could a filesystem event about this name concern a project document?
  *
  * Answers only for names, and answers conservatively: the §4 layout is the
- * allowlist, so `patterns/x.json` counts and `render/master.wav`,
- * `patterns/.x.json.1234.tmp` and `samples/kick.wav` do not.
- *
- * Samples are excluded on purpose. Replacing one changes what the project
- * *sounds* like without changing any document, which the v1 reconcile has no way
- * to express — the live engine's sample cache is keyed by content and invalidated
- * on load (Phase 2). Making that live is real work, not a filter change, so it
- * stays out rather than half-arriving here.
+ * allowlist, so `patterns/x.json` counts and `render/master.wav` and
+ * `patterns/.x.json.1234.tmp` do not. A sample is not a document — see
+ * `couldBeSample`, which the watcher consults as well.
  */
 export function couldBeDocument(filename: string): boolean {
   const path = filename.replaceAll("\\", "/");
   const base = path.slice(path.lastIndexOf("/") + 1);
   if (base.startsWith(".")) return false;
   return docKindHintForPath(path) !== undefined;
+}
+
+/**
+ * Could a filesystem event about this name concern a sample?
+ *
+ * Watched, because a replaced `samples/kick.wav` changes what the project *sounds*
+ * like while changing no document at all — so a filter that let only documents
+ * through was the one place where the disk and the audio could disagree with nothing
+ * said about it (PLAN.md §14, and §16's Phase 2 criterion). What happens next is not
+ * a document reconcile: the sync layer hashes the referenced samples and announces
+ * the ones whose content moved.
+ *
+ * Deliberately not restricted to `.wav`. The extension rule is the *validator's*
+ * (docs/format-spec.md §8), and a kit voice pointed at `samples/kick.aiff` must
+ * produce that diagnostic rather than be invisible to the watcher. Nested paths
+ * count, because a sample path only has to start with `samples/`. Dotfiles do not,
+ * which is also what excludes this server's own atomic-write temporaries.
+ */
+export function couldBeSample(filename: string): boolean {
+  const path = filename.replaceAll("\\", "/");
+  if (!path.startsWith("samples/")) return false;
+  return !path
+    .slice("samples/".length)
+    .split("/")
+    .some((segment) => segment.length === 0 || segment.startsWith("."));
 }

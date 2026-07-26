@@ -34,6 +34,30 @@ export interface LiveSessionOptions {
  */
 export type LiveEditEffect = "parameters" | "structural";
 
+/** A sample file and the content hash of the bytes now on disk for it. */
+export interface SampleContent {
+  path: string;
+  contentHash: string;
+}
+
+/** What a session did with an announcement that sample files changed on disk. */
+export interface SampleChangeOutcome {
+  /** Paths whose replacement content was fetched, decoded and sent to the worklet. */
+  reloaded: string[];
+  /**
+   * Paths named by the announcement that this session already holds that exact
+   * content for. Its own echo check, and the reason a redundant announcement costs
+   * nothing: identity is the content, not the fact of having been told.
+   */
+  unchanged: string[];
+  /**
+   * Paths named by the announcement that this session does not hold at all — a kit
+   * voice no track in the schedule plays. Ignored rather than fetched: loading audio
+   * nothing can trigger would be work with no sound attached to it.
+   */
+  ignored: string[];
+}
+
 /** What the transport did with an edit, so a UI can say when it will be heard. */
 export interface LiveEditOutcome {
   effect: LiveEditEffect;
@@ -201,6 +225,70 @@ export class LiveSession {
     return run;
   }
 
+  /**
+   * Adopt replacement bytes for sample files that changed on disk (PLAN.md §14).
+   *
+   * A replaced `samples/kick.wav` changes no document, so nothing about it can
+   * arrive as a document edit: it is announced separately and lands here. What
+   * happens is deliberately narrow — the new bytes are fetched, hashed, decoded and
+   * posted to the worklet, which points every kit voice on that path at them for
+   * its next trigger. No recompile, no graph swap, no configure: the schedule did
+   * not move, and rebuilding the graph would silence every voice currently sounding
+   * for a change that does not need it.
+   *
+   * `announced` says what the sidecar believes is on disk, and is only ever used to
+   * decide whether this session's content is stale. The content actually adopted is
+   * hashed from the bytes that arrive, so a session cannot end up believing it holds
+   * content it does not — the announcement may already be out of date by the time
+   * the fetch lands, and the bytes are the only honest answer.
+   *
+   * Fetching and decoding happen before anything is adopted, so a failed fetch or a
+   * file that will not decode leaves the session playing exactly what it was, and
+   * rejects; the next announcement retries, because the hash it names still differs
+   * from what is held.
+   *
+   * Serialized with `update` through the same queue: a document edit and a sample
+   * replacement can arrive from one settle window, and a configure naming content the
+   * worklet has not been sent is rejected by the worklet.
+   */
+  applySampleChange(announced: readonly SampleContent[]): Promise<SampleChangeOutcome> {
+    const run = this.updating.then(() => this.applySamples(announced));
+    this.updating = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async applySamples(announced: readonly SampleContent[]): Promise<SampleChangeOutcome> {
+    const outcome: SampleChangeOutcome = { reloaded: [], unchanged: [], ignored: [] };
+    for (const sample of announced) {
+      const held = this.hashes.get(sample.path);
+      if (held === undefined) {
+        outcome.ignored.push(sample.path);
+        continue;
+      }
+      if (held === sample.contentHash) {
+        outcome.unchanged.push(sample.path);
+        continue;
+      }
+      const loaded = await loadSample(
+        sample.path,
+        this.fetchSample,
+        this.post,
+        this.onSampleLoaded,
+        this.hashes,
+      );
+      // The bytes on disk may have moved on again between the announcement and this
+      // fetch. Whatever arrived is what the worklet now holds, so it is what gets
+      // reported — and if it is a third version, the announcement for that one finds
+      // this hash already in place and stops.
+      if (loaded === held) outcome.unchanged.push(sample.path);
+      else outcome.reloaded.push(sample.path);
+    }
+    return outcome;
+  }
+
   private async applyUpdate(project: Project, effect: LiveEditEffect): Promise<LiveEditOutcome> {
     const schedule = compile(project, { sampleRate: this.sampleRate, seed: this.seed });
     const barStarts = musicalGrid(project, { sampleRate: this.sampleRate, seed: this.seed }).barStarts;
@@ -278,30 +366,53 @@ async function loadSamples(
 ): Promise<void> {
   for (const path of requiredSamplePaths(project, schedule)) {
     if (hashes.has(path)) continue;
-    const bytes = await fetchSample(path);
-    // Hashed over the bytes as delivered, exactly as the offline path hashes the
-    // bytes on disk, so a replaced sample invalidates identically (PLAN.md §14).
-    const contentHash = hashContent(bytes);
-    const decoded = decodeWav(bytes);
-    hashes.set(path, contentHash);
-    const right = decoded.channels[1];
-    post({
-      type: "sampleData",
-      path,
-      contentHash,
-      sampleRate: decoded.sampleRate,
-      left: decoded.channels[0]!,
-      ...(right === undefined ? {} : { right }),
-    });
-    onLoaded?.({
-      path,
-      bytes: bytes.byteLength,
-      contentHash,
-      frames: decoded.channels[0]!.length,
-      sampleRate: decoded.sampleRate,
-      channels: decoded.channels.length,
-    });
+    await loadSample(path, fetchSample, post, onLoaded, hashes);
   }
+}
+
+/**
+ * Fetch, hash, decode and post one sample, recording it in `hashes`. Returns the
+ * content hash of the bytes that arrived.
+ *
+ * The one place a sample's bytes become audio, so a first load and a replacement
+ * cannot differ in how they are hashed or decoded — which they must not, since the
+ * hash is the identity the worklet checks a configure against.
+ *
+ * `hashes` is written only after the decode succeeds: a fetch that fails or bytes
+ * that will not decode must leave the session holding what it had, not a path
+ * bound to content the worklet was never sent.
+ */
+async function loadSample(
+  path: string,
+  fetchSample: SampleFetcher,
+  post: (command: LiveCommand) => void,
+  onLoaded: LiveSessionOptions["onSampleLoaded"],
+  hashes: Map<string, string>,
+): Promise<string> {
+  const bytes = await fetchSample(path);
+  // Hashed over the bytes as delivered, exactly as the offline path hashes the
+  // bytes on disk, so a replaced sample invalidates identically (PLAN.md §14).
+  const contentHash = hashContent(bytes);
+  const decoded = decodeWav(bytes);
+  hashes.set(path, contentHash);
+  const right = decoded.channels[1];
+  post({
+    type: "sampleData",
+    path,
+    contentHash,
+    sampleRate: decoded.sampleRate,
+    left: decoded.channels[0]!,
+    ...(right === undefined ? {} : { right }),
+  });
+  onLoaded?.({
+    path,
+    bytes: bytes.byteLength,
+    contentHash,
+    frames: decoded.channels[0]!.length,
+    sampleRate: decoded.sampleRate,
+    channels: decoded.channels.length,
+  });
+  return contentHash;
 }
 
 /**

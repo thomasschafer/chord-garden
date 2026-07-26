@@ -359,6 +359,13 @@ uncompressed PCM WAV only, validated by extension and header, with a 50 MB
 per-file cap. A referenced sample that doesn't exist on disk is an error
 naming the missing path.
 
+Samples are identified by content, so replacing one in place is a real edit
+even though no JSON changed: an app with the project open adopts the new audio
+from the next hit onward without a reload, and hits already sounding play out
+on the buffer they started with rather than clicking. A replacement that fails
+the checks above behaves like any other invalid edit — the diagnostic names the
+file and nothing is adopted until it validates again.
+
 Those constraints are on samples going in. What comes out is unrelated to them:
 `render` always writes 24-bit stereo PCM WAV at the requested `--sample-rate`
 (default 48000), for the master and for every `--stems` file, whatever depth,

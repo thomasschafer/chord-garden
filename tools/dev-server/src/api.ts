@@ -128,7 +128,7 @@ export const SNAPSHOT_PATH = "snapshot";
  * checked in the handshake: a page left open across a rebuild is told to reload
  * rather than left silently misreading a message it half understands.
  */
-export const SYNC_PROTOCOL = 2;
+export const SYNC_PROTOCOL = 3;
 
 /** Largest client→server message the socket will read (PLAN.md §10). */
 export const MAX_SOCKET_MESSAGE_BYTES = 64 * 1024;
@@ -158,9 +158,30 @@ export interface HelloMessage {
    * the page has nothing and loads over HTTP instead.
    */
   inventory?: string;
+  /**
+   * The sample content this page holds, when it holds any.
+   *
+   * The document `inventory` cannot cover it: samples are fetched separately and
+   * lazily — a page that has never played holds none of them — so folding them into
+   * that one hash would make every reconnect look like a page behind the disk. It is
+   * per-path rather than a single hash for the same reason the push is: what the page
+   * needs back is *which* files to fetch again.
+   *
+   * Absent means "none, or this page does not play audio". A page that holds nothing
+   * needs no announcement, because the bytes it eventually fetches will be whatever
+   * is on disk then.
+   */
+  samples?: readonly SampleFile[];
 }
 
 export type ClientMessage = HelloMessage;
+
+/** A sample file and the content hash of its bytes. */
+export interface SampleFile {
+  /** Project-relative, always under `samples/` (docs/format-spec.md §8). */
+  path: string;
+  contentHash: string;
+}
 
 /** One document in a pushed snapshot, named and hashed but without its bytes. */
 export interface SnapshotFile {
@@ -243,6 +264,44 @@ export interface ProjectChangedMessage {
 }
 
 /**
+ * Sample files on disk are no longer the ones this page is playing (PLAN.md §14).
+ *
+ * Its own message, and not part of `ProjectChangedMessage`, because replacing
+ * `samples/kick.wav` changes no document: there is nothing to reconcile into the
+ * model, no bytes for a write precondition, and nothing for the reconcile's
+ * inventory checks to be consistent with. Smuggling it into a document snapshot
+ * would mean inventing a document change that did not happen. The two do arrive
+ * together — an agent adding a kit voice and dropping in the WAV it names — and
+ * then they are two messages from one settle window, this one first, because the
+ * worklet refuses a graph naming content it has not been sent.
+ *
+ * The audio itself does not travel here. Samples are fetched from the confined
+ * `files/` endpoint, which serves them `no-store`; a message carrying megabytes of
+ * WAV would also have to grow a chunking protocol for no benefit.
+ */
+export interface SamplesChangedMessage {
+  type: "samplesChanged";
+  /**
+   * Every sample the project references, with the hash of the bytes on disk.
+   *
+   * This is the authority, and the page acts on it by comparing it with the content
+   * it holds — so a redundant announcement is a no-op rather than a re-fetch, and a
+   * page whose own state has moved past this message is not dragged backwards. There
+   * is no `scope` here for the same reason: a page holds only the samples its
+   * schedule needs, a subset, so a path it does not hold means nothing at all rather
+   * than needing two readings the way an absent *document* does.
+   */
+  samples: SampleFile[];
+  /**
+   * The paths whose content differs from what the sidecar last established — what it
+   * noticed, for a log or a UI line. Advisory: the page decides what to fetch from
+   * `samples`, so an over- or under-stated `changed` cannot make it hold the wrong
+   * audio.
+   */
+  changed: string[];
+}
+
+/**
  * The project on disk does not currently validate, so there is no snapshot to
  * adopt. Sent rather than swallowed: a half-finished multi-file agent edit is
  * expected and transient, but the browser still has to show why it has stopped
@@ -291,7 +350,8 @@ export type ServerMessage =
   | RejectedMessage
   | SocketErrorMessage
   | ProjectChangedMessage
-  | ProjectInvalidMessage;
+  | ProjectInvalidMessage
+  | SamplesChangedMessage;
 
 /** Close code for "this project is already open in another window". */
 export const CLOSE_ALREADY_OPEN = 4001;

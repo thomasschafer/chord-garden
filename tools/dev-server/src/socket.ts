@@ -5,6 +5,8 @@ import {
   type HelloMessage,
   type ProjectChangedMessage,
   type ProjectInvalidMessage,
+  type SampleFile,
+  type SamplesChangedMessage,
   type ServerMessage,
 } from "./api.js";
 
@@ -58,6 +60,12 @@ export interface ProjectSocketHandlers {
    */
   ready(reconnected: boolean): void;
   changed(message: ProjectChangedMessage): void;
+  /**
+   * Sample files on disk are no longer the ones this page is playing. Separate from
+   * `changed` because no document moved: nothing here reaches the document store, and
+   * the only thing that has to happen is that the audio engine adopts the new bytes.
+   */
+  samplesChanged(message: SamplesChangedMessage): void;
   invalid(message: ProjectInvalidMessage): void;
   /** The sidecar will not admit this session. Nothing will retry. */
   rejected(rejection: SyncRejection): void;
@@ -86,6 +94,15 @@ export interface ProjectSocketOptions {
    * what lets the sidecar replay what a dropped connection missed.
    */
   inventory?: () => string | undefined;
+  /**
+   * The sample content this page holds, consulted on every connection attempt for
+   * the same reason `inventory` is: what matters is what it holds *now*.
+   *
+   * Separate from `inventory` because samples are fetched lazily — a page that has
+   * never played holds none — so a page can be exactly in step with the disk's
+   * documents while its audio is a version behind, and only this can say so.
+   */
+  samples?: () => readonly SampleFile[] | undefined;
   /** Retry delays, in order; the last one repeats. */
   retryDelaysMs?: readonly number[];
   setTimer?: (callback: () => void, ms: number) => unknown;
@@ -133,12 +150,14 @@ export class ProjectSocket {
         // First-message authentication (PLAN.md §10): the token goes in a frame,
         // never in the URL, so it cannot end up in a log or a Referer.
         const inventory = this.options.inventory?.();
+        const samples = this.options.samples?.();
         const hello: HelloMessage = {
           type: "hello",
           protocol: SYNC_PROTOCOL,
           token: this.options.token,
           project: this.options.project,
           ...(inventory === undefined ? {} : { inventory }),
+          ...(samples === undefined || samples.length === 0 ? {} : { samples }),
         };
         transport.send(JSON.stringify(hello));
       },
@@ -256,6 +275,28 @@ export class ProjectSocket {
           return;
         }
         this.options.handlers.changed(message);
+        return;
+      case "samplesChanged":
+        if (!Array.isArray(message.samples) || !Array.isArray(message.changed)) {
+          this.options.handlers.protocolError("a samplesChanged message was missing its sample lists");
+          return;
+        }
+        if (
+          message.samples.some(
+            (sample) =>
+              sample === null ||
+              typeof sample !== "object" ||
+              typeof sample.path !== "string" ||
+              typeof sample.contentHash !== "string",
+          )
+        ) {
+          // The inventory is what the page decides from, so a malformed entry is not
+          // something to skip past: acting on part of it would leave the page holding
+          // audio the disk does not have and believing it was told everything.
+          this.options.handlers.protocolError("a samplesChanged message carried a sample without a path and content hash");
+          return;
+        }
+        this.options.handlers.samplesChanged(message);
         return;
       case "projectInvalid":
         this.options.handlers.invalid(message);

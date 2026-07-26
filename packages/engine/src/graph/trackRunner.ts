@@ -53,7 +53,11 @@ export interface TrackRunner {
    * structural change and belongs at a bar boundary (PLAN.md §12 step 6).
    */
   updateInstrument(instrument: InstrumentDoc, automation: readonly CompiledAutomationLane[]): void;
-  /** Point every voice using `path` at replacement content (see `SampleStore`). */
+  /**
+   * Point every voice using `path` at replacement content, for its next trigger
+   * onwards (see `SampleStore`, and `DrumkitTrackRunner.replaceSample` for why it
+   * is the next trigger and not the sounding one).
+   */
   replaceSample(path: string, data: SampleData): void;
 }
 
@@ -365,10 +369,16 @@ export class DrumkitTrackRunner extends BaseTrackRunner<DrumHitCommand> {
   }
 
   /**
-   * Swap in replacement content for `path`. A hit already playing keeps its
-   * position in the new buffer, so it finishes early if the replacement is
-   * shorter — the alternative, deferring to the next bar, would make a sample
-   * swap feel broken while auditioning it.
+   * Adopt replacement content for `path`, for the hits that come after it.
+   *
+   * The timing is deliberately between the two obvious choices. Deferring the swap
+   * to the next bar, as a structural graph change is deferred, would make
+   * auditioning a replaced sample feel broken. Swapping it under the hits already
+   * sounding would splice two unrelated waveforms together mid-voice, which is a
+   * click — and a click is exactly what "the file changed and you heard it change"
+   * must not sound like. So the new buffer takes effect at the next trigger and a
+   * sounding hit finishes on the buffer it started with; `PlaybackVoice.sample` is
+   * what holds it there.
    */
   override replaceSample(path: string, data: SampleData): void {
     for (const [voice, voicePath] of this.samplePaths) {

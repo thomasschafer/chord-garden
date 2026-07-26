@@ -39,6 +39,7 @@ export {
   type ParamUnit,
   type ResolvedParam,
 } from "./registry.js";
+export { referencedSamplePaths, sampleReferences, type SampleReference } from "./samples.js";
 export { serializeCanonical, type DocKind } from "./serialize.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";
 export { checkWavHeader, type WavCheckResult } from "./wav.js";

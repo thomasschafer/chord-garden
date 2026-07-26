@@ -6,12 +6,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonicalFiles, loadProject, serializeCanonical } from "@chord-garden/format";
+import { hashContent } from "@chord-garden/engine/live";
+import { encodeWav } from "@chord-garden/engine/wav";
 import {
   CLOSE_ALREADY_OPEN,
   inventoryHash,
   SNAPSHOT_PATH,
   SYNC_PROTOCOL,
   type ProjectChangedMessage,
+  type SamplesChangedMessage,
   type ServerMessage,
   type WriteRequest,
   type WriteResponse,
@@ -185,6 +188,28 @@ class TestSocket {
   }
 }
 
+/**
+ * Wait out the filesystem events the *setup* caused, and assert they said nothing.
+ *
+ * Only for the tests that use the real watcher, and it is not a nicety. macOS
+ * FSEvents delivers a recursive watch some events from just before the stream was
+ * opened, so the `cpSync` that lays the fixture down in `beforeEach` reliably reaches
+ * a watcher created afterwards: instrumenting `touch` shows nearly every test in this
+ * file receiving an unsolicited `automation/pad.json` or `instruments/bass-synth.json`
+ * event it never caused. The resulting scan is harmless on its own — the disk matches
+ * what was established, so nothing is pushed, which is what this asserts — but it
+ * lands at an unpredictable moment, and a scan in the middle of a test's own burst
+ * either splits a coalesced push in two or does the work the test meant to attribute
+ * to something else. Both make a green test worthless, and the second is a plausible
+ * cause of a rare spurious failure.
+ *
+ * Not a substitute for the settle-window tests: those are in `watch.test.ts` on a fake
+ * clock, and this only makes the real-OS tests start from a quiet disk.
+ */
+async function untilTheSetupIsQuiet(socket: TestSocket): Promise<void> {
+  await socket.expectSilence();
+}
+
 /** An authenticated, welcomed socket — the state every sync test starts from. */
 async function editorSocket(): Promise<TestSocket> {
   const socket = new TestSocket(port);
@@ -284,6 +309,31 @@ function changed(message: ServerMessage): ProjectChangedMessage {
   return message;
 }
 
+function samplesChanged(message: ServerMessage): SamplesChangedMessage {
+  if (message.type !== "samplesChanged") {
+    throw new Error(`expected a samplesChanged message, got ${JSON.stringify(message)}`);
+  }
+  return message;
+}
+
+/** The bytes of a sample as the project currently holds them. */
+function sampleBytes(path: string): Buffer {
+  return readFileSync(join(root, path));
+}
+
+/**
+ * Replace a sample on disk, the way anyone auditioning a kick does: the file at the
+ * same path, with different audio in it.
+ *
+ * A real WAV rather than a doctored one, so the project still validates and the case
+ * under test is "the sound changed", not "the file broke".
+ */
+function replaceSample(path: string, level: number, frames = 400): Buffer {
+  const bytes = Buffer.from(encodeWav({ sampleRate: 8000, left: new Float32Array(frames).fill(level) }, 16));
+  writeFileSync(join(root, path), bytes);
+  return bytes;
+}
+
 describe("external edits", () => {
   it("pushes a validated snapshot naming the file an agent edited", async () => {
     const socket = await editorSocket();
@@ -305,6 +355,10 @@ describe("external edits", () => {
 
   it("coalesces a burst of edits into one push", async () => {
     const socket = await editorSocket();
+    // A scan landing between the writes below would push "First" or "Second" and this
+    // would fail — not because coalescing broke, but because the setup's own filesystem
+    // events reached the watcher late (see `untilTheSetupIsQuiet`).
+    await untilTheSetupIsQuiet(socket);
 
     externalEdit("project.json", renamedProject("First"));
     externalEdit("project.json", renamedProject("Second"));
@@ -719,6 +773,236 @@ describe("delete and recreate", () => {
     // Not one file of it was consumed, so the model in the browser is still whole.
     expect(manual.establishedText("project.json")).toBeDefined();
     expect(manual.establishedText("patterns/drums-verse.json")).toBeDefined();
+  });
+});
+
+describe("sample replacement", () => {
+  /**
+   * The hole this closes (PLAN.md §14, §16's Phase 2 criterion): replacing
+   * `samples/kick.wav` changes what the project *sounds* like while changing no
+   * document at all. The watcher used to filter `samples/` out entirely, so the
+   * offline render picked the new file up and a running app kept playing the old audio
+   * with nothing said about it — the one remaining place where the disk and what you
+   * hear could silently disagree.
+   *
+   * A sample change is therefore its own message with its own inventory. It is not
+   * folded into a `projectChanged`, because there is no changed document to put in one.
+   */
+  it("announces a replaced sample by content hash, and says nothing about the documents", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const before = manual.establishedSampleHash("samples/kick.wav");
+
+    const replacement = replaceSample("samples/kick.wav", 0.9);
+    manual.scan();
+
+    const message = samplesChanged(await socket.next());
+    expect(message.changed).toEqual(["samples/kick.wav"]);
+    // The hash of the bytes now on disk, which is the key the engine's cache and the
+    // worklet's configure check are both made of.
+    expect(message.samples).toEqual([
+      { path: "samples/hat.wav", contentHash: hashContent(sampleBytes("samples/hat.wav")) },
+      { path: "samples/kick.wav", contentHash: hashContent(replacement) },
+    ]);
+    expect(manual.establishedSampleHash("samples/kick.wav")).toBe(hashContent(replacement));
+    expect(manual.establishedSampleHash("samples/kick.wav")).not.toBe(before);
+    // No document moved, so there is nothing else to say.
+    await socket.expectSilence();
+  });
+
+  it("says nothing about a sample rewritten with the same bytes", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    // A copy over itself, a `touch`, a backup tool restoring an identical file: the
+    // mtime moves and the content does not. Time is not an input here, so this is a
+    // non-event — and an implementation that compared timestamps would push, and the
+    // page would re-fetch and re-decode audio it already had on every such event.
+    writeFileSync(join(root, "samples/kick.wav"), sampleBytes("samples/kick.wav"));
+    manual.scan();
+
+    await socket.expectSilence();
+  });
+
+  it("notices a replacement through the real filesystem watcher", async () => {
+    // The one case that must use the real watcher: `samples/` was excluded by the event
+    // filter, and no amount of driving `scan()` by hand would have caught that. Which
+    // also means the disk has to be quiet first — any scan at all finds the replaced
+    // sample, so a stray setup event arriving mid-test would make this pass with the
+    // filter removed, which is exactly what it did before the drain went in. The filter
+    // itself is proven on a fake clock in `watch.test.ts`; what this adds is that the
+    // chain holds against the real operating system.
+    const socket = await editorSocket();
+    await untilTheSetupIsQuiet(socket);
+
+    const replacement = replaceSample("samples/kick.wav", 0.5);
+
+    const message = samplesChanged(await socket.next());
+    expect(message.changed).toEqual(["samples/kick.wav"]);
+    expect(message.samples.find((sample) => sample.path === "samples/kick.wav")?.contentHash).toBe(
+      hashContent(replacement),
+    );
+  });
+
+  it("reports an invalid replacement and adopts nothing, then announces the good one", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const good = manual.establishedSampleHash("samples/kick.wav");
+
+    // A drag-and-drop of an MP3 renamed to .wav, or a half-written file. The validator
+    // already refuses it (PCM WAV header, extension, 50 MB cap, existence), and this is
+    // the case that proves a replacement gets exactly the treatment an invalid document
+    // edit gets: keep the last good audio, name the file, adopt nothing.
+    writeFileSync(join(root, "samples/kick.wav"), "ID3 this is not a wav at all", "utf8");
+    manual.scan();
+
+    const invalid = await socket.next();
+    expect(invalid.type).toBe("projectInvalid");
+    if (invalid.type !== "projectInvalid") return;
+    const diagnostic = invalid.diagnostics.find((each) => each.code === "sample.not-wav");
+    expect(diagnostic?.message).toContain("samples/kick.wav");
+    // Nothing consumed, so the difference is still there to announce when it is fixed.
+    expect(manual.establishedSampleHash("samples/kick.wav")).toBe(good);
+
+    const replacement = replaceSample("samples/kick.wav", 0.75);
+    manual.scan();
+
+    expect(samplesChanged(await socket.next()).changed).toEqual(["samples/kick.wav"]);
+    expect(manual.establishedSampleHash("samples/kick.wav")).toBe(hashContent(replacement));
+    // The retraction of the diagnostics still arrives, with no documents in it: a
+    // sample announcement is not a statement about whether the project validates.
+    const retraction = changed(await socket.next());
+    expect(retraction.changed).toEqual([]);
+    expect(retraction.diagnostics.filter((each) => each.severity === "error")).toEqual([]);
+  });
+
+  it("reports a deleted sample a kit voice still names as an invalid project", async () => {
+    // Verified rather than assumed: a missing sample is `sample.missing` from
+    // `semanticValidate`, so it needs no special case here — it is an invalid project
+    // like any other, and the last good audio keeps playing.
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const before = manual.establishedSampleHash("samples/kick.wav");
+
+    unlinkSync(join(root, "samples/kick.wav"));
+    manual.scan();
+
+    const invalid = await socket.next();
+    expect(invalid.type).toBe("projectInvalid");
+    if (invalid.type !== "projectInvalid") return;
+    expect(invalid.diagnostics.map((each) => each.code)).toContain("sample.missing");
+    expect(manual.establishedSampleHash("samples/kick.wav")).toBe(before);
+  });
+
+  it("says nothing about a file dropped into samples/ that no instrument references", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    writeFileSync(join(root, "samples/spare.wav"), Buffer.from(encodeWav({ sampleRate: 8000, left: new Float32Array(10) }, 16)));
+    manual.scan();
+
+    // Nothing audible depends on it — the inventory is what the *instruments* name —
+    // so there is nothing for a running engine to do about it.
+    await socket.expectSilence();
+  });
+
+  it("announces a sample and a document edit from one settle window as two messages, samples first", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+
+    // The composite case: an agent editing the drum pattern and dropping in a new kick
+    // in the same breath. Samples go first, because the worklet refuses a graph naming
+    // content it has not been sent.
+    const replacement = replaceSample("samples/kick.wav", 0.6);
+    externalEdit(
+      "patterns/drums-verse.json",
+      readFileSync(join(root, "patterns/drums-verse.json"), "utf8").replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"),
+    );
+    manual.scan();
+
+    const samples = samplesChanged(await socket.next());
+    expect(samples.changed).toEqual(["samples/kick.wav"]);
+    expect(samples.samples.find((sample) => sample.path === "samples/kick.wav")?.contentHash).toBe(
+      hashContent(replacement),
+    );
+    const documents = changed(await socket.next());
+    expect(documents.changed.map((file) => file.path)).toEqual(["patterns/drums-verse.json"]);
+    await socket.expectSilence();
+  });
+
+  it("keeps establishing a replaced sample with no browser connected", async () => {
+    const manual = manualSync();
+    const replacement = replaceSample("samples/kick.wav", 0.4);
+    manual.scan();
+
+    expect(manual.establishedSampleHash("samples/kick.wav")).toBe(hashContent(replacement));
+  });
+
+  it("refuses to establish a sample as document text", () => {
+    // Unreachable through the write endpoint, which admits documents only. It is a
+    // guard because the day sample writing is added, "documents are established as
+    // text and samples as a content hash" is exactly the distinction that would be
+    // missed — and the symptom would be the sidecar announcing its own write as
+    // somebody else's edit.
+    expect(() => sync.noteWrite("samples/kick.wav", "RIFF....")).toThrow(/content hash/);
+    expect(() => sync.noteWrite("project.json", renamedProject("Fine"))).not.toThrow();
+  });
+});
+
+describe("a reconnecting session's samples", () => {
+  /**
+   * The document inventory cannot answer this. A sample replaced while the socket was
+   * down is established with nobody listening, so a page's *documents* can be exactly
+   * in step with the disk — the quiet path through `catchUp` — while the audio it is
+   * playing is a version behind. Without the hello carrying what the page holds, the
+   * one case sample watching exists for survives a reconnect untouched.
+   */
+  it("tells a page holding stale sample content which file to fetch again", async () => {
+    const manual = manualSync();
+    replaceSample("samples/kick.wav", 0.8);
+    manual.scan();
+
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+    await socket.hello({
+      samples: [{ path: "samples/kick.wav", contentHash: "the-version-this-page-is-playing" }],
+    });
+    expect(await socket.next()).toMatchObject({ type: "welcome" });
+
+    const message = samplesChanged(await socket.next());
+    expect(message.changed).toEqual(["samples/kick.wav"]);
+    expect(message.samples.find((sample) => sample.path === "samples/kick.wav")?.contentHash).toBe(
+      manual.establishedSampleHash("samples/kick.wav"),
+    );
+  });
+
+  it("says nothing to a page whose sample content is the content on disk", async () => {
+    manualSync();
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+
+    await socket.hello({
+      samples: [
+        { path: "samples/kick.wav", contentHash: hashContent(sampleBytes("samples/kick.wav")) },
+        { path: "samples/hat.wav", contentHash: hashContent(sampleBytes("samples/hat.wav")) },
+      ],
+    });
+
+    expect(await socket.next()).toMatchObject({ type: "welcome" });
+    await socket.expectSilence();
+  });
+
+  it("refuses a hello whose sample list is malformed", async () => {
+    // Refused rather than ignored: a page whose declaration was silently dropped would
+    // be told nothing about its stale audio, which is the failure the field prevents.
+    const socket = new TestSocket(port);
+    sockets.push(socket);
+
+    await socket.hello({ samples: [{ path: "samples/kick.wav" }] });
+
+    expect(await socket.next()).toMatchObject({ type: "error", message: expect.stringContaining("contentHash") });
+    await socket.waitForClose();
+    expect(sync.hasEditor).toBe(false);
   });
 });
 

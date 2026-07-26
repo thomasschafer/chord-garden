@@ -5,6 +5,8 @@ import {
   type HelloMessage,
   type ProjectChangedMessage,
   type ProjectInvalidMessage,
+  type SampleFile,
+  type SamplesChangedMessage,
   type ServerMessage,
 } from "../src/api.js";
 import { ProjectSocket, type SyncRejection, type SyncTransportHandlers } from "../src/socket.js";
@@ -51,6 +53,7 @@ interface Harness {
   transports: FakeTransport[];
   ready: boolean[];
   changed: ProjectChangedMessage[];
+  samplesChanged: SamplesChangedMessage[];
   invalid: ProjectInvalidMessage[];
   rejected: SyncRejection[];
   dropped: string[];
@@ -61,12 +64,15 @@ interface Harness {
   latest(): FakeTransport;
 }
 
-function harness(options: { inventory?: () => string | undefined } = {}): Harness {
+function harness(
+  options: { inventory?: () => string | undefined; samples?: () => readonly SampleFile[] | undefined } = {},
+): Harness {
   const transports: FakeTransport[] = [];
   const timers: (() => void)[] = [];
   const state = {
     ready: [] as boolean[],
     changed: [] as ProjectChangedMessage[],
+    samplesChanged: [] as SamplesChangedMessage[],
     invalid: [] as ProjectInvalidMessage[],
     rejected: [] as SyncRejection[],
     dropped: [] as string[],
@@ -76,6 +82,7 @@ function harness(options: { inventory?: () => string | undefined } = {}): Harnes
     project: "p",
     token: TOKEN,
     ...(options.inventory === undefined ? {} : { inventory: options.inventory }),
+    ...(options.samples === undefined ? {} : { samples: options.samples }),
     factory: (_path, handlers) => {
       const transport = new FakeTransport(handlers);
       transports.push(transport);
@@ -84,6 +91,7 @@ function harness(options: { inventory?: () => string | undefined } = {}): Harnes
     handlers: {
       ready: (reconnected) => state.ready.push(reconnected),
       changed: (message) => state.changed.push(message),
+      samplesChanged: (message) => state.samplesChanged.push(message),
       invalid: (message) => state.invalid.push(message),
       rejected: (rejection) => state.rejected.push(rejection),
       dropped: (reason) => state.dropped.push(reason),
@@ -112,6 +120,9 @@ function harness(options: { inventory?: () => string | undefined } = {}): Harnes
     },
     get changed() {
       return state.changed;
+    },
+    get samplesChanged() {
+      return state.samplesChanged;
     },
     get invalid() {
       return state.invalid;
@@ -231,6 +242,82 @@ describe("telling the sidecar what this page holds", () => {
     second.handlers.open();
 
     expect(second.hellos[0]?.inventory).toBe("inventory-after-the-load");
+  });
+
+  it("sends no sample list when the page is playing nothing", () => {
+    // A page that has never started the transport holds no decoded audio, so there is
+    // nothing to be stale: whatever it fetches when it does start is read from the
+    // disk as it is then. Declaring an empty list would only make every first
+    // connection carry a field that means nothing.
+    const test = harness({ samples: () => [] });
+
+    connect(test);
+
+    expect(test.latest().hellos[0]?.samples).toBeUndefined();
+  });
+
+  it("declares the sample content it holds, read at connect time", () => {
+    // The reason this is separate from `inventory`: a page's documents can be exactly
+    // in step with the disk while the audio it is playing is a version behind, and only
+    // this field can say so.
+    let samples: SampleFile[] = [];
+    const test = harness({ samples: () => samples });
+    connect(test);
+    expect(test.latest().hellos[0]?.samples).toBeUndefined();
+
+    samples = [{ path: "samples/kick.wav", contentHash: "kick-v1" }];
+    test.latest().handlers.closed(1006, "gone");
+    test.runTimers();
+    const second = test.latest();
+    second.handlers.open();
+
+    expect(second.hellos[0]?.samples).toEqual([{ path: "samples/kick.wav", contentHash: "kick-v1" }]);
+  });
+});
+
+describe("sample changes on the wire", () => {
+  it("passes an announcement through with its inventory", () => {
+    const test = harness();
+    const transport = connect(test);
+
+    transport.deliver({
+      type: "samplesChanged",
+      samples: [
+        { path: "samples/kick.wav", contentHash: "kick-v2" },
+        { path: "samples/hat.wav", contentHash: "hat-v1" },
+      ],
+      changed: ["samples/kick.wav"],
+    });
+
+    expect(test.samplesChanged).toHaveLength(1);
+    expect(test.samplesChanged[0]?.samples.map((sample) => sample.path)).toEqual([
+      "samples/kick.wav",
+      "samples/hat.wav",
+    ]);
+    expect(test.samplesChanged[0]?.changed).toEqual(["samples/kick.wav"]);
+    // Not a document change, so nothing about it may reach the document side.
+    expect(test.changed).toEqual([]);
+    expect(test.protocolErrors).toEqual([]);
+  });
+
+  it("refuses an announcement with missing lists or a malformed entry", () => {
+    // The inventory is what the page decides from, so acting on a partly readable one
+    // would leave it holding audio the disk does not have while believing it had been
+    // told everything.
+    const test = harness();
+    const transport = connect(test);
+
+    transport.deliver({ type: "samplesChanged", changed: [] } as unknown as ServerMessage);
+    transport.deliver({
+      type: "samplesChanged",
+      samples: [{ path: "samples/kick.wav" }],
+      changed: ["samples/kick.wav"],
+    } as unknown as ServerMessage);
+
+    expect(test.samplesChanged).toEqual([]);
+    expect(test.protocolErrors).toHaveLength(2);
+    expect(test.protocolErrors[0]).toContain("sample lists");
+    expect(test.protocolErrors[1]).toContain("content hash");
   });
 });
 

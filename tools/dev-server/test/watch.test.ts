@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { couldBeDocument, DirectoryWatcher } from "../src/watch.js";
+import { couldBeDocument, couldBeSample, DirectoryWatcher } from "../src/watch.js";
 
 /**
  * When the watcher decides the dust has settled, on a clock the test owns.
@@ -180,5 +180,60 @@ describe("which names could be a document", () => {
 
   it("accepts a Windows-style separator, because a filter is not a place to be clever", () => {
     expect(couldBeDocument("patterns\\drums-verse.json")).toBe(true);
+  });
+});
+
+describe("which names could be a sample", () => {
+  it("accepts anything under samples/, at any depth", () => {
+    for (const name of ["samples/kick.wav", "samples/kits/909/kick.wav", "samples\\kick.wav"]) {
+      expect(couldBeSample(name), name).toBe(true);
+    }
+  });
+
+  /**
+   * Deliberately not restricted to `.wav`: the extension rule belongs to the
+   * validator (docs/format-spec.md §8), and a kit voice pointed at a file this filter
+   * had hidden would produce no diagnostic at all — the sound and the disk would
+   * disagree with nothing said about it, which is the whole failure being closed.
+   */
+  it("accepts a non-wav file under samples/, so the validator can be the one to refuse it", () => {
+    expect(couldBeSample("samples/kick.aiff")).toBe(true);
+  });
+
+  it("refuses everything outside samples/, and dotted names inside it", () => {
+    for (const name of [
+      "project.json",
+      "patterns/drums-verse.json",
+      "render/master.wav",
+      "samples.wav",
+      "samplesnaked/kick.wav",
+      "samples/.hidden.wav",
+      "samples/.kick.wav.123.tmp",
+      "samples/kits/.tmp.wav",
+    ]) {
+      expect(couldBeSample(name), name).toBe(false);
+    }
+  });
+
+  it("settles for a sample event, which is the filter this whole path hangs on", () => {
+    // Until this, `samples/` was filtered out entirely and replacing a WAV reached
+    // nothing: the render picked it up and a running app did not. A settle for the
+    // name is the first link in the chain.
+    const watch = start();
+
+    watch.touch("samples/kick.wav");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(settles).toBe(1);
+  });
+
+  it("still does not settle for a render output or an editor temporary", () => {
+    const watch = start();
+
+    watch.touch("render/master.wav");
+    watch.touch("samples/.kick.wav.99.tmp");
+    vi.advanceTimersByTime(SETTLE_MS * 4);
+
+    expect(settles).toBe(0);
   });
 });

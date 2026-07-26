@@ -1,4 +1,10 @@
-import { LIVE_PROCESSOR_NAME, LiveSession, type LiveEditEffect, type LiveEvent } from "@chord-garden/engine/live";
+import {
+  LIVE_PROCESSOR_NAME,
+  LiveSession,
+  type LiveEditEffect,
+  type LiveEvent,
+  type SampleContent,
+} from "@chord-garden/engine/live";
 import type { Project } from "@chord-garden/format/pure";
 
 /** Everything a transport readout needs, pushed on each worklet report. */
@@ -30,6 +36,13 @@ export interface PlayerStatus {
   lastEdit: EditStatus | undefined;
   /** Document edits this run has fed to the engine. */
   editsApplied: number;
+  /**
+   * Sample files this run has re-fetched because they changed on disk, most recent
+   * first. Shown rather than kept internal: a replaced sample changes what is coming
+   * out of the speakers with nothing on screen moving, so the transport readout is
+   * the only place that can say it happened (PLAN.md §14).
+   */
+  samplesReloaded: readonly string[];
 }
 
 export interface EditStatus {
@@ -53,6 +66,7 @@ const IDLE: PlayerStatus = {
   error: undefined,
   lastEdit: undefined,
   editsApplied: 0,
+  samplesReloaded: [],
 };
 
 /** Seconds of silence after the last event, so release tails are not cut off. */
@@ -199,6 +213,48 @@ export class LivePlayer {
         ...this.status,
         phase: "failed",
         error: `the live engine refused an edit: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
+  /**
+   * The sample content this run holds, for the sync handshake.
+   *
+   * Empty while nothing is playing, which is the honest answer: a page with no
+   * session holds no audio, and whatever it loads when it starts will be read from
+   * the disk as it is then.
+   */
+  sampleContent(): SampleContent[] {
+    const session = this.session;
+    if (session === undefined) return [];
+    return [...session.sampleHashes].map(([path, contentHash]) => ({ path, contentHash }));
+  }
+
+  /**
+   * Adopt sample files that changed on disk (PLAN.md §14).
+   *
+   * Only while playing, for the same reason `applyDocumentEdit` is: `start` builds a
+   * fresh session that fetches every sample it needs from the disk as it is then, so
+   * a replacement made while idle is already in the next run.
+   *
+   * The engine decides what to do with the announcement by comparing content, so
+   * calling this with samples that have not really changed costs a comparison and
+   * nothing else.
+   */
+  async applySampleChange(samples: readonly SampleContent[]): Promise<void> {
+    const session = this.session;
+    if (session === undefined || this.status.phase !== "playing") return;
+    try {
+      const outcome = await session.applySampleChange(samples);
+      if (outcome.reloaded.length === 0) return;
+      this.update({ ...this.status, samplesReloaded: [...outcome.reloaded, ...this.status.samplesReloaded] });
+    } catch (error) {
+      // The same rule as a refused edit: the audio and the disk have diverged, and
+      // that is the one state this app must not present as normal.
+      this.update({
+        ...this.status,
+        phase: "failed",
+        error: `the live engine could not load a replaced sample: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
   }

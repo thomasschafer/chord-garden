@@ -30,6 +30,8 @@ export {
   type LiveEditEffect,
   type LiveEditOutcome,
   type LiveSessionOptions,
+  type SampleChangeOutcome,
+  type SampleContent,
   type SampleFetcher,
 } from "./session.js";
 export { LiveScheduler, nextBarBoundary, type SliceAction, type StructuralChange } from "./scheduler.js";

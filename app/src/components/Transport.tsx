@@ -66,6 +66,8 @@ export function Transport({ project }: { project: Project }): React.JSX.Element 
         </span>
         <span>live edits</span>
         <span>{describeEdits(status)}</span>
+        <span>samples reloaded</span>
+        <span>{describeSamples(status)}</span>
       </div>
       {status.error !== undefined && <p className="error">audio error: {status.error}</p>}
     </section>
@@ -80,6 +82,20 @@ export function Transport({ project }: { project: Project }): React.JSX.Element 
  * sound genuinely disagree, and a person who cannot see that reasonably concludes
  * the edit did not work.
  */
+/**
+ * Which sample files have been re-read from disk while this run has been playing.
+ *
+ * The one change with no visible cause anywhere else in the app: replacing
+ * `samples/kick.wav` moves nothing in the editors, so without this the sound changes
+ * and the screen says nothing about why. A replacement is adopted by the next hit of
+ * that voice, so it is audible within a step rather than at a bar line.
+ */
+function describeSamples(status: PlayerStatus): string {
+  if (status.samplesReloaded.length === 0) return "none since play started";
+  const [latest, ...earlier] = status.samplesReloaded;
+  return earlier.length === 0 ? `${latest}` : `${latest} (and ${earlier.length} more)`;
+}
+
 function describeEdits(status: PlayerStatus): string {
   if (status.phase === "idle") return "press play; edits made now are in the model the engine will compile";
   if (status.lastEdit === undefined) return `${status.editsApplied} applied`;

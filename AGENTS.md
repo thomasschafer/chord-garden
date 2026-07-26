@@ -122,7 +122,11 @@ Three things about the render that look like bugs and aren't:
   `docs/format-spec.md` §5.1 before writing pitches, since guessing the octave
   numbering is how a part ends up an octave out.
 - **Samples are project-relative**, under `samples/`, referenced as
-  `samples/<name>.wav`. Never an absolute path, never `..`.
+  `samples/<name>.wav`. Never an absolute path, never `..`. Replacing a WAV in
+  place is picked up like any other edit — a running app plays the new sound
+  from the next hit onward, with no reload, and the next `render` uses it too.
+  A replacement that isn't valid PCM WAV fails as `sample.not-wav` naming the
+  file, and nothing is adopted until you fix it.
 - **Never bump `project.json.format`.** A newer format than the tool
   supports is rejected outright, not migrated. If you think the format
   itself needs to change, that's a format-spec change, not a project edit —

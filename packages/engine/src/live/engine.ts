@@ -102,6 +102,19 @@ export class LiveEngine {
     return this.underrunBlocks;
   }
 
+  /**
+   * Distinct decoded sample buffers held, which is where this engine's memory
+   * actually goes.
+   *
+   * Exposed because a sample file being replaced repeatedly — the ordinary way
+   * anyone auditions a kick — must not accumulate one decode per version. The
+   * `SampleStore` drops content the moment no path refers to it, and this is how
+   * that is asserted rather than argued.
+   */
+  get sampleContentCount(): number {
+    return this.samples.contentCount;
+  }
+
   activeVoiceCount(): number {
     let count = 0;
     for (const runner of this.graph.runners) count += runner.activeVoiceCount();
