@@ -13,24 +13,16 @@ import { livePlayer, seed } from "../session";
  * The player itself lives in `session.ts`, not here: the editors' changes reach it
  * through the document store (see `audio/documentBridge.ts`), which has to work
  * whether or not this component happens to be mounted.
+ *
+ * This readout re-renders on every worklet report, which is what a readout of a
+ * moving position is for. It passes none of it on: it is a leaf, and the playhead
+ * inside each editor subscribes to the player separately so that a position never
+ * travels through a component that has editors underneath it.
  */
-export function Transport({
-  project,
-  onStatus,
-}: {
-  project: Project;
-  onStatus: (status: PlayerStatus) => void;
-}): React.JSX.Element {
+export function Transport({ project }: { project: Project }): React.JSX.Element {
   const [status, setStatus] = useState<PlayerStatus>(() => livePlayer.getStatus());
 
-  useEffect(
-    () =>
-      livePlayer.subscribe((next) => {
-        setStatus(next);
-        onStatus(next);
-      }),
-    [onStatus],
-  );
+  useEffect(() => livePlayer.subscribe(setStatus), []);
 
   const start = useCallback(() => {
     void livePlayer.start(project, seed);

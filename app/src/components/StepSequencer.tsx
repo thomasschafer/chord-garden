@@ -13,7 +13,7 @@ import { documentStore } from "../session";
 import type { StepEventPatch } from "../store/documentStore";
 import { gridGeometry } from "../view/grid";
 import { DraftField } from "./DraftField";
-import { Playhead } from "./Playhead";
+import { PatternPlayhead } from "./Playhead";
 
 /**
  * A step sequencer for one grid pattern: a lane per kit voice, a cell per step.
@@ -35,14 +35,15 @@ import { Playhead } from "./Playhead";
  */
 export function StepSequencer({
   project,
+  trackId,
   pattern,
   kit,
-  playheadTick,
 }: {
   project: Project;
+  /** The track that plays this pattern; the playhead is only defined through it. */
+  trackId: string;
   pattern: GridPatternDoc;
   kit: DrumkitInstrumentDoc;
-  playheadTick: number | undefined;
 }): React.JSX.Element {
   const toggleGridStep = useStore(documentStore, (state) => state.toggleGridStep);
   const [selected, setSelected] = useState<{ lane: string; step: number } | undefined>(undefined);
@@ -116,7 +117,12 @@ export function StepSequencer({
                 onSelect={onSelect}
               />
             ))}
-            {playheadTick !== undefined && <Playhead leftPx={playheadTick * geometry.pxPerTick} />}
+            <PatternPlayhead
+              project={project}
+              trackId={trackId}
+              patternId={patternId}
+              pxPerTick={geometry.pxPerTick}
+            />
           </div>
         </div>
       </div>

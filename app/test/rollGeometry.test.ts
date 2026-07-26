@@ -2,7 +2,8 @@ import { pitchToMidi, type NoteEvent, type NotesPatternDoc, type Project } from 
 import { describe, expect, it } from "vitest";
 import { CELL_PX, defaultSnapTicks, gridGeometry, snapOptions } from "../src/view/grid";
 import { movedNote, pitchRange, placementAt, resizedNote, rowTop, widerOf, type RollGeometry } from "../src/view/roll";
-import { patternPlayhead, songTickAt } from "../src/view/playback";
+import { livePatternTick, patternPlayhead, songTickAt } from "../src/view/playback";
+import type { PlayerStatus } from "../src/audio/livePlayer";
 import { FIXTURE, openedFrom } from "./fixture";
 
 /**
@@ -27,6 +28,25 @@ function pattern(notes: NoteEvent[], lengthTicks = 7680): NotesPatternDoc {
 
 function roll(highestMidi: number): RollGeometry {
   return { pxPerTick: geometry.pxPerTick, rowPx: 15, highestMidi };
+}
+
+/** A worklet report's worth of transport status, playing at 48 kHz. */
+function playingAt(positionSample: number): PlayerStatus {
+  return {
+    phase: "playing",
+    sampleRate: 48_000,
+    positionSample,
+    totalSamples: 48_000 * 60,
+    activeVoices: 1,
+    underrunBlocks: 0,
+    peak: 0.5,
+    peakSession: 0.5,
+    reportsWithSound: 1,
+    reports: 1,
+    error: undefined,
+    lastEdit: undefined,
+    editsApplied: 0,
+  };
 }
 
 /** The fixture's project with a different meter and PPQN, for the note-value rules. */
@@ -163,6 +183,36 @@ describe("moving a note", () => {
     expect(movedNote(late, 0, -1, pattern([late]))?.pitch).toBe("G#1");
   });
 
+  it("keeps the note's own accidental, so a drag does not respell it", () => {
+    // Same principle as snapping the delta rather than the value: the accidental is
+    // the author's, and a vertical drag is not a request to rewrite it. `Bb1` and
+    // `A#1` are both MIDI 34, so this is inaudible — and still an edit nobody asked
+    // for, on a document `fmt` is careful to leave spelled as written.
+    const flat: NoteEvent = { pitch: "Bb1", startTick: 480, durationTicks: 240, velocity: 800 };
+    expect(movedNote(flat, 0, 1, pattern([flat]))?.pitch).toBe("B1");
+    expect(movedNote(flat, 0, -2, pattern([flat]))?.pitch).toBe("Ab1");
+    expect(movedNote(flat, 0, 12, pattern([flat]))?.pitch).toBe("Bb2");
+    expect(movedNote(flat, 0, -12, pattern([flat]))?.pitch).toBe("Bb0");
+
+    const sharp: NoteEvent = { ...flat, pitch: "A#1" };
+    expect(movedNote(sharp, 0, 1, pattern([sharp]))?.pitch).toBe("B1");
+    expect(movedNote(sharp, 0, -2, pattern([sharp]))?.pitch).toBe("G#1");
+    expect(movedNote(sharp, 0, 12, pattern([sharp]))?.pitch).toBe("A#2");
+
+    // A note with no accidental has none to keep, and is unaffected.
+    const natural: NoteEvent = { ...flat, pitch: "A1" };
+    expect(movedNote(natural, 0, 1, pattern([natural]))?.pitch).toBe("A#1");
+    expect(movedNote(natural, 0, -1, pattern([natural]))?.pitch).toBe("G#1");
+
+    // And a horizontal-only drag reports no pitch change at all for any of them.
+    for (const note of [flat, sharp, natural]) {
+      expect(movedNote(note, SIXTEENTH, 0, pattern([note])), note.pitch).toEqual({
+        startTick: 720,
+        pitch: note.pitch,
+      });
+    }
+  });
+
   it("names only the fields it changes, so expression rides along untouched", () => {
     const change = movedNote(late, SIXTEENTH, 2, pattern([late]));
 
@@ -277,6 +327,45 @@ describe("the playhead", () => {
       repeatIndex: 1,
       clipStartTick: 15_360,
     });
+  });
+
+  it("reads a transport status straight through to a pattern-local tick", () => {
+    // What `PatternPlayhead` calls on every worklet report, composed once here so
+    // the component holds nothing but the subscription.
+    const perQuarter = (60 / 124) * 48_000;
+    expect(livePatternTick(project, "drums", "drums-verse", playingAt(perQuarter))).toBeCloseTo(960, 6);
+    expect(livePatternTick(project, "bass", "bass-main", playingAt(perQuarter))).toBeUndefined();
+    expect(livePatternTick(project, "bass", "bass-main", playingAt(perQuarter * 16))).toBeCloseTo(0, 6);
+  });
+
+  it("gives back the same snapshot for a report that did not move it", () => {
+    // `PatternPlayhead` hands this to `useSyncExternalStore`, which compares
+    // snapshots with `Object.is`: a report that changes the meters but not the
+    // position must therefore re-render nothing at all. A snapshot that were a
+    // fresh object each call would re-render on every report instead — and would
+    // trip React's own "the result of getSnapshot should be cached" check.
+    const report = playingAt(12_345);
+    const louder: PlayerStatus = { ...report, peak: 0.9, activeVoices: 4, reports: 2, underrunBlocks: 1 };
+    const tick = livePatternTick(project, "drums", "drums-verse", report);
+
+    expect(typeof tick).toBe("number");
+    expect(livePatternTick(project, "drums", "drums-verse", louder)).toBe(tick);
+    // And "not playing" is the same `undefined` every time, so a stopped transport
+    // does not re-render a playhead either.
+    const stopped: PlayerStatus = { ...report, phase: "stopped" };
+    expect(livePatternTick(project, "drums", "drums-verse", stopped)).toBe(
+      livePatternTick(project, "drums", "drums-verse", { ...stopped, peak: 0 }),
+    );
+  });
+
+  it("has no position unless the transport is playing with a known sample rate", () => {
+    // Three ways there is no line to draw, and the caller asks one question.
+    const playing = playingAt(0);
+    expect(livePatternTick(project, "drums", "drums-verse", playing)).toBe(0);
+    for (const phase of ["idle", "starting", "stopped", "failed"] as const) {
+      expect(livePatternTick(project, "drums", "drums-verse", { ...playing, phase }), phase).toBeUndefined();
+    }
+    expect(livePatternTick(project, "drums", "drums-verse", { ...playing, sampleRate: null })).toBeUndefined();
   });
 
   it("has no position when no clip of that pattern is playing", () => {

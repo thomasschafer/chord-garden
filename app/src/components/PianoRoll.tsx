@@ -5,7 +5,6 @@ import { documentStore } from "../session";
 import type { NotePatch, OptionalNoteField, RequiredNoteField } from "../store/documentStore";
 import { defaultSnapTicks, gridGeometry, ROW_PX, snapNearest, snapOptions } from "../view/grid";
 import {
-  clampMidi,
   hasExpression,
   isBlackKey,
   movedNote,
@@ -18,7 +17,7 @@ import {
   type RollGeometry,
 } from "../view/roll";
 import { DraftField } from "./DraftField";
-import { Playhead } from "./Playhead";
+import { PatternPlayhead } from "./Playhead";
 
 /**
  * A piano roll for one note pattern: notes placed by `startTick` and pitch, with a
@@ -30,7 +29,9 @@ import { Playhead } from "./Playhead";
  * needs a row index, and the only conversion between a row and a `pitch` is the
  * format package's `midiToPitch`/`pitchToMidi`. docs/format-spec.md §5.1 spends a
  * paragraph on the octave convention precisely because a private conversion that is
- * an octave out writes valid documents that sound wrong.
+ * an octave out writes valid documents that sound wrong. Moving an existing note
+ * goes through `transposePitch` instead, which keeps the accidental the author
+ * wrote; the roll names a pitch from scratch only when placing a new note.
  *
  * **The grid is a view, and snapping is relative.** Positions in the document are
  * integer ticks (PLAN.md §6); the 16th-note grid is what gets drawn. A drag moves a
@@ -45,12 +46,13 @@ import { Playhead } from "./Playhead";
  */
 export function PianoRoll({
   project,
+  trackId,
   pattern,
-  playheadTick,
 }: {
   project: Project;
+  /** The track that plays this pattern; the playhead is only defined through it. */
+  trackId: string;
   pattern: NotesPatternDoc;
-  playheadTick: number | undefined;
 }): React.JSX.Element {
   const addNote = useStore(documentStore, (state) => state.addNote);
   const updateNote = useStore(documentStore, (state) => state.updateNote);
@@ -231,12 +233,12 @@ export function PianoRoll({
                     const semitone = event.key === "ArrowUp" ? 1 : event.key === "ArrowDown" ? -1 : 0;
                     if (step === 0 && semitone === 0) return;
                     event.preventDefault();
-                    attempt(() => {
-                      updateNote(pattern.id, index, {
-                        startTick: Math.max(0, Math.min(note.startTick + step, pattern.lengthTicks - 1)),
-                        pitch: midiToPitch(clampMidi(midi + semitone)),
-                      });
-                    });
+                    // The same `movedNote` a drag commits, so the keyboard cannot
+                    // acquire its own idea of a move — of the clamping at the edges
+                    // of the pattern and the keyboard, or of the note's spelling.
+                    const change = movedNote(note, step, semitone, pattern);
+                    if (change === undefined) return;
+                    attempt(() => updateNote(pattern.id, index, change));
                   }}
                   onFocus={() => setSelected(index)}
                 >
@@ -251,7 +253,12 @@ export function PianoRoll({
                 </button>
               );
             })}
-            {playheadTick !== undefined && <Playhead leftPx={playheadTick * geometry.pxPerTick} />}
+            <PatternPlayhead
+              project={project}
+              trackId={trackId}
+              patternId={pattern.id}
+              pxPerTick={geometry.pxPerTick}
+            />
           </div>
         </div>
       </div>

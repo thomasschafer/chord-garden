@@ -1,7 +1,6 @@
 import type { Project } from "@chord-garden/format/pure";
 import { PianoRoll } from "./PianoRoll";
 import { StepSequencer } from "./StepSequencer";
-import { patternPlayhead } from "../view/playback";
 
 /**
  * Every pattern of the project, each in the editor its kind calls for, grouped by
@@ -12,14 +11,12 @@ import { patternPlayhead } from "../view/playback";
  * kit (docs/format-spec.md §5), and the playhead is only defined through the clips
  * of that track. A pattern no track references is an `orphan.pattern` diagnostic and
  * is deliberately not editable here — there is no kit to interpret it against.
+ *
+ * The track and pattern identify the playhead; they do not locate it. Each editor's
+ * own `PatternPlayhead` reads the transport, so nothing on this path re-renders when
+ * the transport moves — only when the document changes.
  */
-export function PatternEditors({
-  project,
-  songTick,
-}: {
-  project: Project;
-  songTick: number | undefined;
-}): React.JSX.Element {
+export function PatternEditors({ project }: { project: Project }): React.JSX.Element {
   return (
     <section>
       <h2>patterns</h2>
@@ -35,7 +32,6 @@ export function PatternEditors({
               </p>
             );
           }
-          const head = songTick === undefined ? undefined : patternPlayhead(project, trackId, patternId, songTick);
           const instrument = project.instruments.get(track.instrument);
           return (
             <div key={`${trackId}/${patternId}`}>
@@ -49,15 +45,10 @@ export function PatternEditors({
                     not a drumkit, so its lanes name no voices
                   </p>
                 ) : (
-                  <StepSequencer
-                    project={project}
-                    pattern={pattern}
-                    kit={instrument}
-                    playheadTick={head?.localTick}
-                  />
+                  <StepSequencer project={project} trackId={trackId} pattern={pattern} kit={instrument} />
                 )
               ) : (
-                <PianoRoll project={project} pattern={pattern} playheadTick={head?.localTick} />
+                <PianoRoll project={project} trackId={trackId} pattern={pattern} />
               )}
             </div>
           );

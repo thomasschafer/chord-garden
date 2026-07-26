@@ -1,5 +1,6 @@
 import { samplesPerTick } from "@chord-garden/engine/compiler";
 import type { Project } from "@chord-garden/format/pure";
+import type { PlayerStatus } from "../audio/livePlayer";
 
 /**
  * Where the transport is, in the terms an editor draws in.
@@ -32,6 +33,25 @@ export interface PatternPlayhead {
  * wins; two clips of one pattern overlapping on one track is a legal document, and
  * drawing two playheads is more confusing than drawing the earlier one.
  */
+/**
+ * Where a transport status puts the playhead inside one pattern of one track:
+ * everything `PatternPlayhead` has to get right, with no React in the way.
+ *
+ * `undefined` covers all three ways there is nothing to draw — the transport is not
+ * playing, it has no sample rate yet, or no clip of this pattern is sounding on this
+ * track — because they are one question to a caller ("is there a line, and where").
+ */
+export function livePatternTick(
+  project: Project,
+  trackId: string,
+  patternId: string,
+  status: PlayerStatus,
+): number | undefined {
+  if (status.phase !== "playing" || status.sampleRate === null) return undefined;
+  const songTick = songTickAt(project, status.sampleRate, status.positionSample);
+  return patternPlayhead(project, trackId, patternId, songTick)?.localTick;
+}
+
 export function patternPlayhead(
   project: Project,
   trackId: string,

@@ -3,6 +3,7 @@ import {
   LOWEST_MIDI,
   midiToPitch,
   pitchToMidi,
+  transposePitch,
   type NoteEvent,
   type NotesPatternDoc,
 } from "@chord-garden/format/pure";
@@ -59,6 +60,11 @@ export function rowTop(midi: number, geometry: RollGeometry): number {
  * returned, so velocity, `microTicks`, `probability` and `ratchet` are carried by the
  * note they belong to rather than re-stated here, where one forgotten field would
  * quietly erase them.
+ *
+ * The pitch moves through `transposePitch`, which keeps the note's own accidental,
+ * for the same reason the tick delta is snapped rather than the tick: an accidental
+ * the author wrote is not the drag's to change. Every keyboard and pointer move in
+ * the roll goes through here, so there is one place that has to be right.
  */
 export function movedNote(
   note: NoteEvent,
@@ -67,11 +73,10 @@ export function movedNote(
   pattern: NotesPatternDoc,
 ): Partial<NoteEvent> | undefined {
   const startTick = Math.max(0, Math.min(note.startTick + deltaTicks, pattern.lengthTicks - 1));
-  const midi = pitchToMidi(note.pitch);
   // A pitch outside the grammar has no row, so vertical movement is not defined for
   // it; the horizontal move is still honest and is the only way to fix the note in
   // the UI at all.
-  const pitch = midi === undefined ? note.pitch : midiToPitch(clampMidi(midi + deltaRows));
+  const pitch = transposePitch(note.pitch, deltaRows) ?? note.pitch;
   if (startTick === note.startTick && pitch === note.pitch) return undefined;
   return { startTick, pitch };
 }
@@ -117,7 +122,7 @@ export function widerOf(left: PitchRange, right: PitchRange): PitchRange {
   return { low: Math.min(left.low, right.low), high: Math.max(left.high, right.high) };
 }
 
-export function clampMidi(midi: number): number {
+function clampMidi(midi: number): number {
   return Math.max(LOWEST_MIDI, Math.min(HIGHEST_MIDI, midi));
 }
 

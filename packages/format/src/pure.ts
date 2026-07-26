@@ -27,7 +27,7 @@ export { parseStrictJson, type JsonObject, type JsonValue, type ParseResult } fr
 export * from "./model.js";
 export { ticksPerBar, type TimeSignature } from "./musicTime.js";
 export { formatSteps, parseSteps, type StepsContext, type StepsParseResult } from "./pattern.js";
-export { HIGHEST_MIDI, LOWEST_MIDI, midiToPitch, pitchToMidi } from "./pitch.js";
+export { HIGHEST_MIDI, LOWEST_MIDI, midiToPitch, pitchToMidi, transposePitch } from "./pitch.js";
 export {
   BASIC_MONO_PARAMS,
   BASIC_POLY_PARAMS,
