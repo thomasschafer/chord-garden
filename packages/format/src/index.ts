@@ -29,6 +29,7 @@ export { semanticValidate, MAX_SAMPLE_BYTES } from "./semantic.js";
 export { pitchToMidi } from "./pitch.js";
 export { assembleProject, type AssembledFile } from "./assemble.js";
 export { canonicalFiles } from "./canonical.js";
+export { docKindFromHint, docKindHintForPath, type DocKindHint } from "./docKind.js";
 export { describeProject, type DescribePattern, type DescribeReport, type DescribeTrack } from "./describe.js";
 export { checkWavHeader, type WavCheckResult } from "./wav.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";

@@ -13,5 +13,11 @@
   "dependencies": {
     "@chord-garden/engine": "*",
     "@chord-garden/format": "*"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/main.d.ts",
+      "default": "./dist/main.js"
+    }
   }
 }

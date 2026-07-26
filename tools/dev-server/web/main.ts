@@ -1,29 +1,16 @@
-import { compile, musicalGrid, type CompiledSchedule } from "@chord-garden/engine/compiler";
-import {
-  LIVE_PROCESSOR_NAME,
-  LiveScheduler,
-  LiveTransport,
-  hashContent,
-  intervalTicker,
-  liveGraph,
-  lookaheadSamples,
-  requiredSamplePaths,
-  type LiveCommand,
-  type LiveEvent,
-  type LiveGraph,
-} from "@chord-garden/engine/live";
-import { decodeWav } from "@chord-garden/engine/wav";
-import { assembleProject, parseStrictJson, type AssembledFile, type Project } from "@chord-garden/format/pure";
-import type { ProjectSummary } from "../src/api.js";
+import { LIVE_PROCESSOR_NAME, LiveSession, type LiveEvent } from "@chord-garden/engine/live";
+import { ProjectClient } from "../src/client.js";
 
 /**
  * The Phase 2 verification harness: load a project over HTTP, run it through the
  * real live engine in a real AudioWorklet, and say loudly enough for an
  * automated check whether sound came out.
  *
- * Deliberately plain. Phase 3 builds the actual UI (PLAN.md §16); this page
- * exists to prove the engine works in a browser, and every line of it is
- * observable from the console under one prefix.
+ * Deliberately plain. Phase 3's app is at `/app/`; this page exists to prove the
+ * engine works in a browser, and every line of it is observable from the console
+ * under one prefix. Project loading, sample delivery and transport wiring are
+ * `ProjectClient` and `LiveSession`, shared with the app so the two pages cannot
+ * end up exercising different engines.
  */
 const PREFIX = "[chord-garden]";
 
@@ -125,88 +112,12 @@ const startButton = element<HTMLButtonElement>("start");
 const stopButton = element<HTMLButtonElement>("stop");
 const readout = element<HTMLPreElement>("readout");
 
+const client = ProjectClient.fromPage(window as unknown as Record<string, unknown>);
+
 let context: AudioContext | undefined;
-let transport: LiveTransport | undefined;
-let schedule: CompiledSchedule | undefined;
+let session: LiveSession | undefined;
 let endSample = 0;
 let lastLogAt = 0;
-
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { accept: "application/json" } });
-  if (!response.ok) throw new Error(`GET ${url} → ${response.status} ${await response.text()}`);
-  return (await response.json()) as T;
-}
-
-/**
- * Fetch and index a project bundle.
- *
- * The server has already schema- and semantic-validated it, and says so in the
- * summary; the browser re-parses each document with the format package's own
- * strict parser rather than `JSON.parse` so that a file the loader would reject
- * (a comment, a duplicate key) is rejected here too instead of quietly becoming
- * a different document than the one on disk.
- */
-async function fetchProject(name: string): Promise<Project> {
-  const base = `/api/projects/${encodeURIComponent(name)}`;
-  const summary = await getJson<ProjectSummary>(base);
-  const errors = summary.diagnostics.filter((diagnostic) => diagnostic.severity === "error");
-  for (const diagnostic of summary.diagnostics) {
-    log(`project ${diagnostic.severity}: ${diagnostic.file}: ${diagnostic.code} ${diagnostic.message}`);
-  }
-  if (!summary.ok) {
-    throw new Error(`project "${name}" does not validate (${errors.length} errors); fix it before playing it`);
-  }
-
-  const documents: AssembledFile[] = [];
-  for (const file of summary.files) {
-    const response = await fetch(`${base}/files/${file.path}`);
-    if (!response.ok) throw new Error(`GET ${file.path} → ${response.status}`);
-    const parsed = parseStrictJson(await response.text(), file.path);
-    if (parsed.value === undefined) {
-      throw new Error(
-        `${file.path} did not parse: ${parsed.diagnostics.map((diagnostic) => diagnostic.message).join("; ")}`,
-      );
-    }
-    documents.push({ kind: file.kind, value: parsed.value });
-  }
-
-  const project = assembleProject(base, documents);
-  log(`project "${name}" loaded: ${summary.files.length} documents, ${project.tracks.size} tracks, ${project.instruments.size} instruments`);
-  return project;
-}
-
-/** Fetch, hash and decode every sample the schedule needs, then push it across. */
-async function sendSamples(
-  project: Project,
-  target: CompiledSchedule,
-  post: (command: LiveCommand) => void,
-): Promise<Map<string, string>> {
-  const base = `/api/projects/${encodeURIComponent(projectName)}/files`;
-  const hashes = new Map<string, string>();
-  for (const path of requiredSamplePaths(project, target)) {
-    const response = await fetch(`${base}/${path}`);
-    if (!response.ok) throw new Error(`GET ${path} → ${response.status} ${await response.text()}`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    // Hashed over the bytes on the wire, exactly as the offline path hashes the
-    // bytes on disk, so a replaced sample invalidates identically (PLAN.md §14).
-    const contentHash = hashContent(bytes);
-    const decoded = decodeWav(bytes);
-    hashes.set(path, contentHash);
-    const right = decoded.channels[1];
-    post({
-      type: "sampleData",
-      path,
-      contentHash,
-      sampleRate: decoded.sampleRate,
-      left: decoded.channels[0],
-      ...(right === undefined ? {} : { right }),
-    });
-    log(
-      `sample ${path}: ${bytes.byteLength} bytes, hash ${contentHash}, ${decoded.channels[0].length} frames @ ${decoded.sampleRate} Hz, ${decoded.channels.length} channel(s)`,
-    );
-  }
-  return hashes;
-}
 
 async function start(): Promise<void> {
   if (status.phase === "playing" || status.phase === "loading") return;
@@ -229,10 +140,18 @@ async function startAudio(): Promise<void> {
   if (context !== undefined) {
     await context.close();
     context = undefined;
-    transport = undefined;
+    session = undefined;
     log("closed the previous audio context");
   }
-  const project = await fetchProject(projectName);
+
+  const loaded = await client.loadProject(projectName);
+  for (const diagnostic of loaded.summary.diagnostics) {
+    log(`project ${diagnostic.severity}: ${diagnostic.file}: ${diagnostic.code} ${diagnostic.message}`);
+  }
+  const project = loaded.project;
+  log(
+    `project "${projectName}" loaded: ${loaded.summary.files.length} documents, ${project.tracks.size} tracks, ${project.instruments.size} instruments`,
+  );
   status.project = projectName;
 
   // Created inside the click handler: browsers only resume an AudioContext from
@@ -279,37 +198,25 @@ async function startAudio(): Promise<void> {
   worklet.connect(audio.destination);
   log(`worklet node created and connected: ${LIVE_PROCESSOR_NAME}, 1 output × 2 channels`);
 
-  const compiled = compile(project, { sampleRate, seed });
-  schedule = compiled;
-  const barStarts = musicalGrid(project, { sampleRate, seed }).barStarts;
-  const events = compiled.tracks.reduce((total, track) => total + track.events.length, 0);
-  status.scheduleSamples = compiled.totalSamples;
-  endSample = compiled.totalSamples + TAIL_SECONDS * sampleRate;
-  log(
-    `compiled schedule for ${sampleRate} Hz seed ${seed}: ${compiled.tracks.length} tracks, ${events} events, ${compiled.totalSamples} samples (${(compiled.totalSamples / sampleRate).toFixed(2)} s), ${barStarts.length} bars`,
-  );
-
-  const post = (command: LiveCommand): void => {
-    worklet.port.postMessage(command);
-  };
-  const hashes = await sendSamples(project, compiled, post);
-  const graphOf = (target: CompiledSchedule): LiveGraph =>
-    liveGraph(project, target, (path) => {
-      const hash = hashes.get(path);
-      if (hash === undefined) throw new Error(`no content hash was fetched for "${path}"`);
-      return hash;
-    });
-
-  const scheduler = new LiveScheduler(compiled, barStarts, lookaheadSamples(sampleRate));
-  transport = new LiveTransport({
+  const live = await LiveSession.create({
     clock: audio,
-    sink: { postMessage: post },
-    scheduler,
+    sink: { postMessage: (command) => worklet.port.postMessage(command) },
     sampleRate,
-    ticker: intervalTicker(window),
-    graphOf,
+    project,
+    seed,
+    fetchSample: (path) => client.asset(projectName, path),
+    onSampleLoaded: (info) => {
+      log(
+        `sample ${info.path}: ${info.bytes} bytes, hash ${info.contentHash}, ${info.frames} frames @ ${info.sampleRate} Hz, ${info.channels} channel(s)`,
+      );
+    },
   });
-  transport.sendConfigure({ generation: 0, atSample: null, schedule: compiled }, graphOf(compiled));
+  session = live;
+  status.scheduleSamples = live.totalSamples;
+  endSample = live.totalSamples + TAIL_SECONDS * sampleRate;
+  log(
+    `compiled schedule for ${sampleRate} Hz seed ${seed}: ${live.schedule.tracks.length} tracks, ${live.eventCount} events, ${live.totalSamples} samples (${(live.totalSamples / sampleRate).toFixed(2)} s), ${live.barStarts.length} bars`,
+  );
 
   await audio.resume();
   status.contextState = audio.state;
@@ -321,15 +228,15 @@ async function startAudio(): Promise<void> {
   status.reportsWithSound = 0;
   status.peakMax = 0;
   lastLogAt = performance.now();
-  transport.start();
+  live.start();
   stopButton.disabled = false;
   log("transport started");
   render();
 }
 
 function stop(): void {
-  if (transport === undefined) return;
-  transport.stop();
+  if (session === undefined) return;
+  session.stop();
   status.phase = "stopped";
   stopButton.disabled = true;
   startButton.disabled = false;
@@ -358,7 +265,7 @@ function handleEvent(event: LiveEvent): void {
     return;
   }
 
-  transport?.acceptEvent(event);
+  session?.acceptEvent(event);
   const peak = Math.max(event.peakLeft, event.peakRight);
   status.reports++;
   if (peak > 0) status.reportsWithSound++;
@@ -375,7 +282,7 @@ function handleEvent(event: LiveEvent): void {
   if (now - lastLogAt >= LOG_INTERVAL_MS) {
     lastLogAt = now;
     log(
-      `pos=${status.positionSeconds.toFixed(2)}s/${((schedule?.totalSamples ?? 0) / (status.contextSampleRate ?? 1)).toFixed(2)}s peakL=${event.peakLeft.toFixed(4)} peakR=${event.peakRight.toFixed(4)} peakMax=${status.peakMax.toFixed(4)} underruns=${status.underrunBlocks} voices=${status.activeVoices} gen=${status.generation} reports=${status.reports}`,
+      `pos=${status.positionSeconds.toFixed(2)}s/${((session?.totalSamples ?? 0) / (status.contextSampleRate ?? 1)).toFixed(2)}s peakL=${event.peakLeft.toFixed(4)} peakR=${event.peakRight.toFixed(4)} peakMax=${status.peakMax.toFixed(4)} underruns=${status.underrunBlocks} voices=${status.activeVoices} gen=${status.generation} reports=${status.reports}`,
     );
     status.peakRecent = 0;
     render();

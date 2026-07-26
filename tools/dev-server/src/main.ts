@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,10 +100,17 @@ export async function main(argv: readonly string[]): Promise<void> {
     }
   }
 
+  // A fresh unguessable token per run (PLAN.md §10). It never appears in a URL;
+  // the served pages carry it to their own scripts, which send it as a header.
+  const token = randomBytes(32).toString("hex");
+  const appRoot = join(REPO_ROOT, "app/dist");
+
   const server = createAssetServer({
     projects: options.projects,
     webRoot: join(REPO_ROOT, "tools/dev-server/web"),
     bundleRoot,
+    token,
+    ...(existsSync(appRoot) ? { appRoot } : {}),
     ...(options.verbose ? { log: (line: string) => process.stdout.write(`${line}\n`) } : {}),
   });
 
@@ -111,8 +119,15 @@ export async function main(argv: readonly string[]): Promise<void> {
     server.listen(options.port, HOST, resolveListen);
   });
   const first = options.projects[0]!;
-  process.stdout.write(`\nchord-garden dev server on http://localhost:${options.port}/?project=${first.name}\n`);
-  process.stdout.write("click \"start audio\" in the page; the console logs everything under [chord-garden]\n");
+  if (existsSync(appRoot)) {
+    process.stdout.write(`\nchord-garden app on http://localhost:${options.port}/app/?project=${first.name}\n`);
+  } else {
+    process.stdout.write(
+      `\nno app build at ${appRoot}; run \`npm run build -w @chord-garden/app\` to serve the UI at /app/\n`,
+    );
+  }
+  process.stdout.write(`engine harness on http://localhost:${options.port}/?project=${first.name}\n`);
+  process.stdout.write("click \"start audio\" in either page; the console logs everything under [chord-garden]\n");
 }
 
 const invokedDirectly = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

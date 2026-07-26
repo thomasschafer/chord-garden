@@ -4,12 +4,13 @@
   "type": "module",
   "workspaces": [
     "packages/*",
-    "tools/*"
+    "tools/*",
+    "app"
   ],
   "scripts": {
-    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli && npm run build -w @chord-garden/dev-server && npm run build:web",
+    "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli && npm run build -w @chord-garden/dev-server && npm run build:web && npm run build -w @chord-garden/app",
     "build:web": "node tools/dev-server/dist/buildWeb.js",
-    "typecheck": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli && npm run typecheck -w @chord-garden/dev-server",
+    "typecheck": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli && npm run typecheck -w @chord-garden/dev-server && npm run typecheck -w @chord-garden/app",
     "dev": "npm run build && node tools/dev-server/dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest"

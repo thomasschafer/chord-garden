@@ -1,12 +1,14 @@
-import { request, type Server } from "node:http";
+import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ProjectSummary } from "../src/api.js";
 import { createAssetServer } from "../src/server.js";
+import { rawRequest } from "./helpers.js";
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const PROJECT_ROOT = `${REPO_ROOT}fixtures/valid/first-track`;
+const TOKEN = "test-token-0123456789abcdef";
 
 let server: Server;
 let port: number;
@@ -16,6 +18,7 @@ beforeAll(async () => {
     projects: [{ name: "first-track", root: PROJECT_ROOT }],
     webRoot: `${REPO_ROOT}tools/dev-server/web`,
     bundleRoot: `${REPO_ROOT}tools/dev-server/build`,
+    token: TOKEN,
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   port = (server.address() as AddressInfo).port;
@@ -27,38 +30,9 @@ afterAll(async () => {
   });
 });
 
-interface Response {
-  status: number;
-  contentType: string;
-  body: string;
-}
-
-/**
- * A raw request, because `fetch` will not let a test send the wrong `Host`, and
- * the Host check is one of the things worth testing.
- */
-function get(path: string, options: { method?: string; host?: string } = {}): Promise<Response> {
-  return new Promise((resolve, reject) => {
-    const call = request(
-      {
-        host: "127.0.0.1",
-        port,
-        path,
-        method: options.method ?? "GET",
-        ...(options.host === undefined ? {} : { headers: { host: options.host } }),
-      },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => (body += chunk));
-        response.on("end", () =>
-          resolve({ status: response.statusCode ?? 0, contentType: response.headers["content-type"] ?? "", body }),
-        );
-      },
-    );
-    call.on("error", reject);
-    call.end();
-  });
+/** An authenticated request; the token is what a served page would carry. */
+function get(path: string, options: { method?: string; host?: string } = {}) {
+  return rawRequest(port, path, { token: TOKEN, ...options });
 }
 
 describe("dev asset server", () => {

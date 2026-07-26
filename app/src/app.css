@@ -1,0 +1,90 @@
+/*
+ * Plain on purpose. Stage 1 is the shell, the store and the write path; the
+ * sequencer and piano roll arrive next and can bring a real visual design with
+ * them. Everything here is in service of being able to read what the model says.
+ */
+:root {
+  color-scheme: light dark;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+}
+
+h1 {
+  font-size: 1.2rem;
+  margin: 0 0 0.25rem;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+section {
+  max-width: 60rem;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid currentColor;
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  font-weight: 600;
+}
+
+label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-right: 1.5rem;
+}
+
+input {
+  font: inherit;
+  padding: 0.15rem 0.3rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.3rem 0.8rem;
+}
+
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0;
+  margin-bottom: 0.5rem;
+}
+
+.status {
+  display: grid;
+  grid-template-columns: 12rem 1fr;
+  gap: 0.1rem 1rem;
+}
+
+.error {
+  font-weight: 600;
+}
+
+.muted {
+  opacity: 0.7;
+}
+
+ul {
+  margin: 0.25rem 0;
+  padding-left: 1.2rem;
+}

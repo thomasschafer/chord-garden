@@ -12,6 +12,7 @@
  */
 export { assembleProject, type AssembledFile } from "./assemble.js";
 export { canonicalFiles } from "./canonical.js";
+export { docKindFromHint, docKindHintForPath, type DocKindHint } from "./docKind.js";
 export { describeProject, type DescribePattern, type DescribeReport, type DescribeTrack } from "./describe.js";
 export {
   DiagnosticCollector,

@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { assembleProject } from "./assemble.js";
+import { docKindFromHint, type DocKindHint } from "./docKind.js";
 import { DiagnosticCollector, type Diagnostic, type Loc } from "./diagnostics.js";
 import { parseStrictJson, type JsonObject, type JsonValue } from "./jsonParse.js";
 import type { Project } from "./model.js";
@@ -77,7 +78,7 @@ function finish(diags: DiagnosticCollector, files: Map<string, LoadedFile>, extr
 function loadFile(
   root: string,
   path: string,
-  kindHint: DocKind | "pattern" | "instrument",
+  kindHint: DocKindHint,
   files: Map<string, LoadedFile>,
   diags: DiagnosticCollector,
   opts: { required: boolean },
@@ -114,7 +115,7 @@ function loadFile(
   return parsed.value;
 }
 
-function kindForPath(dir: (typeof DOC_DIRS)[number]): DocKind | "pattern" | "instrument" {
+function kindForPath(dir: (typeof DOC_DIRS)[number]): DocKindHint {
   switch (dir) {
     case "tracks":
       return "track";
@@ -128,41 +129,34 @@ function kindForPath(dir: (typeof DOC_DIRS)[number]): DocKind | "pattern" | "ins
 }
 
 function resolveKind(
-  hint: DocKind | "pattern" | "instrument",
+  hint: DocKindHint,
   value: JsonValue,
   path: string,
   locs: Map<string, Loc>,
   diags: DiagnosticCollector,
 ): DocKind | undefined {
+  const resolved = docKindFromHint(hint, value);
+  if (resolved !== undefined) return resolved;
   if (hint === "pattern") {
-    const kind = (value as JsonObject)["kind"];
-    if (kind === "grid") return "pattern.grid";
-    if (kind === "notes") return "pattern.notes";
     diags.add({
       severity: "error",
       code: "pattern.unknown-kind",
       file: path,
       pointer: "/kind",
-      message: `pattern kind must be "grid" or "notes", found ${JSON.stringify(kind)}`,
+      message: `pattern kind must be "grid" or "notes", found ${JSON.stringify((value as JsonObject)["kind"])}`,
       loc: locs.get("/kind") ?? locs.get("") ?? { line: 1, column: 1 },
     });
     return undefined;
   }
-  if (hint === "instrument") {
-    const type = (value as JsonObject)["type"];
-    if (type === "synth") return "instrument.synth";
-    if (type === "drumkit") return "instrument.drumkit";
-    diags.add({
-      severity: "error",
-      code: "instrument.unknown-type",
-      file: path,
-      pointer: "/type",
-      message: `instrument type must be "synth" or "drumkit", found ${JSON.stringify(type)}`,
-      loc: locs.get("/type") ?? locs.get("") ?? { line: 1, column: 1 },
-    });
-    return undefined;
-  }
-  return hint;
+  diags.add({
+    severity: "error",
+    code: "instrument.unknown-type",
+    file: path,
+    pointer: "/type",
+    message: `instrument type must be "synth" or "drumkit", found ${JSON.stringify((value as JsonObject)["type"])}`,
+    loc: locs.get("/type") ?? locs.get("") ?? { line: 1, column: 1 },
+  });
+  return undefined;
 }
 
 function checkFileNameMatchesId(

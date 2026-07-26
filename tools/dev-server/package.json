@@ -15,5 +15,19 @@
     "@chord-garden/engine": "*",
     "@chord-garden/format": "*",
     "esbuild": "^0.28.1"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "default": "./dist/api.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    }
   }
 }
