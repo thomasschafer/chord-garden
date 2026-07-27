@@ -1,6 +1,8 @@
 import { useEffect } from "react";
 import { useStore } from "zustand";
 import { AutomationEditors } from "./components/AutomationEditor";
+import { InstrumentEditors } from "./components/InstrumentEditor";
+import { Mixer } from "./components/Mixer";
 import { PatternEditors } from "./components/PatternEditors";
 import { ProjectHeader } from "./components/ProjectHeader";
 import { SyncStatus } from "./components/SyncStatus";
@@ -73,8 +75,10 @@ export function App(): React.JSX.Element {
       <p className="muted">{project.root}</p>
       <ProjectHeader project={project} />
       <Transport project={project} />
+      <Mixer project={project} />
       <PatternEditors project={project} />
       <AutomationEditors project={project} />
+      <InstrumentEditors project={project} />
       <TrackList project={project} />
       <SyncStatus />
       <WriteStatus />

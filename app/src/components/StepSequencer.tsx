@@ -15,7 +15,7 @@ import {
 import { memo, useCallback, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { documentStore } from "../session";
-import type { LaneDefaultsPatch, StepEventPatch } from "../store/documentStore";
+import type { LaneDefaultsPatch, StepEventPatch, StepsPerBarRemap } from "../store/documentStore";
 import { gridGeometry } from "../view/grid";
 import {
   DRAG_THRESHOLD_PX,
@@ -495,6 +495,11 @@ function LaneInspector({
 }): React.JSX.Element {
   const setLaneDefaults = useStore(documentStore, (state) => state.setLaneDefaults);
   const setLaneStepsPerBar = useStore(documentStore, (state) => state.setLaneStepsPerBar);
+  const remapLaneStepsPerBar = useStore(documentStore, (state) => state.remapLaneStepsPerBar);
+  /** A grid change that was refused, and the resolution it wanted. */
+  const [refused, setRefused] = useState<{ stepsPerBar: number; message: string } | undefined>(undefined);
+  /** What the last accepted remap did to this lane's hits. */
+  const [remapped, setRemapped] = useState<StepsPerBarRemap | undefined>(undefined);
 
   const barTicks = ticksPerBar(project.project.ppqn, project.project.meterMap[0]!.timeSignature);
   const stepTicks = barTicks / lane.grid.stepsPerBar;
@@ -538,16 +543,45 @@ function LaneInspector({
             value={String(lane.grid.stepsPerBar)}
             onCommit={(text) => {
               if (text.trim() === "") return;
+              const stepsPerBar = Number(text);
+              setRemapped(undefined);
               try {
-                setLaneStepsPerBar(patternId, laneName, Number(text));
+                setLaneStepsPerBar(patternId, laneName, stepsPerBar);
+                setRefused(undefined);
                 onError(undefined);
               } catch (cause) {
-                onError(cause instanceof Error ? cause.message : String(cause));
+                // Not reported through `onError`: this refusal has a way forward, and
+                // the offer to take it has to sit next to the reason rather than in a
+                // line of error text at the bottom of the editor.
+                const message = cause instanceof Error ? cause.message : String(cause);
+                setRefused({ stepsPerBar, message });
+                onError(undefined);
               }
             }}
           />
           <span className="muted">must divide a bar&rsquo;s {barTicks} ticks</span>
         </label>
+        {refused !== undefined && (
+          <p className="warn">
+            {refused.message}{" "}
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  const report = remapLaneStepsPerBar(patternId, laneName, refused.stepsPerBar);
+                  setRemapped(report);
+                  setRefused(undefined);
+                  onError(undefined);
+                } catch (cause) {
+                  onError(cause instanceof Error ? cause.message : String(cause));
+                }
+              }}
+            >
+              move the hits to the nearest step anyway
+            </button>
+          </p>
+        )}
+        {remapped !== undefined && <RemapReport report={remapped} onDismiss={() => setRemapped(undefined)} />}
         {LANE_DEFAULT_FIELDS.map((field) => (
           <label key={field}>
             {field}
@@ -577,6 +611,49 @@ function LaneInspector({
         {effect.moved === 0 && effect.total > 0 && " , because every hit here is on an even step"}.
       </p>
     </div>
+  );
+}
+
+/**
+ * What a remap did to a lane's hits, itemised.
+ *
+ * Shown rather than summarised as a count, because the change is not undoable
+ * from here and a hit that was dropped is the author's material: "3 hits lost"
+ * tells them something went wrong, and the step numbers tell them what to put
+ * back. A hit that kept its tick is worth saying too — otherwise a grid change
+ * that preserved the groove reads as if it might not have.
+ */
+function RemapReport({
+  report,
+  onDismiss,
+}: {
+  report: StepsPerBarRemap;
+  onDismiss: () => void;
+}): React.JSX.Element {
+  const lost = report.lost.length;
+  return (
+    <p className={lost > 0 ? "warn" : "muted"}>
+      {report.from} → {report.to} steps per bar: {report.kept.length} hits kept their tick
+      {report.moved.length > 0 && (
+        <>
+          , {report.moved.length} moved to the nearest step (
+          {report.moved.map(([was, now]) => `${was}→${now}`).join(", ")})
+        </>
+      )}
+      {lost > 0 && (
+        <>
+          , and <strong>{lost} dropped</strong> because an earlier hit already claimed the step they landed on
+          (step {report.lost.join(", ")})
+          {report.lostOverrides.length > 0 && (
+            <>
+              {" "}— {report.lostOverrides.length} of those also had per-step expression, which went with them (step{" "}
+              {report.lostOverrides.join(", ")})
+            </>
+          )}
+        </>
+      )}
+      . <button type="button" onClick={onDismiss}>dismiss</button>
+    </p>
   );
 }
 

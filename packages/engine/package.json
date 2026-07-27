@@ -16,6 +16,10 @@
       "types": "./dist/live/index.d.ts",
       "default": "./dist/live/index.js"
     },
+    "./params": {
+      "types": "./dist/graph/paramEffect.d.ts",
+      "default": "./dist/graph/paramEffect.js"
+    },
     "./wav": {
       "types": "./dist/render/wav.d.ts",
       "default": "./dist/render/wav.js"

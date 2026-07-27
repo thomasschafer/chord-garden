@@ -299,9 +299,29 @@ export class LiveSession {
     this.project = project;
     this.currentSchedule = schedule;
     this.currentBarStarts = barStarts;
-    if (effect === "structural") {
+    // A parameter edit cannot be pushed in place while a graph rebuild is still
+    // queued, and the reason is worth stating because the failure was loud and
+    // baffling: toggle a step during playback and then move a fader before the
+    // bar line, and the edit was refused as "structural" even though the fader
+    // was the only thing the author touched.
+    //
+    // The queued change owns two things this method would otherwise contradict.
+    // It holds the events the worklet will play from the bar line on, so
+    // `updateParameters` — which compares the recompiled schedule against what is
+    // *currently* playing — sees the step toggle in the comparison and correctly
+    // refuses. And its configure was built from the document as it was when it
+    // was queued, so even where the events happen to be identical (a `stepsPerBar`
+    // change that lands every hit on the same tick) the bar line would restore the
+    // pre-fader instrument and silently undo the parameter edit.
+    //
+    // So the parameter edit joins the queued change instead of racing it: the
+    // rebuild is re-queued from the current document, carrying both edits, and the
+    // outcome says `structural` because that is honestly what happened and the
+    // transport readout should say "at bar N" rather than "already audible".
+    const queued = effect === "parameters" && this.transport.hasPendingStructuralChange;
+    if (effect === "structural" || queued) {
       const change = this.transport.applyStructuralChange(schedule, barStarts);
-      return { effect, atSample: change.atSample };
+      return { effect: "structural", atSample: change.atSample };
     }
     this.transport.applyParameterChange(
       schedule,

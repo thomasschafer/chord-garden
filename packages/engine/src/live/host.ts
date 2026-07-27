@@ -184,6 +184,16 @@ export class LiveTransport {
     this.estimate = Math.max(this.estimate, event.positionSample);
   }
 
+  /**
+   * Whether a graph rebuild is queued and has not landed yet.
+   *
+   * Read by `LiveSession.update`, which may not push a parameter change in place
+   * while one is outstanding; see the comment there for why.
+   */
+  get hasPendingStructuralChange(): boolean {
+    return this.scheduler.pendingChange !== undefined;
+  }
+
   /** Post a queued graph replacement; `change` comes from the scheduler. */
   sendConfigure(change: StructuralChange, graph: LiveGraph): void {
     this.sink.postMessage({

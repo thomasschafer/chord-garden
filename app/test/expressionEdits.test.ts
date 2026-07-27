@@ -490,3 +490,44 @@ describe("what an automation edit means to a running transport", () => {
     expect(eventsOf(project(store))).not.toEqual(before);
   });
 });
+
+/**
+ * Store actions must not depend on `this`.
+ *
+ * React hands an action to a component detached from the state object — a fader
+ * receives `useStore(documentStore, (s) => s.setInstrumentParam)` and calls it as a
+ * bare function — so any action reaching a sibling through `this` throws once it is
+ * wired to a control. Reaching the action as `getState().setInstrumentParam(...)`
+ * binds `this` and hides that entirely, which is how `setInstrumentParam` shipped
+ * broken past a green suite until a fader was dragged in a browser.
+ *
+ * So these cases call every action the way React does: pulled off the state and
+ * invoked with no receiver.
+ */
+describe("actions survive being detached from the store", () => {
+  it("sets one instrument param when called as a bare function", () => {
+    const { store } = open();
+    const { setInstrumentParam } = store.getState();
+    setInstrumentParam("bass-synth", "filter.cutoff", 1200);
+    expect(project(store).instruments.get("bass-synth")?.params?.["filter.cutoff"]).toBe(1200);
+  });
+
+  it("leaves the params beside it exactly as they were", () => {
+    const { store } = open();
+    const before = { ...project(store).instruments.get("bass-synth")!.params };
+    const { setInstrumentParam } = store.getState();
+    setInstrumentParam("bass-synth", "filter.cutoff", 1200);
+    const after = project(store).instruments.get("bass-synth")!.params!;
+    for (const [key, value] of Object.entries(before)) {
+      if (key === "filter.cutoff") continue;
+      expect(after[key], `param "${key}"`).toBe(value);
+    }
+  });
+
+  it("removes the key when the value goes back to undefined", () => {
+    const { store } = open();
+    const { setInstrumentParam } = store.getState();
+    setInstrumentParam("bass-synth", "filter.cutoff", undefined);
+    expect(project(store).instruments.get("bass-synth")?.params?.["filter.cutoff"]).toBeUndefined();
+  });
+});

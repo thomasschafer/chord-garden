@@ -14,6 +14,7 @@ export {
   type DrumkitConfiguration,
   type SampleResolver,
 } from "./instrumentSettings.js";
+export { paramEditEffect, type ParamEditEffect } from "./paramEffect.js";
 export {
   DrumkitTrackRunner,
   SynthTrackRunner,

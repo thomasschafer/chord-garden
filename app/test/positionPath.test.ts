@@ -79,6 +79,12 @@ describe("the path a playback position takes through the UI", () => {
     expect(seen).toEqual({
       // The player itself: it is where a position report arrives.
       "audio/livePlayer.ts": ["PlayerStatus", "positionSample"],
+      // The master level meter, which subscribes directly for the same reason the
+      // playhead does. It is a leaf in its own file precisely so admitting it here
+      // does not also license the mixer's faders — a meter sharing a file with the
+      // strips would put every fader on the ~47/s report path, including the one
+      // under the pointer.
+      "components/MasterMeter.tsx": ["livePlayer", "PlayerStatus"],
       // The playhead line, which subscribes to the player directly. A leaf, so a
       // report re-renders one absolutely positioned div and nothing else.
       "components/Playhead.tsx": ["livePlayer"],

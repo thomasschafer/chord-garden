@@ -1,3 +1,4 @@
+import { paramEditEffect } from "@chord-garden/engine/params";
 import {
   canonicalFiles,
   checkExpressionValue,
@@ -270,9 +271,57 @@ export interface DocumentState {
    * Refused rather than rounded when a hit would not land on the new grid: a
    * coarser grid genuinely cannot hold an off-grid hit, and quietly moving or
    * dropping one is requantisation nobody asked for (PLAN.md §18's rule about
-   * grids being a view).
+   * grids being a view). The refusal names every hit that blocks it, because
+   * "one of your hits is in the way" is not something a musician can act on.
+   *
+   * `remapLaneStepsPerBar` is the other half: the same change with the author's
+   * explicit consent to lose timing.
    */
   setLaneStepsPerBar(patternId: string, lane: string, stepsPerBar: number): void;
+  /**
+   * Change a lane's grid resolution, moving each hit to the nearest step of the
+   * new grid and reporting exactly what that cost.
+   *
+   * The deliberately lossy half of the pair, and it exists because refusing alone
+   * leaves a one-way door: a lane written at 16 with a hit on step 6 can never
+   * become 12, and "delete the hit yourself first" is the editor asking the author
+   * to do the destructive part by hand with no idea what else will move.
+   *
+   * The loss is bounded and stated, never silent. A hit already on a step of the
+   * new grid does not move. A hit between steps moves to the nearer one. Two hits
+   * the coarser grid puts on one step cannot both survive — the earlier one keeps
+   * the step and the later is dropped, with its `stepEvents` overrides — and the
+   * returned report names every hit in each category by the step index it had, for
+   * the UI to show. Nothing about it is a guess the author has to discover by ear.
+   */
+  remapLaneStepsPerBar(patternId: string, lane: string, stepsPerBar: number): StepsPerBarRemap;
+  /**
+   * Set, change or clear one param of one instrument.
+   *
+   * `undefined` clears the override. So does a value equal to the registry
+   * default, which is the same rule the velocity drag follows: the file says what
+   * the author meant, and "the default" is said by the absence of a key, not by a
+   * number that happens to equal it (docs/format-spec.md §6 — "omitting a param
+   * means its default; `fmt` never writes defaults in for you"). An instrument
+   * left overriding nothing loses its `params` object too, rather than keeping an
+   * empty one.
+   *
+   * The audio classification is not this file's opinion: `paramEditEffect` answers
+   * it from how the DSP is actually built, so a param the renderer reads per block
+   * is heard in the next one and one it fixes when it constructs a voice waits for
+   * a bar line.
+   */
+  setInstrumentParam(instrumentId: string, key: string, value: number | string | undefined): void;
+  /**
+   * The same, for several params of one instrument at once.
+   *
+   * One edit, not one per key, because some gestures are genuinely about a set of
+   * params: pulling a whole drum kit down by 3 dB moves every voice's `gain`, and
+   * as separate edits that is one recompile and one file write per voice for a
+   * single drag of a single control. The effect is the strongest of the keys' — one
+   * param the DSP fixes at construction makes the whole batch structural.
+   */
+  setInstrumentParams(instrumentId: string, patch: InstrumentParamPatch): void;
   /**
    * Start automating `param` on `track`, seeded with one point at tick 0 holding
    * the value the instrument already produces — so creating a lane changes
@@ -331,6 +380,39 @@ export type StepEventPatch = {
 export type LaneDefaultsPatch = {
   [K in keyof LaneDefaults]?: number | undefined;
 };
+
+/**
+ * Params to set on one instrument. Present-and-`undefined` means "clear this
+ * override", exactly as `StepEventPatch` does; a key that is absent is untouched.
+ *
+ * Keys are strings rather than a union of param names on purpose: the valid keys
+ * are the registry's, they depend on the instrument (a drumkit's are per voice),
+ * and the store checks each one against `resolveParam` before writing. A union
+ * here would be a second copy of the registry in the type system that could not
+ * express a drumkit's keys anyway.
+ */
+export type InstrumentParamPatch = Record<string, number | string | undefined>;
+
+/**
+ * What became of a lane's hits when `remapLaneStepsPerBar` changed its grid.
+ *
+ * Every hit the lane had appears in exactly one of `kept`, `moved` and `lost`, by
+ * the step index it had in the old grid — which is the property the UI's summary
+ * and `test/patternEdits.test.ts` both rest on. A hit cannot go missing from the
+ * report without the arithmetic disagreeing with itself.
+ */
+export interface StepsPerBarRemap {
+  from: number;
+  to: number;
+  /** Hits already on a step of the new grid; their tick did not change. */
+  kept: readonly number[];
+  /** Hits moved to the nearest step, as `[wasStep, nowStep]`. */
+  moved: readonly (readonly [number, number])[];
+  /** Hits dropped because an earlier hit had already claimed their new step. */
+  lost: readonly number[];
+  /** Of `lost`, the ones that also took `stepEvents` overrides with them. */
+  lostOverrides: readonly number[];
+}
 
 /** Fields every note must have, which a patch may change but not remove. */
 export const REQUIRED_NOTE_FIELDS = ["pitch", "startTick", "durationTicks", "velocity"] as const;
@@ -718,26 +800,126 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           assertStepGrid(draft, stepsPerBar);
           const from = lane.grid.stepsPerBar;
           if (stepsPerBar === from) return;
-          const barTicks = ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
-          const wasStepTicks = barTicks / from;
-          const nowStepTicks = barTicks / stepsPerBar;
+          const grid = regridOf(draft, from, stepsPerBar);
+          const hits = hitsOf(lane, patternId, bars);
 
-          const remap = (step: number): number => {
-            const tick = step * wasStepTicks;
-            const moved = tick / nowStepTicks;
-            if (!Number.isInteger(moved)) {
-              throw new Error(
-                `cannot change lane "${laneName}" to ${stepsPerBar} steps per bar: the hit at step ${step} is at tick ${tick}, which is between steps of that grid. Move or remove it first.`,
-              );
-            }
-            return moved;
-          };
+          // Every blocking hit, not the first one found. A lane is refused as a
+          // whole, so naming one hit tells the author to fix it and try again, and
+          // discover the next one — which is the interaction a validator exists to
+          // prevent, arriving from the UI instead.
+          const blocked = hits.filter((step) => !Number.isInteger(step * grid.ratio));
+          if (blocked.length > 0) {
+            const positions = blocked.map((step) => `${step} (tick ${step * grid.wasStepTicks})`).join(", ");
+            throw new Error(
+              `cannot change lane "${laneName}" from ${from} to ${stepsPerBar} steps per bar: ${blocked.length} of its ${hits.length} hits fall between steps of that grid — step ${positions}. Move or remove them, or remap the lane and accept that those hits shift.`,
+            );
+          }
 
-          const hits = hitsOf(lane, patternId, bars).map(remap);
-          const stepEvents = lane.stepEvents?.map((entry) => ({ ...entry, step: remap(entry.step) }));
+          const moved = (step: number): number => step * grid.ratio;
+          const stepEvents = lane.stepEvents?.map((entry) => ({ ...entry, step: moved(entry.step) }));
           lane.grid.stepsPerBar = stepsPerBar;
-          lane.steps = formatSteps(hits, stepsPerBar, bars);
+          lane.steps = formatSteps(hits.map(moved), stepsPerBar, bars);
           if (stepEvents !== undefined) lane.stepEvents = stepEvents.sort((a, b) => a.step - b.step);
+        });
+      },
+
+      remapLaneStepsPerBar(patternId, laneName, stepsPerBar) {
+        let report: StepsPerBarRemap | undefined;
+        applyEdit("structural", (draft) => {
+          const { lane, bars } = gridLane(draft, patternId, laneName);
+          assertStepGrid(draft, stepsPerBar);
+          const from = lane.grid.stepsPerBar;
+          const grid = regridOf(draft, from, stepsPerBar);
+          const total = stepsPerBar * bars;
+          const overrides = new Map((lane.stepEvents ?? []).map((entry) => [entry.step, entry]));
+
+          const kept: number[] = [];
+          const shifted: [number, number][] = [];
+          const lost: number[] = [];
+          const lostOverrides: number[] = [];
+          /** New step index -> the old step that claimed it. Ascending, so first wins. */
+          const claimed = new Map<number, number>();
+          const stepEvents: StepEvent[] = [];
+
+          for (const step of hitsOf(lane, patternId, bars)) {
+            const exact = step * grid.ratio;
+            // Clamped, because a coarser grid can round the last hits of a pattern
+            // past its final step: at 16 -> 4 the hit on step 15 rounds to step 4 of
+            // a four-step bar, which does not exist. The clamp lands it on the last
+            // step, where it either fits or collides and is reported as lost.
+            const to = Math.min(total - 1, Math.max(0, Math.round(exact)));
+            if (claimed.has(to)) {
+              lost.push(step);
+              if (overrides.has(step)) lostOverrides.push(step);
+              continue;
+            }
+            claimed.set(to, step);
+            if (Number.isInteger(exact)) kept.push(step);
+            else shifted.push([step, to]);
+            const override = overrides.get(step);
+            if (override !== undefined) stepEvents.push({ ...override, step: to });
+          }
+
+          lane.grid.stepsPerBar = stepsPerBar;
+          lane.steps = formatSteps([...claimed.keys()].sort((a, b) => a - b), stepsPerBar, bars);
+          if (stepEvents.length === 0) delete lane.stepEvents;
+          else lane.stepEvents = stepEvents.sort((a, b) => a.step - b.step);
+
+          report = { from, to: stepsPerBar, kept, moved: shifted, lost, lostOverrides };
+        });
+        if (report === undefined) throw new Error("internal error: the regrid produced no report");
+        return report;
+      },
+
+      setInstrumentParam(instrumentId, key, value) {
+        // `get()`, not `this`: React hands an action to a component detached from the
+        // state object (`useStore(documentStore, (s) => s.setInstrumentParam)`), so
+        // `this` is undefined by the time a fader calls it. A test that reaches the
+        // action as `getState().setInstrumentParam(...)` binds `this` and passes,
+        // which is exactly how this survived until a fader was dragged in a browser.
+        get().setInstrumentParams(instrumentId, { [key]: value });
+      },
+
+      setInstrumentParams(instrumentId, patch) {
+        const current = get().project?.instruments.get(instrumentId);
+        if (current === undefined) throw new Error(`no instrument "${instrumentId}"`);
+        const entries = Object.entries(patch);
+        if (entries.length === 0) throw new Error(`cannot set no params at all on "${instrumentId}"`);
+
+        // Resolved and range-checked before anything moves, so a batch is all-or-nothing
+        // and the document never holds a value `musictool validate` would reject.
+        const specs = new Map<string, ParamSpec>();
+        let effect: AudioEffect = "parameters";
+        for (const [key, value] of entries) {
+          const resolved = resolveParam(current, key);
+          if (resolved === undefined) {
+            throw new Error(`"${key}" is not a param of instrument "${instrumentId}"`);
+          }
+          if (value !== undefined) {
+            const problem = checkParamValue(resolved.spec, value);
+            if (problem !== undefined) {
+              throw new Error(`${JSON.stringify(value)} is not a valid "${key}" value: ${problem}`);
+            }
+          }
+          specs.set(key, resolved.spec);
+          // Classified from the engine's own account of when the DSP reads each param,
+          // so a claim of `parameters` the worklet would refuse cannot be made here.
+          if (paramEditEffect(current, key) === "structural") effect = "structural";
+        }
+
+        applyEdit(effect, (draft) => {
+          const instrument = draft.instruments.get(instrumentId);
+          if (instrument === undefined) throw new Error(`no instrument "${instrumentId}"`);
+          const params = { ...(instrument.params ?? {}) };
+          for (const [key, value] of entries) {
+            if (value === undefined || value === specs.get(key)!.default) delete params[key];
+            else params[key] = value;
+          }
+          // An empty `params` is schema-legal and is still not a document anyone
+          // wrote: it is two lines of noise in the diff of an instrument that has
+          // stopped overriding anything.
+          if (Object.keys(params).length === 0) delete instrument.params;
+          else instrument.params = params;
         });
       },
 
@@ -1085,6 +1267,21 @@ function assertVoiceExists(draft: Project, patternId: string, laneName: string):
       );
     }
   }
+}
+
+/**
+ * The arithmetic both grid changes share: how long a step was, and what an old
+ * step index becomes in the new grid.
+ *
+ * `ratio` is the whole point of a shared helper. A step's *tick* is what has to be
+ * preserved, and the tick cancels out — `step * wasStepTicks / nowStepTicks` is
+ * `step * to / from` — so the two actions agree by construction on which hits land
+ * exactly and where the rest go, rather than by two similar-looking expressions
+ * happening to match.
+ */
+function regridOf(draft: Project, from: number, to: number): { wasStepTicks: number; ratio: number } {
+  const barTicks = ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
+  return { wasStepTicks: barTicks / from, ratio: to / from };
 }
 
 /** Every grid step must be a whole number of ticks (docs/format-spec.md §5). */
