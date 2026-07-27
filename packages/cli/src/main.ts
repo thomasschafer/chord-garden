@@ -79,6 +79,21 @@ track repeats the onset, event, and level fields per kit voice under "voices":
                      on a hat is invisible in the track numbers and visible
                      here. This is where you check "the kick is on every beat",
                      and it needs no --stems
+  effects            the track's effect chain in signal order, empty when it
+                     has none. It explains the rest of the entry: the level may
+                     be lower or wider than the instrument's own, and sound may
+                     continue past the last event
+  onsetSource        which bus onsets were measured on. "track" for a track with
+                     no chain; "preEffect" for one with a chain, because a
+                     delay's repeats are deliberate sound at unscheduled
+                     positions and counting them as .spurious would flag a
+                     healthy project. Levels, clipping and spectral stay on the
+                     audible bus
+  musicalSamples     samples of music, before the tail. parameters.tail gives
+                     the same number with .tailSamples beside it, and says that
+                     levels and onsets are measured over the whole buffer — so
+                     with an effect tail they move with --tail. A tail still
+                     sounding where the render stopped is a warning; raise --tail
   musicalGrid        .barPositions and .beatPositions in samples for the
                      rendered range, plus .startBar and .beatsPerBar. Compare a
                      voice's onsets.expectedPositions against .beatPositions
@@ -267,7 +282,7 @@ function runRender(args: readonly string[], io: CliIo): number {
       stems: true,
       tailSeconds: parsed.tailSeconds,
     });
-    if (rendered.stems === undefined || rendered.voices === undefined) {
+    if (rendered.stems === undefined || rendered.voices === undefined || rendered.dry === undefined) {
       throw new Error("renderer did not return the isolated buffers required for analysis");
     }
     const report = analyzeRender(
@@ -280,6 +295,7 @@ function runRender(args: readonly string[], io: CliIo): number {
         musicalGrid: musicalGrid(loaded.project, scheduleOptions),
       },
       rendered.voices,
+      rendered.dry,
     );
 
     mkdirSync(dirname(parsed.out), { recursive: true });

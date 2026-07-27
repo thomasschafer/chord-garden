@@ -36,12 +36,35 @@ export interface ProjectDoc {
 
 export type TrackType = "drumkit" | "instrument";
 
+export type EffectType = "delay" | "reverb" | "filter";
+
+/**
+ * One effect in a track's chain.
+ *
+ * `id` is what automation addresses (`fx.<id>.<param>`) and is deliberately
+ * carried by the effect rather than derived from its position in `effects`.
+ * Reordering the chain changes the order audio passes through it and nothing
+ * else: no automation lane re-targets, and no other effect's sound moves. Keying
+ * on an array position is the mistake PLAN.md §18 records twice over.
+ */
+export interface EffectDoc {
+  id: string;
+  description?: string;
+  type: EffectType;
+  params?: Record<string, number | string>;
+}
+
 export interface TrackDoc {
   id: string;
   description?: string;
   type: TrackType;
   instrument: string;
   patterns: string[];
+  /**
+   * The track's effect chain, applied in array order after the instrument.
+   * Requires `project.json` `format` 2 or newer.
+   */
+  effects?: EffectDoc[];
 }
 
 export type SynthEngine = "basic-mono" | "basic-poly";

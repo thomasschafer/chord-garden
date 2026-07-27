@@ -1,0 +1,18 @@
+{
+  "id": "drums",
+  "type": "drumkit",
+  "instrument": "kit-main",
+  "patterns": ["beat"],
+  "effects": [
+    {
+      "id": "room",
+      "description": "A short plate on the whole kit.",
+      "type": "reverb",
+      "params": {
+        "damping": 400,
+        "mix": 220,
+        "size": 600
+      }
+    }
+  ]
+}

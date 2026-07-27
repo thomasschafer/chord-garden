@@ -1,5 +1,5 @@
 import type { CompiledAutomationLane, CompiledNoteEvent } from "../compiler.js";
-import type { InstrumentDoc } from "@chord-garden/format";
+import type { EffectDoc, InstrumentDoc } from "@chord-garden/format";
 
 /** Name the worklet module registers, and the name the node must be created with. */
 export const LIVE_PROCESSOR_NAME = "chord-garden-live";
@@ -25,6 +25,12 @@ export interface LiveSampleRef {
 export interface LiveTrackConfig {
   trackId: string;
   instrument: InstrumentDoc;
+  /**
+   * The track's effect chain in signal order. Crosses the boundary as documents
+   * for the same reason `instrument` does: the worklet derives its settings with
+   * the one `effectChainSpecs` the renderer uses.
+   */
+  effects: EffectDoc[];
   automation: CompiledAutomationLane[];
 }
 
@@ -82,6 +88,12 @@ export type LiveCommand =
       generation: number;
       trackIndex: number;
       instrument: InstrumentDoc;
+      /**
+       * The chain's params only. Its *shape* may not change this way — an effect
+       * added, removed, reordered or retyped is a graph change — and the runner
+       * refuses one rather than adopting it (`EffectChain.updateSettings`).
+       */
+      effects: EffectDoc[];
       automation: CompiledAutomationLane[];
     }
   | { type: "start" }

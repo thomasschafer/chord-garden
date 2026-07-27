@@ -1,0 +1,31 @@
+{
+  "id": "bassline",
+  "kind": "notes",
+  "lengthTicks": 7680,
+  "notes": [
+    {
+      "pitch": "A1",
+      "startTick": 0,
+      "durationTicks": 720,
+      "velocity": 900
+    },
+    {
+      "pitch": "A1",
+      "startTick": 1920,
+      "durationTicks": 480,
+      "velocity": 700
+    },
+    {
+      "pitch": "C2",
+      "startTick": 3840,
+      "durationTicks": 960,
+      "velocity": 850
+    },
+    {
+      "pitch": "E2",
+      "startTick": 5760,
+      "durationTicks": 720,
+      "velocity": 800
+    }
+  ]
+}

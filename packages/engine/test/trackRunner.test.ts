@@ -46,6 +46,7 @@ function renderSliced(windowSize: number): { left: Float32Array; right: Float32A
     instrumentId: INSTRUMENT.id,
     events: EVENTS,
     automation: [],
+    effects: [],
   };
   const runner = new SynthTrackRunner(track, INSTRUMENT, 48_000);
   const left = new Float32Array(TOTAL_SAMPLES);
@@ -94,7 +95,7 @@ describe("track runner", () => {
   });
 
   it("refuses events that arrive after the block that should have played them", () => {
-    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: [], automation: [] };
+    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: [], automation: [], effects: [] };
     const runner = new SynthTrackRunner(track, INSTRUMENT, 48_000);
     const left = new Float32Array(CONTROL_BLOCK_SIZE);
     const right = new Float32Array(CONTROL_BLOCK_SIZE);
@@ -105,7 +106,7 @@ describe("track runner", () => {
   });
 
   it("refuses events that go backwards, and blocks that do not continue", () => {
-    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: [], automation: [] };
+    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: [], automation: [], effects: [] };
     const runner = new SynthTrackRunner(track, INSTRUMENT, 48_000);
     runner.enqueue([{ startSample: 500, durationSamples: 10, midi: 60, velocity: 900 }]);
     expect(() => runner.enqueue([{ startSample: 400, durationSamples: 10, midi: 60, velocity: 900 }])).toThrow(
@@ -119,7 +120,7 @@ describe("track runner", () => {
   });
 
   it("silences its voices and forgets its queue on reset", () => {
-    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: EVENTS, automation: [] };
+    const track: CompiledTrack = { trackId: "synth", instrumentId: INSTRUMENT.id, events: EVENTS, automation: [], effects: [] };
     const runner = new SynthTrackRunner(track, INSTRUMENT, 48_000);
     runner.enqueue(EVENTS);
     const left = new Float32Array(CONTROL_BLOCK_SIZE);

@@ -14,10 +14,17 @@ export {
   type DrumkitConfiguration,
   type SampleResolver,
 } from "./instrumentSettings.js";
-export { paramEditEffect, type ParamEditEffect } from "./paramEffect.js";
+export { effectChainSpecs, effectStaticValues } from "./effectSettings.js";
+export {
+  chainEditEffect,
+  effectParamEditEffect,
+  paramEditEffect,
+  type ParamEditEffect,
+} from "./paramEffect.js";
 export {
   DrumkitTrackRunner,
   SynthTrackRunner,
   createTrackRunner,
+  type StereoBuffers,
   type TrackRunner,
 } from "./trackRunner.js";

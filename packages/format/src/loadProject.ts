@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { assembleProject } from "./assemble.js";
 import { docKindFromHint, type DocKindHint } from "./docKind.js";
 import { DiagnosticCollector, type Diagnostic, type Loc } from "./diagnostics.js";
+import { SUPPORTED_FORMAT } from "./formatVersion.js";
 import { parseStrictJson, type JsonObject, type JsonValue } from "./jsonParse.js";
 import type { Project } from "./model.js";
 import { schemaValidate } from "./schema.js";
 import { semanticValidate } from "./semantic.js";
 import type { DocKind } from "./serialize.js";
 
-export const SUPPORTED_FORMAT = 1;
+export { SUPPORTED_FORMAT } from "./formatVersion.js";
 
 export interface LoadedFile {
   path: string;

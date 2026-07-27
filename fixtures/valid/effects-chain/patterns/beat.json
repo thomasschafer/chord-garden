@@ -1,0 +1,24 @@
+{
+  "id": "beat",
+  "kind": "grid",
+  "lengthTicks": 3840,
+  "lanes": [
+    {
+      "lane": "kick",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "x... x... x... x..."
+    },
+    {
+      "lane": "hat",
+      "grid": {
+        "stepsPerBar": 16
+      },
+      "steps": "..x. ..x. ..x. ..x.",
+      "defaults": {
+        "velocity": 600
+      }
+    }
+  ]
+}

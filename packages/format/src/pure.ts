@@ -45,23 +45,41 @@ export { HIGHEST_MIDI, LOWEST_MIDI, midiToPitch, pitchToMidi, transposePitch } f
 export {
   BASIC_MONO_PARAMS,
   BASIC_POLY_PARAMS,
+  DELAY_PARAMS,
   DRUMKIT_VOICE_PARAMS,
+  EFFECT_PARAMS,
+  EFFECT_PARAM_PREFIX,
+  EFFECT_TYPES,
+  FILTER_EFFECT_PARAMS,
   PARAM_UNIT_LABELS,
+  REVERB_PARAMS,
   automatableParams,
+  automatableTrackParams,
   checkParamValue,
   describeParamRange,
+  effectParamKey,
+  effectParams,
+  effectiveEffectParamValue,
   effectiveParamValue,
   instrumentParams,
+  parseEffectParamKey,
+  resolveEffectParam,
   resolveParam,
+  resolveTrackParam,
   staticParamValue,
+  staticTrackParamValue,
+  validEffectParamKeys,
   validParamKeys,
+  validTrackParamKeys,
   type AutomatableParam,
   type InstrumentParam,
   type ParamSpec,
   type ParamUnit,
   type ResolvedParam,
+  type ResolvedTrackParam,
 } from "./registry.js";
 export { referencedSamplePaths, sampleReferences, type SampleReference } from "./samples.js";
 export { serializeCanonical, type DocKind } from "./serialize.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";
+export { EFFECTS_MIN_FORMAT, SUPPORTED_FORMAT } from "./formatVersion.js";
 export { checkWavHeader, type WavCheckResult } from "./wav.js";

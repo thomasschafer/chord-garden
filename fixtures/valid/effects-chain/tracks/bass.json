@@ -1,0 +1,27 @@
+{
+  "id": "bass",
+  "type": "instrument",
+  "instrument": "bass-synth",
+  "patterns": ["bassline"],
+  "effects": [
+    {
+      "id": "tone",
+      "type": "filter",
+      "params": {
+        "cutoff": 600,
+        "mode": "lowpass",
+        "resonance": 300
+      }
+    },
+    {
+      "id": "slap",
+      "type": "delay",
+      "params": {
+        "damping": 500,
+        "feedback": 400,
+        "mix": 200,
+        "time": 250
+      }
+    }
+  ]
+}

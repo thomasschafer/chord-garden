@@ -41,7 +41,7 @@ export function liveGraph(
     if (instrument === undefined) {
       throw new Error(`cannot configure live engine: instrument "${track.instrumentId}" is missing`);
     }
-    return { trackId: track.trackId, instrument, automation: track.automation };
+    return { trackId: track.trackId, instrument, effects: track.effects, automation: track.automation };
   });
   const samples = requiredSamplePaths(project, schedule).map((path) => ({ path, contentHash: hashOf(path) }));
   return { tracks, samples };

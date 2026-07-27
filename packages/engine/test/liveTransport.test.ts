@@ -250,6 +250,7 @@ describe("structural and parameter changes through the worklet", () => {
       {
         trackIndex: 0,
         instrument: variant.instruments.get("synth-main")!,
+        effects: [],
         automation: recompiled.tracks[0]!.automation,
       },
     ]);
@@ -278,6 +279,7 @@ describe("structural and parameter changes through the worklet", () => {
       generation: 0,
       trackIndex: 2,
       instrument: { ...pad, params: { ...pad.params, maxVoices: 4 } },
+      effects: [],
       automation: [],
     });
     expect(errors(run.harness.events).at(-1)).toMatch(/maxVoices went from 16 to 4/);
@@ -300,7 +302,7 @@ describe("live protocol failures", () => {
       type: "configure",
       generation: 0,
       atSample: null,
-      tracks: [{ trackId: "drums", instrument: drumkit, automation: [] }],
+      tracks: [{ trackId: "drums", instrument: drumkit, effects: [], automation: [] }],
       samples: [{ path: "samples/kick.wav", contentHash: "deadbeef" }],
     });
     expect(errors(harness.events).at(-1)).toMatch(/sample "samples\/kick.wav" has not been sent/);
@@ -333,7 +335,14 @@ describe("live protocol failures", () => {
   it("rejects params for a generation that is not the active one", async () => {
     const run = await createLiveRun(loadedProject(FIXTURE));
     const pad = run.graphOf(run.schedule).tracks[2]!;
-    run.harness.send({ type: "params", generation: 4, trackIndex: 2, instrument: pad.instrument, automation: [] });
+    run.harness.send({
+      type: "params",
+      generation: 4,
+      trackIndex: 2,
+      instrument: pad.instrument,
+      effects: [],
+      automation: [],
+    });
     expect(errors(run.harness.events).at(-1)).toMatch(/generation 4 is not the active generation 0/);
   });
 

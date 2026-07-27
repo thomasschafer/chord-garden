@@ -11,6 +11,26 @@
     "patterns": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }
+    },
+    "effects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": { "type": "string" },
+          "type": { "enum": ["delay", "reverb", "filter"] },
+          "params": {
+            "type": "object",
+            "patternProperties": {
+              "^[a-zA-Z][a-zA-Z0-9]*$": { "type": ["integer", "string"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type"],
+        "unevaluatedProperties": false
+      }
     }
   },
   "required": ["id", "type", "instrument", "patterns"],

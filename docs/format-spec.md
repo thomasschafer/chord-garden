@@ -225,9 +225,11 @@ come back changed. What it normalises:
   is ≤4, or ungrouped if none), ` | ` between bars.
 
 What it does not reorder: `lanes` within a pattern, `patterns` within a track,
-`trackOrder`, automation `lanes`, and automation `points` (whose order is
-semantic — they must be strictly increasing in tick). It never changes a value:
-no transposition, no requantisation, no re-spelling of enharmonics.
+`trackOrder`, automation `lanes`, automation `points` (whose order is semantic —
+they must be strictly increasing in tick), and a track's `effects`, whose order
+is the order audio passes through the chain. An effect's own `params` map is
+sorted alphabetically like any other open map. It never changes a value: no
+transposition, no requantisation, no re-spelling of enharmonics.
 
 `fmt` never changes how a project sounds. Nothing it normalises reaches the
 render — not layout, not key order, and not the sort order of `clips`, `notes`,
@@ -323,6 +325,87 @@ the param's own unit — a `filter.cutoff` lane stores integer Hz, not permille.
 The registry is closed: no other keys are valid, and an unknown one is
 `registry.unknown-param` with a "did you mean" suggestion (§9).
 
+### 6.1 Effects
+
+A track may carry an `effects` chain, applied in array order after its
+instrument. **This requires `format` 2** (§10); a format-1 track with `effects`
+is `format.effects-require-2`.
+
+```json
+{
+  "id": "bass",
+  "type": "instrument",
+  "instrument": "bass-synth",
+  "patterns": ["bass-main"],
+  "effects": [
+    { "id": "tone", "type": "filter", "params": { "cutoff": 1400 } },
+    { "id": "slap", "type": "delay", "params": { "feedback": 420, "time": 250 } }
+  ]
+}
+```
+
+Every effect carries its own `id` (kebab-case, `^[a-z][a-z0-9-]*$`), unique
+within the track (`effect.duplicate-id`). Automation targets an effect param as
+**`fx.<id>.<param>`** — the author's id, not the type, and never the array
+position. Reordering a chain changes the order audio passes through it and
+nothing else: no automation lane re-targets and no other effect's settings move.
+That key is always exactly three segments, so it can never collide with a
+drumkit's two-segment `<voice>.<param>` — even on a kit that happens to have a
+voice named `fx`. An `fx.` key naming an effect the track does not have is
+`ref.missing-effect`.
+
+`params` follows the same rules as an instrument's: closed, registry-declared,
+omitted keys take the default, and a param at its default is not written.
+
+**delay** — a feedback line with a damped repeat.
+
+| param | unit | range / values | default | automatable |
+|---|---|---|---|---|
+| `time` | ms | 1..2000 | 375 | no |
+| `feedback` | permille | 0..950 | 300 | yes |
+| `damping` | permille | 0..1000 | 300 | yes |
+| `mix` | permille | 0..1000 | 250 | yes |
+
+`time` is milliseconds, not a musical division: every *position* in this format
+is ticks, but a device time constant is already ms here (`amp.attack`,
+`portamento`), and a beat is `60000 / bpm` ms if you want one. It is the one
+non-automatable numeric param in the set, because the tap is an integer offset
+into a buffer — sweeping it would step rather than glide, so modulated delay is
+deferred rather than faked (§11). `feedback` stops at 950 because unity never
+decays; the bound is in the range rather than in a clamp you cannot see.
+`damping` is what makes high feedback usable, since undamped repeats pile up
+high frequencies and turn metallic.
+
+**reverb** — eight damped combs into four allpasses per channel.
+
+| param | unit | range / values | default | automatable |
+|---|---|---|---|---|
+| `size` | permille | 0..1000 | 500 | yes |
+| `damping` | permille | 0..1000 | 500 | yes |
+| `width` | permille | 0..1000 | 1000 | yes |
+| `mix` | permille | 0..1000 | 200 | yes |
+
+`size` maps to a recirculation gain strictly below 1, so stability is a property
+of the mapping rather than of a limiter.
+
+**filter** — the same biquad and Q mapping the synth voices use, so a track
+sweep and an instrument sweep cannot sound like two different filters.
+
+| param | unit | range / values | default | automatable |
+|---|---|---|---|---|
+| `mode` | enum | lowpass, highpass, bandpass | lowpass | no |
+| `cutoff` | Hz | 20..20000 | 1000 | yes |
+| `resonance` | permille | 0..1000 | 100 | yes |
+
+It is `mode` rather than `type` because an effect already has a `type`, and
+`{"type": "filter", "params": {"type": "lowpass"}}` is a sentence nobody should
+have to read twice.
+
+A reverb or a long delay keeps sounding after the last note. `render` does not
+extend its buffer to fit that tail — `--tail` is what you asked for, so a tail
+longer than it is reported as a truncation rather than silently changing the
+length of your render (`AGENTS.md`).
+
 ## 7. Arrangement and automation
 
 `arrangement.json` holds only the timeline: `lengthTicks` and `clips`
@@ -346,10 +429,13 @@ render).
 
 Automation is **per track**, in `automation/<track-id>.json`, not embedded in
 `arrangement.json` — this keeps arrangement diffs small and automation edits
-from colliding with clip edits. Each lane names a `param` (must be
-automatable on that track's instrument), an `interp` (`linear` or `step`),
-and strictly-increasing `[tick, value]` points, value in the param's unit. At
-most one lane per param per track.
+from colliding with clip edits. Each lane names a `param`, an `interp`
+(`linear` or `step`), and strictly-increasing `[tick, value]` points, value in
+the param's unit. At most one lane per param per track.
+
+A lane may target either a param on the track's **instrument** (`filter.cutoff`,
+or `kick.gain` on a drumkit) or a param on one of its **effects**, written
+`fx.<id>.<param>` (§6.1). Either way the param must be `automatable: yes`.
 
 ## 8. Samples
 
@@ -397,12 +483,33 @@ Every diagnostic (from either layer) is one shape:
 never against `message` prose, which can change. `severity` is
 `error | warning | info`; `validate` exits non-zero only on `error`.
 
+Effects add three codes: `format.effects-require-2` (a format-1 track carrying a
+chain, §10), `effect.duplicate-id` (two effects on one track sharing an id, which
+would make `fx.<id>.<param>` ambiguous), and `ref.missing-effect` (an `fx.` lane
+naming an effect the track does not have, with a "did you mean").
+
 ## 10. Versioning
 
-`project.json.format` is `1`. `validate` rejects a project whose `format` is
-newer than what the tool supports — it does not attempt to migrate. Breaking
-changes bump `format`; additive non-breaking changes keep `format` the same
-but must still round-trip through canonical formatting unchanged.
+The current `format` is **2**. `validate` rejects a project whose `format` is
+newer than the tool supports — it does not attempt to migrate. Breaking changes
+bump `format`; additive non-breaking changes keep it the same but must still
+round-trip through canonical formatting unchanged.
+
+**Format 1 still reads.** Only a *newer* version is rejected, so every format-1
+project remains valid and nothing needs migrating. The single thing version 2
+adds is a track's `effects` chain (§6.1), so a format-1 track carrying `effects`
+is an error (`format.effects-require-2`) naming the version it needs — and that
+is the only complaint reported, rather than a page of consequences of one
+mistake.
+
+**Writing preserves the version a document already has.** A format-1 project
+stays at 1 through any number of edits; the tool raises it to 2 only when you
+add an effect chain, which is the point at which the document genuinely stops
+being format 1. That bump is one visible line in `project.json`, written in the
+same batch as the chain — `AGENTS.md` tells agents never to set `format`
+themselves, so the tool doing it on their behalf has to be something they can
+see in the diff rather than a number that quietly moved. Removing the last
+effect does not walk the version back.
 
 ## 11. What's deliberately not in v1
 
@@ -415,3 +522,13 @@ but must still round-trip through canonical formatting unchanged.
   validators require exactly one point).
 - Third-party/plugin engines — the registry is closed to the three built-in
   engines for now.
+- Tempo-synced delay time, and modulated (swept) delay time. A moving tap needs
+  a fractional read pointer and brings pitch artefacts with it; `time` is
+  integer ms and non-automatable rather than pretending otherwise (§6.1).
+- Nonlinear effects — distortion, saturation, compression. Every effect here is
+  linear and time-invariant while its params hold still, which is a property the
+  engine's tests rely on; adding a nonlinearity is a deliberate change, not a
+  fourth entry in the same list.
+- Sends and busses: an effect chain belongs to one track, and there is no shared
+  reverb bus. A `mixerLane` for effect params is likewise not wired yet — a
+  reverb's `mix` is edited in the effects section, not on a fader.

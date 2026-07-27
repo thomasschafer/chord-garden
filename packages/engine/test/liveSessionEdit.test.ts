@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   loadProject,
   type DrumkitInstrumentDoc,
+  type EffectDoc,
   type GridPatternDoc,
   type Project,
   type SynthInstrumentDoc,
@@ -109,6 +110,144 @@ function withBassGain(project: Project, gainDb100: number): Project {
   bass.params = { ...bass.params, gain: gainDb100 };
   return edited;
 }
+
+const EFFECTS_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/effects-chain", import.meta.url));
+
+/** The bass track's chain, which the effects fixture holds as `[tone, slap]`. */
+function bassChain(project: Project): EffectDoc[] {
+  const track = project.tracks.get("bass");
+  if (track?.effects === undefined) throw new Error("fixture lost its bass effect chain");
+  return track.effects;
+}
+
+function withBassChain(project: Project, replace: (effects: EffectDoc[]) => EffectDoc[]): Project {
+  const edited = structuredClone(project);
+  const track = edited.tracks.get("bass");
+  if (track === undefined) throw new Error("fixture lost its bass track");
+  track.effects = replace(bassChain(edited));
+  return edited;
+}
+
+describe("an effect chain edit during playback", () => {
+  /**
+   * An effect param is a `parameters` change (PLAN.md §12 step 6): no event moves,
+   * so nothing is withdrawn, no graph is rebuilt, and — the part that matters
+   * musically — a delay already ringing keeps its repeats instead of being cut off
+   * by a fresh processor.
+   */
+  it("pushes an effect param in place, with no graph swap", async () => {
+    const run = await createSessionRun(loadedProject(EFFECTS_FIXTURE));
+    run.session.start();
+    renderLive(run, 100 * CONTROL_BLOCK_SIZE, { tickEveryBlocks: 4 });
+    const configuresBefore = configures(run.posted).length;
+
+    const edited = withBassChain(loadedProject(EFFECTS_FIXTURE), (effects) =>
+      effects.map((effect) =>
+        effect.id === "slap" ? { ...effect, params: { ...effect.params, mix: 600 } } : effect,
+      ),
+    );
+    const outcome = await run.session.update(edited, "parameters");
+
+    expect(outcome).toEqual({ effect: "parameters", atSample: null });
+    expect(configures(run.posted)).toHaveLength(configuresBefore);
+    // The chain travels with the params message, so the worklet reads the edited
+    // documents rather than re-deriving from a stale copy.
+    const params = run.posted.filter((command) => command.type === "params");
+    expect(params.at(-1)).toMatchObject({ trackIndex: 1 });
+    const last = params.at(-1);
+    if (last?.type !== "params") throw new Error("expected a params command");
+    expect(last.effects.map((effect) => effect.id)).toEqual(["tone", "slap"]);
+    expect(errors(run.harness.events)).toEqual([]);
+    // It keeps rendering afterwards: an in-place update that silently killed the
+    // track would pass every assertion above.
+    const after = renderLive(run, 100 * CONTROL_BLOCK_SIZE, { tickEveryBlocks: 4 });
+    expect(Math.max(...after.left.map(Math.abs))).toBeGreaterThan(0);
+  });
+
+  /**
+   * The misclassification the scheduler cannot catch. Reordering a chain moves no
+   * event, so `updateParameters` sees an identical schedule and waves it through; the
+   * refusal comes from the runner, whose chain shape no longer matches. Without that
+   * guard the graph would keep the old order and the document would silently
+   * disagree with the audio.
+   */
+  it("refuses a reordered chain called parametric, though no event moved", async () => {
+    const run = await createSessionRun(loadedProject(EFFECTS_FIXTURE));
+    run.session.start();
+    run.transport.tick();
+    const reordered = withBassChain(loadedProject(EFFECTS_FIXTURE), (effects) => [...effects].reverse());
+
+    await run.session.update(reordered, "parameters");
+
+    // The scheduler accepts it — the events really are identical — so the error
+    // arrives from the audio thread, which is where the chain lives.
+    expect(errors(run.harness.events).at(-1)).toMatch(/chain went from \[tone:filter, slap:delay\]/);
+    expect(errors(run.harness.events).at(-1)).toMatch(/which is structural/);
+  });
+
+  it("reorders the chain at a bar boundary when the edit says structural", async () => {
+    const run = await createSessionRun(loadedProject(EFFECTS_FIXTURE));
+    run.session.start();
+    renderLive(run, 100 * CONTROL_BLOCK_SIZE, { tickEveryBlocks: 4 });
+    const reordered = withBassChain(loadedProject(EFFECTS_FIXTURE), (effects) => [...effects].reverse());
+
+    const outcome = await run.session.update(reordered, "structural");
+
+    expect(outcome.effect).toBe("structural");
+    expect(outcome.atSample).not.toBeNull();
+    const configure = configures(run.posted).at(-1);
+    if (configure?.type !== "configure") throw new Error("expected a configure command");
+    expect(configure.tracks[1]?.effects.map((effect) => effect.id)).toEqual(["slap", "tone"]);
+    renderLive(run, 400 * CONTROL_BLOCK_SIZE, { tickEveryBlocks: 4 });
+    expect(errors(run.harness.events)).toEqual([]);
+  });
+
+  it("refuses an added effect called parametric", async () => {
+    const run = await createSessionRun(loadedProject(EFFECTS_FIXTURE));
+    run.session.start();
+    run.transport.tick();
+    const added = withBassChain(loadedProject(EFFECTS_FIXTURE), (effects) => [
+      ...effects,
+      { id: "extra", type: "reverb" },
+    ]);
+
+    await run.session.update(added, "parameters");
+
+    expect(errors(run.harness.events).at(-1)).toMatch(/which is structural/);
+  });
+
+  /**
+   * Automation on `fx.<id>.<param>` end to end: the document's lane reaches the
+   * worklet as a compiled lane, and moving its points is a parameter edit like any
+   * other. `render.test.ts` proves the sweep is audible; this proves the live path
+   * carries it.
+   */
+  it("carries an automation lane on an effect param through to the worklet", async () => {
+    const run = await createSessionRun(loadedProject(EFFECTS_FIXTURE));
+    const configure = configures(run.posted)[0];
+    if (configure?.type !== "configure") throw new Error("expected a configure command");
+    expect(configure.tracks[1]?.automation.map((lane) => lane.param)).toEqual(["fx.tone.cutoff"]);
+
+    run.session.start();
+    renderLive(run, 100 * CONTROL_BLOCK_SIZE, { tickEveryBlocks: 4 });
+
+    const edited = structuredClone(loadedProject(EFFECTS_FIXTURE));
+    const lane = edited.automation.get("bass")?.lanes[0];
+    if (lane === undefined) throw new Error("fixture lost its automation lane");
+    lane.points = [
+      [0, 2_000],
+      [7_680, 900],
+      [15_360, 5_000],
+    ];
+    const outcome = await run.session.update(edited, "parameters");
+
+    expect(outcome).toEqual({ effect: "parameters", atSample: null });
+    const params = run.posted.filter((command) => command.type === "params").at(-1);
+    if (params?.type !== "params") throw new Error("expected a params command");
+    expect(params.automation[0]?.param).toBe("fx.tone.cutoff");
+    expect(errors(run.harness.events)).toEqual([]);
+  });
+});
 
 describe("a document edit during playback", () => {
   /**

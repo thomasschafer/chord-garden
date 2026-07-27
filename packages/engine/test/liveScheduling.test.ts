@@ -19,6 +19,7 @@ function scheduleOf(trackStarts: readonly (readonly number[])[], totalSamples: n
       instrumentId: `instrument-${index}`,
       events: starts.map((start) => event(start, 60 + index)),
       automation: [],
+      effects: [],
     })),
   };
 }

@@ -16,6 +16,7 @@ function loadedProject(root: string): Project {
 
 const FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/first-track", import.meta.url));
 const SWUNG = fileURLToPath(new URL("../../../fixtures/valid/swung-hats", import.meta.url));
+const EFFECTS = fileURLToPath(new URL("../../../fixtures/valid/effects-chain", import.meta.url));
 
 interface Difference {
   index: number;
@@ -83,6 +84,38 @@ describe("live and offline equivalence", () => {
         left: [],
       });
       expect(differences(offline.master.right, live.right)).toEqual([]);
+    }
+  });
+
+  /**
+   * Effects are the case most likely to break this claim and least likely to show
+   * it. Every effect here is recursive, so its output at any sample depends on
+   * every sample before it: a chain built at the wrong moment, reset on a slice
+   * boundary, or fed a ramp computed from the wrong block position produces audio
+   * that is still plausible — a slightly different tail — and identical in every
+   * onset, level and event count an analysis would report. Bit equality is the only
+   * test that catches it.
+   */
+  it("renders an effect chain bit-identically, including its tail past the last event", async () => {
+    const project = loadedProject(EFFECTS);
+    for (const lookaheadSamples of [CONTROL_BLOCK_SIZE, 4864, 48_000]) {
+      const run = await createLiveRun(project, { lookaheadSamples });
+      const totalSamples = alignedTail(run.schedule, 48_000, 3);
+      const tailSeconds = (totalSamples - run.schedule.totalSamples) / 48_000;
+      const offline = render(project, { sampleRate: 48_000, seed: 0, tailSeconds });
+
+      run.transport.start();
+      const live = renderLive(run, totalSamples, { tickEveryBlocks: 1 });
+
+      expect({ lookaheadSamples, left: differences(offline.master.left, live.left) }).toEqual({
+        lookaheadSamples,
+        left: [],
+      });
+      expect(differences(offline.master.right, live.right)).toEqual([]);
+      // The tail is the part only the effects can produce, so it has to be
+      // non-silent or this proves nothing about them.
+      expect(peak(live.left.subarray(run.schedule.totalSamples))).toBeGreaterThan(0.0001);
+      expect(peak(live.left)).toBeGreaterThan(0.1);
     }
   });
 

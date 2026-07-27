@@ -19,6 +19,7 @@ import { runCli, type CliIo } from "../src/main.js";
 
 const VALID_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/first-track", import.meta.url));
 const SWUNG_HATS_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/swung-hats", import.meta.url));
+const EFFECTS_FIXTURE = fileURLToPath(new URL("../../../fixtures/valid/effects-chain", import.meta.url));
 const INVALID_FIXTURE = fileURLToPath(new URL("../../../fixtures/invalid/comment", import.meta.url));
 /** The worked example's tempo and grid: 124 bpm, 960 ppqn, 16 steps to the bar. */
 const SAMPLES_PER_TICK = ((60 / 124) / 960) * 48_000;
@@ -362,6 +363,106 @@ describe("render CLI", () => {
   });
 });
 
+/**
+ * What `--analyze` must keep telling the truth about once a track can ring on past
+ * its last event.
+ *
+ * The failure this guards is specific and was measured before it was fixed: with
+ * onsets taken from the wet bus, the effects fixture reported 202 spurious onsets on
+ * a healthy reverb and 8 on a healthy delay, and warned about both. A delay repeat
+ * *is* sound at a position nothing scheduled, so no threshold can separate it from a
+ * doubled clip — the separation has to be which bus the question is asked on.
+ */
+describe("analysis of a track with an effect chain", () => {
+  function analyze(root: string, extra: string[] = []): AnalysisReport {
+    const out = join(root, "out", "master.wav");
+    const result = run(["render", root, "--out", out, "--analyze", "--json", ...extra]);
+    if (result.code !== 0) throw new Error(`render failed: ${result.stderr}`);
+    return JSON.parse(result.stdout) as AnalysisReport;
+  }
+
+  function trackOf(report: AnalysisReport, id: string): TrackAnalysis {
+    const found = report.tracks.find((track) => track.id === id);
+    if (found === undefined) throw new Error(`no analysis for track "${id}"`);
+    return found;
+  }
+
+  it("reports no warnings and no spurious onsets on a healthy chain", () => {
+    const report = analyze(copyEffectsFixture());
+    expect(report.warnings).toEqual([]);
+    for (const track of report.tracks) {
+      expect({ id: track.id, spurious: track.onsets.spurious }).toEqual({ id: track.id, spurious: 0 });
+      expect(track.onsets.matched).toBe(track.onsets.expected);
+      expect(track.silent).toBe(false);
+    }
+  });
+
+  it("names each track's chain and says which bus its onsets came from", () => {
+    const report = analyze(copyEffectsFixture());
+    expect(trackOf(report, "drums").effects).toEqual(["room"]);
+    expect(trackOf(report, "drums").onsetSource).toBe("preEffect");
+    // Chain order, not sorted: it is the signal path.
+    expect(trackOf(report, "bass").effects).toEqual(["tone", "slap"]);
+    expect(trackOf(report, "bass").onsetSource).toBe("preEffect");
+  });
+
+  it("leaves a track with no chain measured on its own audio", () => {
+    const report = analyze(copyFixture());
+    for (const track of report.tracks) {
+      expect({ id: track.id, effects: track.effects, source: track.onsetSource }).toEqual({
+        id: track.id,
+        effects: [],
+        source: "track",
+      });
+    }
+  });
+
+  /**
+   * The exactness claim, and the strongest evidence the fix is right rather than
+   * merely quieter: the same project with its chains removed reports the same onset
+   * numbers, position for position. Adding an effect cannot move an onset, because an
+   * onset is a fact about the source.
+   */
+  it("reports exactly the onsets the same project reports with no effects at all", () => {
+    const withEffects = analyze(copyEffectsFixture());
+    const without = analyze(copyEffectsFixture({ stripEffects: true }));
+    for (const track of withEffects.tracks) {
+      const bare = trackOf(without, track.id);
+      expect({ id: track.id, onsets: track.onsets }).toEqual({ id: track.id, onsets: bare.onsets });
+    }
+    // And the audio really did change, or the comparison above is vacuous.
+    expect(withEffects.master.peak).not.toBe(without.master.peak);
+  });
+
+  it("reports where the music ends, so a level measured over the tail is readable", () => {
+    const report = analyze(copyEffectsFixture());
+    expect(report.musicalSamples).toBeGreaterThan(0);
+    expect(report.musicalSamples).toBeLessThan(report.totalSamples);
+    expect(report.parameters.tail).toMatchObject({
+      musicalSamples: report.musicalSamples,
+      tailSamples: report.totalSamples - report.musicalSamples,
+      levelsIncludeTail: true,
+      onsetsIncludeTail: true,
+    });
+  });
+
+  /**
+   * `--tail` is not raised automatically: the length of a reverb tail is a property
+   * of the DSP, and making the buffer depend on it would mean `--tail 2` sometimes
+   * produced two seconds and sometimes forty. So a cut-off tail is reported as a
+   * measurement instead (PLAN.md §6.3).
+   */
+  it("warns when the tail was still sounding where the render stopped", () => {
+    const report = analyze(copyEffectsFixture(), ["--tail", "0"]);
+    expect(report.warnings.some((warning) => warning.startsWith("Tail truncated:"))).toBe(true);
+  });
+
+  it("does not warn about a tail on a project whose releases fit the default", () => {
+    const report = analyze(copyFixture());
+    expect(report.warnings).toEqual([]);
+  });
+});
+
 function run(args: string[]): { code: number; stdout: string; stderr: string } {
   let stdout = "";
   let stderr = "";
@@ -401,6 +502,28 @@ function setKickSteps(root: string, steps: string): void {
 function copyFixture(): string {
   const root = temporaryDirectory();
   cpSync(VALID_FIXTURE, root, { recursive: true });
+  return root;
+}
+
+/**
+ * The format-2 effects fixture, optionally with every chain removed — which also
+ * takes the project back to format 1, since `effects` is what needs 2, and drops the
+ * automation lane, which targets an effect that would no longer exist.
+ */
+function copyEffectsFixture(options: { stripEffects?: boolean } = {}): string {
+  const root = temporaryDirectory();
+  cpSync(EFFECTS_FIXTURE, root, { recursive: true });
+  if (options.stripEffects !== true) return root;
+  for (const name of readdirSync(join(root, "tracks"))) {
+    const path = join(root, "tracks", name);
+    const track = readJson<Record<string, unknown>>(path);
+    delete track["effects"];
+    writeJson(path, track);
+  }
+  const project = readJson<Record<string, unknown>>(join(root, "project.json"));
+  project["format"] = 1;
+  writeJson(join(root, "project.json"), project);
+  rmSync(join(root, "automation"), { recursive: true, force: true });
   return root;
 }
 

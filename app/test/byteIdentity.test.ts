@@ -381,6 +381,130 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     expect(changed).toEqual([{ before: "        [30720, 4000],", after: "        [30720, 4100]," }]);
   });
 
+  /**
+   * Adding an effect is the first UI edit that touches two files at once, and the
+   * only one that changes `format`. Both halves are asserted line by line: the chain
+   * appears in the track file and nowhere else, and `project.json` gains the version
+   * bump and nothing else.
+   *
+   * The version bump is deliberately not silent. `AGENTS.md` tells agents never to
+   * touch `format`, so a tool doing it on their behalf has to be visible, and one
+   * line in `project.json` in the same write batch as the chain that required it is
+   * what visible looks like.
+   */
+  it("adds an effect chain and bumps format to 2, changing nothing else in either file", async () => {
+    const before = onDisk();
+    expect(before.get("project.json")).toContain('"format": 1');
+
+    store.getState().addEffect("bass", "slap", "delay");
+    await store.getState().flushNow();
+
+    const after = onDisk();
+    expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+    for (const [path, text] of after) {
+      if (path === "tracks/bass.json" || path === "project.json") continue;
+      expect(text, `${path} was rewritten by adding an effect to tracks/bass.json`).toBe(before.get(path));
+    }
+    // The only change to project.json is the version the chain requires.
+    expect(diffLines(before.get("project.json")!, after.get("project.json")!)).toEqual([
+      { before: '  "format": 1,', after: '  "format": 2,' },
+    ]);
+    // The chain is appended with no params: the registry's defaults are said by
+    // their absence, exactly as an instrument's are.
+    expect(after.get("tracks/bass.json")).toBe(
+      `{
+  "id": "bass",
+  "type": "instrument",
+  "instrument": "bass-synth",
+  "patterns": ["bass-main"],
+  "effects": [
+    {
+      "id": "slap",
+      "type": "delay"
+    }
+  ]
+}
+`,
+    );
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+    expect(loadProject(root).ok).toBe(true);
+  });
+
+  it("changes one line of one file for an effect param edit, and nothing else anywhere", async () => {
+    store.getState().addEffect("bass", "slap", "delay");
+    store.getState().setEffectParam("bass", "slap", "mix", 600);
+    await store.getState().flushNow();
+    const before = onDisk();
+
+    store.getState().setEffectParam("bass", "slap", "mix", 450);
+    await store.getState().flushNow();
+
+    const after = onDisk();
+    for (const [path, text] of after) {
+      if (path === "tracks/bass.json") continue;
+      expect(text, `${path} was rewritten by an effect param edit`).toBe(before.get(path));
+    }
+    expect(diffLines(before.get("tracks/bass.json")!, after.get("tracks/bass.json")!)).toEqual([
+      { before: '        "mix": 600', after: '        "mix": 450' },
+    ]);
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+  });
+
+  /**
+   * The claim the whole id-addressing decision exists to make, asserted on bytes:
+   * reordering a chain moves the effects and touches nothing else — no automation
+   * lane is rewritten, because no lane names a position.
+   */
+  it("reorders a chain without rewriting the automation that targets it", async () => {
+    store.getState().addEffect("pad", "tone", "filter");
+    store.getState().addEffect("pad", "room", "reverb");
+    store.getState().addAutomationLane("pad", "fx.tone.cutoff");
+    await store.getState().flushNow();
+    const before = onDisk();
+    expect(before.get("automation/pad.json")).toContain('"fx.tone.cutoff"');
+
+    store.getState().moveEffect("pad", "room", 0);
+    await store.getState().flushNow();
+
+    const after = onDisk();
+    for (const [path, text] of after) {
+      if (path === "tracks/pad.json") continue;
+      expect(text, `${path} was rewritten by reordering tracks/pad.json's chain`).toBe(before.get(path));
+    }
+    // The chain really did move, and the lane still names the same effect.
+    const chain = JSON.parse(after.get("tracks/pad.json")!) as { effects: { id: string }[] };
+    expect(chain.effects.map((effect) => effect.id)).toEqual(["room", "tone"]);
+    expect(after.get("automation/pad.json")).toContain('"fx.tone.cutoff"');
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+    expect(loadProject(root).ok).toBe(true);
+  });
+
+  /**
+   * Removing an effect takes its automation with it, because a lane naming an absent
+   * effect is `ref.missing-effect` — a document the validator rejects is worse than
+   * an edit that visibly removes the lane. Here the lane was the file's only one, so
+   * the file goes.
+   */
+  it("removes an effect and the automation that targeted it, leaving a valid project", async () => {
+    store.getState().addEffect("drums", "room", "reverb");
+    store.getState().addAutomationLane("drums", "fx.room.mix");
+    await store.getState().flushNow();
+    expect(onDisk().has("automation/drums.json")).toBe(true);
+
+    store.getState().removeEffect("drums", "room");
+    await store.getState().flushNow();
+
+    const after = onDisk();
+    expect(after.has("automation/drums.json")).toBe(false);
+    expect(existsSync(join(root, "automation/drums.json"))).toBe(false);
+    expect(after.get("tracks/drums.json")).not.toContain("effects");
+    // `format` is not walked back: nothing requires 2 any more, but a project's
+    // version is not something an edit should quietly lower either.
+    expect(after.get("project.json")).toContain('"format": 2');
+    expect(loadProject(root).ok).toBe(true);
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+  });
+
   it("writes exactly the bytes the store held, with no server-side reformatting", async () => {
     store.getState().setProjectName("Byte for byte");
     const expected = store.getState().canonical.get("project.json");
@@ -444,6 +568,42 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     expect(check.code).toBe(1);
     expect(check.stdout).toContain("would rewrite patterns/drums-verse.json");
     expect(check.stdout).toContain("steps grouping");
+  });
+
+  /**
+   * The effect assertions above are only worth anything if `fmt --check` would
+   * notice a chain written the wrong way. Two ways, in fact, and they are different
+   * failures: a chain whose keys are in the wrong order, and one whose `params` map
+   * is not alphabetical. Both are documents the loader accepts — only `fmt` can
+   * catch either — so without this case the byte comparisons could be passing on a
+   * serializer that does not really own the chain.
+   */
+  it("bites for effects: a chain with the wrong key order or unsorted params is reported", async () => {
+    store.getState().addEffect("bass", "slap", "delay");
+    store.getState().setEffectParam("bass", "slap", "mix", 600);
+    store.getState().setEffectParam("bass", "slap", "time", 250);
+    await store.getState().flushNow();
+    const path = join(root, "tracks/bass.json");
+    const canonical = readFileSync(path, "utf8");
+    // Canonical form is `time` after `mix`, because `params` is an open map and is
+    // sorted alphabetically.
+    expect(canonical.indexOf('"mix"')).toBeLessThan(canonical.indexOf('"time"'));
+
+    const doc = JSON.parse(canonical) as { effects: { id: string; type: string; params: Record<string, number> }[] };
+    // A hand-written chain: `type` before `id`, and params in the order someone
+    // happened to type them.
+    const effect = doc.effects[0]!;
+    const handWritten = {
+      ...doc,
+      effects: [{ type: effect.type, id: effect.id, params: { time: effect.params.time, mix: effect.params.mix } }],
+    };
+    writeFileSync(path, `${JSON.stringify(handWritten, null, 2)}\n`);
+
+    expect(loadProject(root).ok).toBe(true);
+    const check = fmtCheck();
+    expect(check.code).toBe(1);
+    expect(check.stdout).toContain("would rewrite tracks/bass.json");
+    expect(check.stdout).toContain("key order");
   });
 
   it("bites for notes: a note list in the wrong order is reported as a sort-order change", () => {

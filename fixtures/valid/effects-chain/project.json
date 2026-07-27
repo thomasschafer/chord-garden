@@ -1,0 +1,24 @@
+{
+  "format": 2,
+  "name": "effects chain",
+  "description": "One project per effect type, plus an automated effect param.",
+  "ppqn": 960,
+  "tempoMap": [
+    {
+      "startTick": 0,
+      "bpm": 12000
+    }
+  ],
+  "meterMap": [
+    {
+      "startTick": 0,
+      "timeSignature": [4, 4]
+    }
+  ],
+  "key": {
+    "root": "A",
+    "scale": "minor"
+  },
+  "swing": 0,
+  "trackOrder": ["drums", "bass"]
+}

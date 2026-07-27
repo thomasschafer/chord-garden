@@ -1,4 +1,4 @@
-import type { InstrumentDoc } from "@chord-garden/format";
+import type { EffectDoc, InstrumentDoc } from "@chord-garden/format";
 import type { CompiledAutomationLane, CompiledSchedule } from "../compiler.js";
 import { CONTROL_BLOCK_SIZE } from "../dsp/index.js";
 import type { LiveGraph } from "./configure.js";
@@ -209,10 +209,11 @@ export class LiveTransport {
   sendParams(
     trackIndex: number,
     instrument: InstrumentDoc,
+    effects: EffectDoc[],
     automation: CompiledAutomationLane[],
     generation = this.scheduler.generation,
   ): void {
-    this.sink.postMessage({ type: "params", generation, trackIndex, instrument, automation });
+    this.sink.postMessage({ type: "params", generation, trackIndex, instrument, effects, automation });
   }
 
   /**
@@ -233,11 +234,16 @@ export class LiveTransport {
    */
   applyParameterChange(
     schedule: CompiledSchedule,
-    updates: readonly { trackIndex: number; instrument: InstrumentDoc; automation: CompiledAutomationLane[] }[],
+    updates: readonly {
+      trackIndex: number;
+      instrument: InstrumentDoc;
+      effects: EffectDoc[];
+      automation: CompiledAutomationLane[];
+    }[],
   ): void {
     const generation = this.scheduler.updateParameters(schedule);
     for (const update of updates) {
-      this.sendParams(update.trackIndex, update.instrument, update.automation, generation);
+      this.sendParams(update.trackIndex, update.instrument, update.effects, update.automation, generation);
     }
   }
 }

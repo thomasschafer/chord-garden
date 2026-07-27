@@ -1,0 +1,15 @@
+{
+  "track": "t",
+  "lanes": [
+    {
+      "param": "fx.slop.mix",
+      "interp": "linear",
+      "points": [
+        [
+          0,
+          400
+        ]
+      ]
+    }
+  ]
+}

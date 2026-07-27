@@ -1,0 +1,16 @@
+{
+  "id": "t",
+  "type": "instrument",
+  "instrument": "s",
+  "patterns": [],
+  "effects": [
+    {
+      "id": "room",
+      "type": "reverb"
+    },
+    {
+      "id": "room",
+      "type": "delay"
+    }
+  ]
+}

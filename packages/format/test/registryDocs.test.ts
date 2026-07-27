@@ -5,6 +5,7 @@ import {
   BASIC_MONO_PARAMS,
   BASIC_POLY_PARAMS,
   DRUMKIT_VOICE_PARAMS,
+  EFFECT_PARAMS,
   PARAM_UNIT_LABELS,
   type ParamSpec,
 } from "../src/registry.js";
@@ -54,6 +55,14 @@ function registryEntries(): { key: string; spec: ParamSpec }[] {
   const merged: [string, ParamSpec][] = [
     ...Object.entries({ ...BASIC_MONO_PARAMS, ...BASIC_POLY_PARAMS }),
     ...Object.entries(DRUMKIT_VOICE_PARAMS).map(([param, spec]): [string, ParamSpec] => [`<voice>.${param}`, spec]),
+    // Effect params are keyed `fx.<type>.<param>` here because that is how the docs
+    // head their tables; the automation key an author writes is `fx.<id>.<param>`,
+    // where the id is the author's, not the type. Both halves of this lock must
+    // move together: adding a row here without the doc table, or the reverse, is
+    // exactly the drift this test exists to catch.
+    ...Object.entries(EFFECT_PARAMS).flatMap(([type, table]) =>
+      Object.entries(table).map(([param, spec]): [string, ParamSpec] => [`fx.${type}.${param}`, spec]),
+    ),
   ];
   return merged.map(([key, spec]) => ({ key, spec }));
 }
@@ -104,17 +113,39 @@ function plain(cell: string): string {
   return cell.replaceAll("`", "").replaceAll("−", "-").trim();
 }
 
-/** Markdown rows whose first cell is a backticked param name. */
+/**
+ * Markdown rows whose first cell is a backticked param name.
+ *
+ * Effect tables are scoped by the bold effect type that introduces them, so a
+ * row reads `damping` in the docs where a musician wants to see it, while the
+ * key compared against the registry is `fx.reverb.damping`. Without that, delay and
+ * reverb both documenting a `damping` would read as one param documented twice —
+ * and keying by the bare name would silently let each check the other's spec. Any
+ * heading ends a scope, so an instrument table after an effects section is never
+ * attributed to an effect.
+ */
 function parseParamRows(markdown: string): Map<string, DocumentedParam> {
   const rows = new Map<string, DocumentedParam>();
+  const EFFECT_HEADING = /^\*\*(delay|reverb|filter)\*\*/;
+  let scope: string | undefined;
   for (const line of markdown.split("\n")) {
+    if (line.startsWith("#")) {
+      scope = undefined;
+      continue;
+    }
+    const heading = EFFECT_HEADING.exec(line);
+    if (heading !== null) {
+      scope = heading[1];
+      continue;
+    }
     if (!line.startsWith("| `")) continue;
     const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
     if (cells.length !== 5) continue;
     const [name, unit, range, defaultValue, automatable] = cells;
     if (name === undefined || unit === undefined || range === undefined) continue;
     if (defaultValue === undefined || automatable === undefined) continue;
-    const key = plain(name);
+    const bare = plain(name);
+    const key = scope === undefined ? bare : `fx.${scope}.${bare}`;
     if (rows.has(key)) throw new Error(`param "${key}" is documented by more than one table row`);
     rows.set(key, { unit, range, default: defaultValue, automatable });
   }

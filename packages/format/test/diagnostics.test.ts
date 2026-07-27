@@ -15,6 +15,7 @@ const INVALID_ROOT = fileURLToPath(new URL("../../../fixtures/invalid", import.m
 const EXPECTED: Record<string, string> = {
   "absolute-sample-path": "sample.path-invalid",
   "accent-x": "pattern.accent-unsupported",
+  "bad-effect-param": "registry.unknown-param",
   "bad-engine-param": "registry.unknown-param",
   "bad-id": "schema.pattern",
   "bad-step-events": "pattern.step-event-not-a-hit",
@@ -22,20 +23,27 @@ const EXPECTED: Record<string, string> = {
   "dangling-sample": "sample.missing",
   "dotdot-sample-path": "sample.path-invalid",
   "duplicate-automation-lane": "automation.duplicate-lane",
+  "duplicate-effect-id": "effect.duplicate-id",
   "duplicate-key": "json.duplicate-key",
   "float-param": "number.float",
   "float-tempo": "number.float",
-  "format-2": "project.format-unsupported",
+  "format-1-effects": "format.effects-require-2",
+  // Named for its purpose rather than for a version number: it holds one *past*
+  // `SUPPORTED_FORMAT`, so bumping the format moves the fixture's contents and a
+  // name like `format-2` would end up describing a version the tool now reads.
+  "format-newer": "project.format-unsupported",
   "id-file-mismatch": "id.file-mismatch",
   "malformed-pattern-string": "pattern.invalid-char",
   "missing-reference": "ref.missing-instrument",
   "mixed-pattern": "schema.unevaluatedProperties",
+  "non-automatable-effect-param": "automation.param-not-automatable",
   "non-automatable-param": "automation.param-not-automatable",
   "not-wav-sample": "sample.not-wav",
   "pattern-kind-mismatch": "track.pattern-kind-mismatch",
   "tie-marker": "pattern.tie-unsupported",
   "trackorder-duplicate": "trackorder.duplicate",
   "trackorder-unknown": "trackorder.unknown-track",
+  "unknown-effect-automation": "ref.missing-effect",
   "unknown-field": "schema.unevaluatedProperties",
   "wrong-step-count": "pattern.step-count-mismatch",
 };
@@ -65,9 +73,33 @@ describe("invalid fixtures", () => {
     expect(diag?.suggestion).toContain("filter.cutoff");
   });
 
-  it("format-2 reports only the format error, nothing downstream", () => {
-    const result = loadProject(join(INVALID_ROOT, "format-2"));
+  it("a newer format reports only the format error, nothing downstream", () => {
+    const result = loadProject(join(INVALID_ROOT, "format-newer"));
     expect(result.diagnostics.map((d) => d.code)).toEqual(["project.format-unsupported"]);
+  });
+
+  it("bad-effect-param suggests the effect param that was meant", () => {
+    const result = loadProject(join(INVALID_ROOT, "bad-effect-param"));
+    const diag = result.diagnostics.find((d) => d.code === "registry.unknown-param");
+    expect(diag?.suggestion).toContain("feedback");
+    expect(diag?.pointer).toBe("/effects/0/params/feedbak");
+  });
+
+  it("a format-1 project with effects names the version it needs", () => {
+    const result = loadProject(join(INVALID_ROOT, "format-1-effects"));
+    const diag = result.diagnostics.find((d) => d.code === "format.effects-require-2");
+    expect(diag?.file).toBe("tracks/t.json");
+    expect(diag?.pointer).toBe("/effects");
+    expect(diag?.suggestion).toContain('"format" to 2');
+    // The version is the only complaint: reporting the chain's params against a
+    // format that has no chains would be a page of consequences of one mistake.
+    expect(result.diagnostics.map((d) => d.code)).toEqual(["format.effects-require-2"]);
+  });
+
+  it("unknown-effect-automation suggests the effect id that was meant", () => {
+    const result = loadProject(join(INVALID_ROOT, "unknown-effect-automation"));
+    const diag = result.diagnostics.find((d) => d.code === "ref.missing-effect");
+    expect(diag?.suggestion).toContain("slap");
   });
 
   it("oversize samples are rejected", () => {

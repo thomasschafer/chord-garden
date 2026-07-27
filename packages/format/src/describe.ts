@@ -10,6 +10,15 @@ export interface DescribeTrack {
   patterns: string[];
   clipCount: number;
   automatedParams: string[];
+  /**
+   * The effect chain in signal order, present only when the track has one.
+   *
+   * Omitted rather than reported as `[]` so a project with no effects describes
+   * exactly as it did before effects existed — the golden report of a format-1
+   * project is a contract, and an empty array in every track would break it to
+   * say nothing.
+   */
+  effects?: { id: string; type: string }[];
 }
 
 export interface DescribePattern {
@@ -45,7 +54,7 @@ export function describeProject(project: Project): DescribeReport {
 
   const tracks: DescribeTrack[] = project.project.trackOrder.map((id) => {
     const track = project.tracks.get(id)!;
-    return {
+    const described: DescribeTrack = {
       id,
       type: track.type,
       instrument: track.instrument,
@@ -53,6 +62,10 @@ export function describeProject(project: Project): DescribeReport {
       clipCount: project.arrangement.clips.filter((c) => c.track === id).length,
       automatedParams: project.automation.get(id)?.lanes.map((l) => l.param) ?? [],
     };
+    if (track.effects !== undefined && track.effects.length > 0) {
+      described.effects = track.effects.map((effect) => ({ id: effect.id, type: effect.type }));
+    }
+    return described;
   });
 
   const patterns: DescribePattern[] = [...project.patterns.values()]

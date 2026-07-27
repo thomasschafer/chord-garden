@@ -233,6 +233,7 @@ function schedule(expectedStarts: readonly number[]): CompiledSchedule {
           voice: "tick",
         })),
         automation: [],
+        effects: [],
       },
     ],
   };

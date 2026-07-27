@@ -1,0 +1,15 @@
+{
+  "id": "kit-main",
+  "type": "drumkit",
+  "kit": {
+    "hat": {
+      "sample": "samples/hat.wav"
+    },
+    "kick": {
+      "sample": "samples/kick.wav"
+    }
+  },
+  "params": {
+    "hat.gain": -600
+  }
+}

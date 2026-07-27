@@ -290,6 +290,40 @@ Shared subtractive-voice params (both `basic-mono` and `basic-poly`):
 | `<voice>.pitch` | cents | −2400..2400 | 0 | no |
 | `<voice>.chokeGroup` | count | 0..16 | 0 (none) | no |
 
+Track effects (`format` 2 and newer; see §16 Phase 5). A track's `effects` chain is applied in array order after its instrument, and each effect carries its own `id` so automation addresses `fx.<id>.<param>` — three segments, so it cannot collide with a drumkit's two-segment `<voice>.<param>`, and reordering the chain re-targets nothing.
+
+**delay**
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `time` | ms | 1..2000 | 375 | no |
+| `feedback` | permille | 0..950 | 300 | yes |
+| `damping` | permille | 0..1000 | 300 | yes |
+| `mix` | permille | 0..1000 | 250 | yes |
+
+`time` is ms rather than a musical division because every *position* here is ticks while device time constants are already ms (`amp.attack`, `portamento`), and a synced value would be unautomatable by construction and would make the line length a function of tempo — a real problem once tempo ramps arrive, since a moving tap needs a fractional read pointer. It is non-automatable because the tap is an integer offset: sweeping it would step, not glide. `feedback` stops at 950 because unity never decays, and the bound lives in the declared range rather than in a runtime clamp nobody can see.
+
+**reverb**
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `size` | permille | 0..1000 | 500 | yes |
+| `damping` | permille | 0..1000 | 500 | yes |
+| `width` | permille | 0..1000 | 1000 | yes |
+| `mix` | permille | 0..1000 | 200 | yes |
+
+`size` maps to a comb recirculation gain strictly below 1, so stability is a property of the mapping rather than of a limiter. The structure is multiplies and adds only — no transcendentals — which matters because §18 records that JS trig is implementation-defined.
+
+**filter**
+
+| param | unit | range | default | automatable |
+|---|---|---|---|---|
+| `mode` | enum | lowpass, highpass, bandpass | lowpass | no |
+| `cutoff` | Hz | 20..20000 | 1000 | yes |
+| `resonance` | permille | 0..1000 | 100 | yes |
+
+The same biquad and Q mapping the synth voices use, so a track sweep and an instrument sweep cannot sound like two different filters. Named `mode` because an effect already has a `type`.
+
 Registry rules:
 - `automatable: yes` is required for an automation lane to target a param; automation values use the param's unit (a `filter.cutoff` lane stores integer Hz).
 - Per-note / per-step expression fields reuse these units: `velocity` and `probability` are permille; `microTicks` and `gateTicks` are ticks; `ratchet` is a count. Swing is a project/lane-level permille setting (§6), not per-step expression.
@@ -329,7 +363,7 @@ Only the musical document persists to disk:
 | tracks, instruments, patterns | audio buffers, voice allocation |
 | arrangement / timeline | undo/redo stack |
 | automation, per-note expression | current selection |
-| mixer levels, sends, FX params | live solo/mute (debatable — may persist) |
+| mixer levels and effect chains (built) | live solo/mute (debatable — may persist) |
 
 Keeping this boundary clean is what keeps the agent integration sane: the agent edits the document, never the engine.
 
@@ -581,7 +615,7 @@ Mechanism:
 3. **Watcher fires** → coalesce filesystem events for a short settle window (~100 ms) → read changed files → if file hashes/write acknowledgements match the last write batch *we* made, it's our own echo → ignore. Otherwise treat it as an **external edit** (agent or hand-edit).
 4. **External edit v1** → reparse changed files, rebuild affected project indexes, validate project-level invariants, then replace the affected model objects file-by-file. Preserve UI selection and expanded/collapsed state by stable IDs where possible. Do *not* promise minimal semantic patches in v1.
 5. **Later refinement** → compute semantic model-domain patches (`setNote`, `replaceLaneSteps`, `setParamPoint`, `addClip`) only where they clearly improve undo or collaboration. JSON Patch paths are too low-level to be the primary undo/scheduler contract.
-6. **During playback:** the scheduler reads immutable snapshots of the model each lookahead tick. Parameter tweaks can affect the next scheduling window. Structural changes (pattern length, clip add/remove, track routing) are queued to the next bar boundary unless playback is stopped.
+6. **During playback:** the scheduler reads immutable snapshots of the model each lookahead tick. Parameter tweaks can affect the next scheduling window. Structural changes (pattern length, clip add/remove, track routing) are queued to the next bar boundary unless playback is stopped. An *effect param* is a parameter change; an effect's *membership of the chain, or its position in it*, is structural, because what changed is the graph rather than how it sounds.
 
 Concurrency policy (keep simple in v1, document clearly): if the UI has in-flight unsaved edits when an external edit lands on the same file, last-writer-wins with a visible warning and a retained diagnostic that names the file. Real merge/CRDT is a later concern; the per-file split already makes most collisions unlikely.
 
@@ -692,6 +726,7 @@ Every diagnostic is a structured object — the same shape emitted by `validate`
   - **Swap for the next trigger, not for sounding voices.** A voice must capture its buffer at trigger and play out on it, including its length and retirement. Reading the current buffer per sample splices two waveforms mid-voice: a click *and* a wrong playback rate. Deferring the swap to a bar boundary instead would make a sample edit feel broken.
   - **Identify samples by content hash, not by holding their bytes.** This is the one place the document rule in §12 is deliberately inverted: keeping a copy of every sample would put a project's entire audio in the sidecar's heap, and the hash is *already* the end-to-end identity — the engine's cache and the worklet's own check are keyed by it, so a collision serves the stale decode regardless of what the watcher compared. Time is still never an input.
 - **Worklet packaging:** bundle all processors into one AudioWorklet module and register the processor classes from it; keep the worklet's message protocol (schedule slices in, meters/position out) small and typed.
+- **Effects** (delay, reverb, per-track filter) are pure block processors in the same core, so the offline renderer and the worklet run identical code and stay bit-identical including tails — which is the case most likely to diverge and least likely to show it, since a chain reset on a slice boundary yields a slightly different tail and identical onsets, levels and event counts. Every recursive state write is flushed to exact zero below a silence floor: the bug to prevent is not a denormal *performance* cliff, which JS does not have, but a tail that never terminates — and it would become a speed bug in a Rust/WASM port. Feedback and reverb size are bounded by their declared registry ranges rather than by a runtime clamp, so stability is a property of the format rather than of a guard nobody can see.
 - **Future heavy DSP:** Rust→WASM inside the same worklet, behind the same block-processor interface, only if profiling demands it.
 
 ## 15. Local-first now, deployable later
@@ -765,6 +800,8 @@ The overriding constraint: **no human reviews the implementation.** The maintain
 - **Live/render divergence.** If live playback and offline render ever use different engines, "sounded great in the render, wrong in the app" becomes undebuggable. One DSP core, one event compiler, and a schedule-equivalence test are the guard.
 - **Cross-language number divergence.** Canonical files contain no floats — every quantity is an integer in a registry unit (§6/§6.2), including tempo as bpm×100 — so byte-identical output across TS and any future Rust serializer reduces to integer printing. A cross-implementation golden test must assert byte-identical serialization of the fixtures, and any future float parameter must ship with a defined canonical precision before it is allowed in.
 - **Audio golden-test brittleness.** JS transcendental functions are implementation-defined (§14). Assert exactly on compiled event schedules; assert with tolerances on analysis metrics; only assert on WAV bytes once the DSP core uses its own deterministic math.
+- **An LTI cascade commutes, so a static effect chain's order reaches nothing but rounding.** *(Learned while adding effects, from a test that was passing on noise.)* Delay, reverb and filter are each linear and time-invariant while their params hold still, and reversing such a cascade changed the output by 1.9e-6 of peak — float32 error. So a test that compares *two orderings* and asserts they differ passes with the chain applied backwards. Pin the direction against a cascade computed by hand instead, and assert the commutation fact separately so nobody later reads it as a bug. Under automation the filter is no longer time-invariant and the same reversal differs by 382× peak, which is why the order is still `structural` and still worth getting right.
+- **Ask onset questions of the source bus, not the audible one.** A delay's repeats and a reverb's tail are deliberate sound at positions nothing scheduled, so "does the audio match the schedule?" asked of the wet signal reports a healthy reverb as hundreds of spurious onsets — the §13 false positive that trains agents to ignore warnings. Measure onsets pre-effect and levels post-effect: an onset question is about the source, a level question is about the output. The invariant to hold onto is that adding an effect cannot move an onset, which is checkable by stripping the chains and comparing position for position.
 - **Comments do not exist in this format.** Strict JSON: a `//` in a hand-edited file is a parse error with a diagnostic pointing at `description`/`notes` fields. `AGENTS.md` must state this loudly.
 - **Schema tooling can lie by omission.** Test Ajv 2020-12 mode and any TS type generator against the actual schema features before trusting them.
 - **Scheduler, DSP & sync correctness without review.** The classic LLM failure mode ("compiles, sounds nearly right, glitches under load") is countered by determinism and tests, not by eyeballs: schedule golden tests, analysis assertions, live/offline equivalence, and the §16 watcher race suite (echoes, external edits, delete/recreate, invalid intermediates, multi-file batches). Sync and echo-detection bugs (infinite loops, lost edits) live or die by that race suite.

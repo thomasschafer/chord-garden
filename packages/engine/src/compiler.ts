@@ -5,9 +5,10 @@ import {
   EXPRESSION_FIELDS,
   parseSteps,
   pitchToMidi,
-  resolveParam,
+  resolveTrackParam,
   ticksPerBar,
   type AutomationLane,
+  type EffectDoc,
   type GridPatternDoc,
   type InstrumentDoc,
   type NotesPatternDoc,
@@ -51,6 +52,16 @@ export interface CompiledTrack {
   /** Sorted by startSample, then midi. */
   events: CompiledNoteEvent[];
   automation: CompiledAutomationLane[];
+  /**
+   * The track's effect chain in signal order, exactly as the document holds it.
+   *
+   * The documents cross the boundary rather than pre-resolved DSP numbers, for the
+   * same reason `LiveTrackConfig` carries the instrument document: both the
+   * renderer and the worklet then derive their settings with the one
+   * `effectChainSpecs`, and a second reading of a registry param is the divergence
+   * the one-DSP-core rule exists to prevent. Empty for a track with no chain.
+   */
+  effects: EffectDoc[];
 }
 
 export interface CompiledSchedule {
@@ -297,6 +308,7 @@ function compileTrack(context: CompileContext, trackId: string): CompiledTrack {
     instrumentId: instrument.id,
     events,
     automation: compileAutomation(context, track, instrument),
+    effects: track.effects ?? [],
   };
 }
 
@@ -494,7 +506,9 @@ function compileAutomation(
     throw new Error(`cannot compile automation for track "${track.id}": document targets "${automation.track}"`);
   }
   return automation.lanes.map((lane) => {
-    const resolved = resolveParam(instrument, lane.param);
+    // Resolved against the track, so a lane may target `fx.<id>.<param>` on the
+    // track's own chain as well as an instrument param.
+    const resolved = resolveTrackParam(instrument, track.effects, lane.param);
     if (resolved === undefined) {
       throw new Error(`cannot compile automation for track "${track.id}": param "${lane.param}" does not exist`);
     }

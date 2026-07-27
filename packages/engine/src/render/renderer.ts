@@ -41,9 +41,34 @@ export interface RenderedAudio {
    * precision in this map's iteration order, which is how the mix itself is
    * summed (see `DrumkitProcessor`). Summed in float64 instead they agree to
    * within float32 rounding rather than exactly.
+   *
+   * With an effect chain on the track that identity holds against the track's
+   * `dry` buffer rather than its stem: the chain is one insert across the summed
+   * kit, so no voice owns a share of a delay repeat. A kit voice cannot be given
+   * its own chain — effects are per track, by design.
    */
   voices?: Map<string, Map<string, StereoAudio>>;
+  /**
+   * Each effected track's audio before its effect chain, present exactly when
+   * `stems` are and only for tracks that have a chain.
+   *
+   * Analysis needs it: "did this note sound where it was scheduled" and "is there
+   * sound nothing scheduled" are questions about the source, and a delay's repeats
+   * are deliberate sound at unscheduled positions. Measuring onsets on the wet bus
+   * would report a healthy delay as `spurious` and a reverb bed as a missed onset
+   * — both false positives of the kind PLAN.md §13 forbids.
+   */
+  dry?: Map<string, StereoAudio>;
   totalSamples: number;
+  /**
+   * Samples of *music*, before the release/effect tail — i.e. the compiled
+   * schedule's length. `totalSamples` includes `tailSeconds` on top of it.
+   *
+   * Reported because with an effect chain the tail is no longer reliably silent,
+   * so a consumer measuring levels needs to be able to say which window it
+   * measured over.
+   */
+  musicalSamples: number;
 }
 
 export const DEFAULT_RENDER_OPTIONS: Readonly<RenderOptions> = {
@@ -63,7 +88,11 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
   const totalSamples = schedule.totalSamples + Math.round(resolved.tailSeconds * resolved.sampleRate);
   const master = emptyStereo(totalSamples);
   const isolated = resolved.stems
-    ? { stems: new Map<string, StereoAudio>(), voices: new Map<string, Map<string, StereoAudio>>() }
+    ? {
+        stems: new Map<string, StereoAudio>(),
+        voices: new Map<string, Map<string, StereoAudio>>(),
+        dry: new Map<string, StereoAudio>(),
+      }
     : undefined;
   const resolveSample = fileSampleResolver(project);
 
@@ -74,7 +103,19 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
       isolated === undefined || instrument.type !== "drumkit"
         ? undefined
         : new Map(Object.keys(instrument.kit).map((voice) => [voice, emptyStereo(totalSamples)] as const));
-    const runner = createTrackRunner(compiledTrack, instrument, resolved.sampleRate, resolveSample, trackVoices);
+    // Allocated only for a track that actually has a chain: for every other track
+    // the dry bus *is* the stem, so a second copy of it would be pure memory (see
+    // PLAN.md §18 on per-voice buffers, the same trade one level down).
+    const dry =
+      isolated === undefined || compiledTrack.effects.length === 0 ? undefined : emptyStereo(totalSamples);
+    const runner = createTrackRunner(
+      compiledTrack,
+      instrument,
+      resolved.sampleRate,
+      resolveSample,
+      trackVoices,
+      dry,
+    );
     runner.enqueue(compiledTrack.events);
 
     const stem = emptyStereo(totalSamples);
@@ -91,6 +132,7 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
     if (isolated !== undefined) {
       isolated.stems.set(compiledTrack.trackId, stem);
       if (trackVoices !== undefined) isolated.voices.set(compiledTrack.trackId, trackVoices);
+      if (dry !== undefined) isolated.dry.set(compiledTrack.trackId, dry);
     }
     // The float master deliberately remains unclipped so later analysis can
     // detect overloads. Integer WAV quantisation is where clamping occurs.
@@ -100,9 +142,10 @@ export function render(project: Project, options: Partial<RenderOptions> = {}): 
     }
   }
 
+  const musicalSamples = schedule.totalSamples;
   return isolated === undefined
-    ? { sampleRate: resolved.sampleRate, master, totalSamples }
-    : { sampleRate: resolved.sampleRate, master, ...isolated, totalSamples };
+    ? { sampleRate: resolved.sampleRate, master, totalSamples, musicalSamples }
+    : { sampleRate: resolved.sampleRate, master, ...isolated, totalSamples, musicalSamples };
 }
 
 /**

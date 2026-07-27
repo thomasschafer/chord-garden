@@ -1,8 +1,8 @@
 import {
-  automatableParams,
+  automatableTrackParams,
   describeParamRange,
-  resolveParam,
-  staticParamValue,
+  resolveTrackParam,
+  staticTrackParamValue,
   ticksPerBar,
   type AutomationInterp,
   type AutomationLane,
@@ -35,9 +35,9 @@ import { useDragState } from "./useDragState";
  * Three decisions shape this file.
  *
  * **The registry decides what can be automated, and nothing here has an opinion.**
- * The param picker is `automatableParams(instrument)`, the vertical axis is that
+ * The param picker is `automatableTrackParams(instrument, effects)`, the vertical axis is that
  * param's own `min`/`max`, the unit beside every box is `describeParamRange`, and
- * a new lane starts at `staticParamValue` — the value the instrument already
+ * a new lane starts at `staticTrackParamValue` — the value the track already
  * produces. No param name, range, unit or default is written down in this file.
  * Add a param to `packages/format/src/registry.ts` with `automatable: true` and
  * it appears here with the right axis and the right unit, with nothing in the UI
@@ -103,7 +103,11 @@ function TrackAutomation({
 
   const lanes = project.automation.get(trackId)?.lanes ?? [];
   const used = new Set(lanes.map((lane) => lane.param));
-  const available = automatableParams(instrument).filter((param) => !used.has(param.key));
+  // Resolved against the track: its effect chain's automatable params appear here
+  // beside the instrument's, keyed as `fx.<id>.<param>`, with no list of names in
+  // this file.
+  const effects = project.tracks.get(trackId)?.effects;
+  const available = automatableTrackParams(instrument, effects).filter((param) => !used.has(param.key));
   const [chosen, setChosen] = useState<string | undefined>(undefined);
   const target = chosen !== undefined && available.some((param) => param.key === chosen) ? chosen : available[0]?.key;
 
@@ -214,13 +218,15 @@ function LaneEditor({
   const [selected, setSelected] = useState<number | undefined>(undefined);
   const { shown: drag, ref: dragRef, set: setDrag } = useDragState<PointDrag>();
 
-  const resolved = resolveParam(instrument, lane.param);
+  const effects = project.tracks.get(trackId)?.effects;
+  const resolved = resolveTrackParam(instrument, effects, lane.param);
   if (resolved === undefined) {
-    // A document `validate` reports as `registry.unknown-param`. Shown rather
-    // than skipped: a lane nothing draws is a lane nobody can delete.
+    // A document `validate` reports as `registry.unknown-param` or
+    // `ref.missing-effect`. Shown rather than skipped: a lane nothing draws is a
+    // lane nobody can delete.
     return (
       <p className="error">
-        lane &quot;{lane.param}&quot; targets a param instrument &quot;{instrument.id}&quot; does not have
+        lane &quot;{lane.param}&quot; targets a param track &quot;{trackId}&quot; does not have
       </p>
     );
   }
@@ -228,7 +234,7 @@ function LaneEditor({
   const geometry: AutomationGeometry = { pxPerTick, height: LANE_HEIGHT, ...bounds };
   const lengthTicks = project.arrangement.lengthTicks;
   const width = tickToX(lengthTicks, geometry);
-  const fallback = staticParamValue(instrument, lane.param) ?? bounds.min;
+  const fallback = staticTrackParamValue(instrument, effects, lane.param) ?? bounds.min;
 
   // What is on screen right now: the document, with the point being dragged
   // moved. Kept out of the document so a drag is one edit at the end rather than

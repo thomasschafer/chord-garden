@@ -20,7 +20,8 @@ const KEY_ORDER: Record<string, readonly string[]> = {
   "project.tempoMap[]": ["startTick", "bpm"],
   "project.meterMap[]": ["startTick", "timeSignature"],
   "project.key": ["root", "scale"],
-  track: ["id", "description", "type", "instrument", "patterns"],
+  track: ["id", "description", "type", "instrument", "patterns", "effects"],
+  "track.effects[]": ["id", "description", "type", "params"],
   "instrument.synth": ["id", "description", "type", "engine", "params"],
   "instrument.drumkit": ["id", "description", "type", "kit", "params"],
   "instrument.drumkit.kit[*]": ["sample"],
@@ -42,6 +43,7 @@ const MAP_CONTEXTS = new Set([
   "instrument.synth.params",
   "instrument.drumkit.kit",
   "instrument.drumkit.params",
+  "track.effects[].params",
 ]);
 
 /**

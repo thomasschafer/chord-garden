@@ -330,7 +330,7 @@ export class LiveSession {
         if (instrument === undefined) {
           throw new Error(`cannot apply a parameter change: instrument "${track.instrumentId}" is missing`);
         }
-        return { trackIndex, instrument, automation: track.automation };
+        return { trackIndex, instrument, effects: track.effects, automation: track.automation };
       }),
     );
     return { effect, atSample: null };

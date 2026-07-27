@@ -1,0 +1,17 @@
+{
+  "lengthTicks": 15360,
+  "clips": [
+    {
+      "track": "bass",
+      "pattern": "bassline",
+      "startTick": 0,
+      "repeatCount": 2
+    },
+    {
+      "track": "drums",
+      "pattern": "beat",
+      "startTick": 0,
+      "repeatCount": 4
+    }
+  ]
+}

@@ -14,7 +14,7 @@
         "properties": {
           "param": {
             "type": "string",
-            "pattern": "^[a-zA-Z][a-zA-Z0-9]*(\\.[a-zA-Z][a-zA-Z0-9]*)*$"
+            "pattern": "^[a-zA-Z][a-zA-Z0-9-]*(\\.[a-zA-Z][a-zA-Z0-9-]*)*$"
           },
           "interp": { "enum": ["linear", "step"] },
           "points": {

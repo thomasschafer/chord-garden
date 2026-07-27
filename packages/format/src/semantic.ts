@@ -1,12 +1,22 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { DiagnosticCollector, Loc, Severity } from "./diagnostics.js";
+import { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
 import type { LoadedFile } from "./loadProject.js";
 import type { GridPatternDoc, InstrumentDoc, NotesPatternDoc, Project, TrackDoc } from "./model.js";
 import { ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
 import { pitchToMidi } from "./pitch.js";
-import { checkParamValue, resolveParam, validParamKeys } from "./registry.js";
+import {
+  checkParamValue,
+  parseEffectParamKey,
+  resolveEffectParam,
+  resolveParam,
+  resolveTrackParam,
+  validEffectParamKeys,
+  validParamKeys,
+  validTrackParamKeys,
+} from "./registry.js";
 import { sampleReferences } from "./samples.js";
 import { closestMatch } from "./util.js";
 import { checkWavHeader } from "./wav.js";
@@ -47,6 +57,7 @@ export function semanticValidate(
 
   for (const track of project.tracks.values()) {
     const file = trackFileOf(track.id);
+    checkEffects(project, track, file, report);
     const instrument = project.instruments.get(track.instrument);
     referencedInstruments.add(track.instrument);
     if (instrument === undefined) {
@@ -316,6 +327,77 @@ function checkNotesPattern(pattern: NotesPatternDoc, file: string, report: Repor
   });
 }
 
+/**
+ * A track's effect chain: the version gate, id uniqueness, and every param.
+ *
+ * Ids must be unique *within the chain* and nowhere wider, because `fx.<id>` is
+ * resolved against one track's chain. That is the whole reason the chain is
+ * addressed by id at all: two tracks may both have a `room`, and reordering
+ * either one re-targets nothing.
+ */
+function checkEffects(project: Project, track: TrackDoc, file: string, report: Report): void {
+  const effects = track.effects;
+  if (effects === undefined) return;
+  if (project.project.format < EFFECTS_MIN_FORMAT) {
+    report(
+      "error",
+      "format.effects-require-2",
+      file,
+      "/effects",
+      `track "${track.id}" has an effects chain, which requires project.json "format": ${EFFECTS_MIN_FORMAT}, but this project declares format ${project.project.format}`,
+      `set "format" to ${EFFECTS_MIN_FORMAT} in project.json, or remove the "effects" chain`,
+    );
+    // Reporting each effect's params against a version that does not have
+    // effects would be a page of consequences of one mistake.
+    return;
+  }
+
+  const seen = new Set<string>();
+  effects.forEach((effect, index) => {
+    const pointer = `/effects/${index}`;
+    if (seen.has(effect.id)) {
+      report(
+        "error",
+        "effect.duplicate-id",
+        file,
+        `${pointer}/id`,
+        `track "${track.id}" has more than one effect with id "${effect.id}"; automation addresses an effect by id, so ids must be unique within a chain`,
+      );
+    }
+    seen.add(effect.id);
+
+    for (const [param, value] of Object.entries(effect.params ?? {})) {
+      const paramPointer = `${pointer}/params/${escapeSegment(param)}`;
+      const spec = resolveEffectParam(effect.type, param);
+      if (spec === undefined) {
+        report(
+          "error",
+          "registry.unknown-param",
+          file,
+          paramPointer,
+          `unknown param "${param}" for a "${effect.type}" effect`,
+          didYouMean(param, validEffectParamKeys(effect.type)),
+        );
+        continue;
+      }
+      const problem = checkParamValue(spec, value);
+      if (problem !== undefined) {
+        report(
+          "error",
+          "registry.invalid-value",
+          file,
+          paramPointer,
+          `param "${param}" of effect "${effect.id}" value ${JSON.stringify(value)} is invalid: ${problem} (unit: ${spec.unit})`,
+        );
+      }
+    }
+  });
+}
+
+function escapeSegment(segment: string): string {
+  return segment.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
 function checkInstrumentParams(instrument: InstrumentDoc, file: string, report: Report): void {
   const params = instrument.params;
   if (params === undefined) return;
@@ -409,15 +491,31 @@ function checkAutomation(project: Project, report: Report): void {
       }
       seenParams.add(lane.param);
 
-      const resolved = resolveParam(instrument, lane.param);
+      // Resolved against the track, not just its instrument: a lane may target an
+      // effect param as `fx.<id>.<param>`, and the chain is the track's.
+      const resolved = resolveTrackParam(instrument, track.effects, lane.param);
       if (resolved === undefined) {
+        const parsed = parseEffectParamKey(lane.param);
+        const unknownEffect =
+          parsed !== undefined && !(track.effects ?? []).some((effect) => effect.id === parsed.effectId);
+        if (unknownEffect) {
+          report(
+            "error",
+            "ref.missing-effect",
+            file,
+            `${lanePointer}/param`,
+            `automation targets effect "${parsed.effectId}" but track "${track.id}" has no effect with that id`,
+            didYouMean(parsed.effectId, (track.effects ?? []).map((effect) => effect.id)),
+          );
+          return;
+        }
         report(
           "error",
           "registry.unknown-param",
           file,
           `${lanePointer}/param`,
           `unknown param "${lane.param}" for ${describeEngine(instrument)} on track "${track.id}"`,
-          didYouMean(lane.param, validParamKeys(instrument)),
+          didYouMean(lane.param, validTrackParamKeys(instrument, track.effects)),
         );
         return;
       }

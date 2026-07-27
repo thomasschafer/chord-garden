@@ -28,21 +28,38 @@ export { formatSteps, parseSteps, type StepsContext, type StepsParseResult } fro
 export {
   BASIC_MONO_PARAMS,
   BASIC_POLY_PARAMS,
+  DELAY_PARAMS,
   DRUMKIT_VOICE_PARAMS,
+  EFFECT_PARAMS,
+  EFFECT_PARAM_PREFIX,
+  EFFECT_TYPES,
+  FILTER_EFFECT_PARAMS,
   PARAM_UNIT_LABELS,
+  REVERB_PARAMS,
   automatableParams,
+  automatableTrackParams,
   checkParamValue,
   describeParamRange,
+  effectParamKey,
+  effectParams,
+  effectiveEffectParamValue,
   effectiveParamValue,
   instrumentParams,
+  parseEffectParamKey,
+  resolveEffectParam,
   resolveParam,
+  resolveTrackParam,
   staticParamValue,
+  staticTrackParamValue,
+  validEffectParamKeys,
   validParamKeys,
+  validTrackParamKeys,
   type AutomatableParam,
   type InstrumentParam,
   type ParamSpec,
   type ParamUnit,
   type ResolvedParam,
+  type ResolvedTrackParam,
 } from "./registry.js";
 export { loadSchema, schemaValidate } from "./schema.js";
 export { serializeCanonical, type DocKind } from "./serialize.js";
@@ -53,6 +70,7 @@ export { assembleProject, type AssembledFile } from "./assemble.js";
 export { canonicalFiles } from "./canonical.js";
 export { docKindFromHint, docKindHintForPath, type DocKindHint } from "./docKind.js";
 export { describeProject, type DescribePattern, type DescribeReport, type DescribeTrack } from "./describe.js";
+export { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
 export { checkWavHeader, type WavCheckResult } from "./wav.js";
 export { referencedSamplePaths, sampleReferences, type SampleReference } from "./samples.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";

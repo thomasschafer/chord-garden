@@ -48,6 +48,12 @@ export const EXPECTED_POSITIONS_LIMIT = 256;
 export const GRID_POSITIONS_LIMIT = 256;
 export const SPURIOUS_WARNING_MINIMUM_COUNT = 8;
 export const SPURIOUS_WARNING_EXPECTED_RATIO = 0.25;
+/**
+ * Window at the end of a render checked for a tail that was still sounding when
+ * the buffer ran out. Short on purpose: it asks "had this finished?", and a longer
+ * window would answer "was it quiet lately?" instead.
+ */
+export const TAIL_TRUNCATION_CHECK_MS = 10;
 export const SPECTRAL_BAND_EDGES_HZ = [20, 80, 250, 800, 2_500, 8_000, 20_000] as const;
 
 const FFT_SIZE = 2_048;
@@ -139,6 +145,31 @@ export interface TrackAnalysis extends SignalAnalysis {
   eventCount: number;
   onsets: OnsetAnalysis;
   spectral: SpectralAnalysis;
+  /**
+   * The track's effect chain in signal order, empty when it has none.
+   *
+   * Reported because it is what explains the rest of this object: which bus the
+   * onsets were measured on, why the level may be lower or wider than the
+   * instrument's own, and why sound may continue past the last event.
+   */
+  effects: string[];
+  /**
+   * Which bus `onsets` was measured on.
+   *
+   * `"track"` — the track's audio as it is heard, which is every track without an
+   * effect chain.
+   *
+   * `"preEffect"` — the track's audio *before* its chain. An onset question is a
+   * question about the source: "did this note sound where it was scheduled", and
+   * "is there sound nothing scheduled". A delay's repeats are deliberate sound at
+   * unscheduled positions and a reverb bed raises the floor a later attack has to
+   * rise above, so measuring the wet bus reports a healthy chain as hundreds of
+   * `spurious` onsets and can lose a real attack to `unmatchedExpected` — both
+   * false positives of exactly the kind PLAN.md §13 forbids, and both measured
+   * before this field existed. Levels, clipping and the spectrum stay on the wet
+   * bus, because those are questions about what comes out.
+   */
+  onsetSource: "track" | "preEffect";
   /**
    * Drumkit tracks only, one entry per kit voice in kit order; absent on synth
    * tracks, which have no voices to separate. The voice eventCounts sum to the
@@ -237,6 +268,27 @@ export interface AnalysisParameters {
   musicalGrid: {
     positionsLimit: number;
   };
+  /**
+   * How the rendered buffer divides into music and tail, and which measurements
+   * cover which part of it.
+   *
+   * Before effects the tail was reliably near-silent, so the distinction did not
+   * change a number and was not worth reporting. A reverb tail or a feedback delay
+   * makes it change several: `peak`, `rms`, `silent`, `clipping` and the spectral
+   * summary are all measured over the whole buffer, so they move with `--tail`
+   * rather than describing the music alone. Reporting the boundary is what lets a
+   * consumer say which it is looking at.
+   */
+  tail: {
+    /** Samples of music: the compiled schedule's length. */
+    musicalSamples: number;
+    /** Samples rendered past it, i.e. `--tail`. */
+    tailSamples: number;
+    levelsIncludeTail: true;
+    onsetsIncludeTail: true;
+    /** Window at the very end checked for a tail still sounding when the render stops. */
+    truncationCheckSamples: number;
+  };
 }
 
 export interface AnalysisReport {
@@ -246,6 +298,8 @@ export interface AnalysisReport {
   barRange: { start: number; end: number } | null;
   totalSamples: number;
   durationSeconds: number;
+  /** Samples of music, before the release/effect tail `totalSamples` includes. */
+  musicalSamples: number;
   musicalGrid: MusicalGridAnalysis | null;
   parameters: AnalysisParameters;
   master: SignalAnalysis;
@@ -277,8 +331,13 @@ export function analyzeRender(
   options: AnalyzeOptions,
   /** Per-kit-voice audio from `render`, keyed track then voice; see VoiceAnalysis. */
   voices: ReadonlyMap<string, ReadonlyMap<string, StereoAudio>> = new Map(),
+  /**
+   * Pre-effect audio from `render`, for the tracks that have an effect chain. A
+   * track absent from this map has no chain, so its stem *is* its dry bus.
+   */
+  dry: ReadonlyMap<string, StereoAudio> = new Map(),
 ): AnalysisReport {
-  const parameters = analysisParameters(schedule.sampleRate);
+  const parameters = analysisParameters(schedule.sampleRate, schedule.totalSamples, master.left.length);
   const warnings: string[] = [];
   const masterAnalysis = analyzeSignal(master);
   if (masterAnalysis.clipping.clipped) {
@@ -286,13 +345,21 @@ export function analyzeRender(
       `Master clipping: ${masterAnalysis.clipping.sampleCount} channel samples exceed |${CLIPPING_THRESHOLD}| (first frame ${masterAnalysis.clipping.firstSampleIndex}).`,
     );
   }
+  const truncated = tailStillSounding(master, parameters.tail.truncationCheckSamples);
+  if (truncated !== undefined) {
+    warnings.push(
+      `Tail truncated: the render still measures ${formatMetric(truncated)} in its final ${parameters.tail.truncationCheckSamples} samples, above ${SILENCE_PEAK_THRESHOLD}, so a release or effect tail was cut off. Raise --tail.`,
+    );
+  }
 
   const tracks = schedule.tracks.map((track): TrackAnalysis => {
     const audio = stems.get(track.trackId);
     if (audio === undefined) throw new Error(`cannot analyze: rendered stem for track "${track.trackId}" is missing`);
     const signal = analyzeSignal(audio);
+    // Onsets on the source, levels on the output: see `TrackAnalysis.onsetSource`.
+    const sourceAudio = dry.get(track.trackId) ?? audio;
     const onsets = analyzeOnsets(
-      audio,
+      sourceAudio,
       uniqueSorted(track.events.map((event) => event.startSample)),
       schedule.sampleRate,
       parameters,
@@ -326,6 +393,8 @@ export function analyzeRender(
       ...signal,
       onsets,
       spectral: analyzeSpectrum(audio, schedule.sampleRate),
+      effects: track.effects.map((effect) => effect.id),
+      onsetSource: dry.has(track.trackId) ? "preEffect" : "track",
       ...(voiceAnalyses === undefined ? {} : { voices: voiceAnalyses }),
     };
   });
@@ -337,6 +406,7 @@ export function analyzeRender(
     barRange: options.barRange ?? null,
     totalSamples: master.left.length,
     durationSeconds: master.left.length / schedule.sampleRate,
+    musicalSamples: schedule.totalSamples,
     musicalGrid: options.musicalGrid === undefined ? null : gridAnalysis(options.musicalGrid),
     parameters,
     master: masterAnalysis,
@@ -417,7 +487,11 @@ function gridAnalysis(grid: MusicalGrid): MusicalGridAnalysis {
   };
 }
 
-function analysisParameters(sampleRate: number): AnalysisParameters {
+function analysisParameters(
+  sampleRate: number,
+  musicalSamples: number,
+  renderedSamples: number,
+): AnalysisParameters {
   const hopSamples = millisecondsToSamples(ONSET_HOP_MS, sampleRate);
   const windowSamples = millisecondsToSamples(ONSET_WINDOW_MS, sampleRate);
   const spuriousWindowSamples = millisecondsToSamples(SPURIOUS_ONSET_WINDOW_MS, sampleRate);
@@ -467,7 +541,38 @@ function analysisParameters(sampleRate: number): AnalysisParameters {
     musicalGrid: {
       positionsLimit: GRID_POSITIONS_LIMIT,
     },
+    tail: {
+      musicalSamples,
+      tailSamples: Math.max(0, renderedSamples - musicalSamples),
+      levelsIncludeTail: true,
+      onsetsIncludeTail: true,
+      truncationCheckSamples: millisecondsToSamples(TAIL_TRUNCATION_CHECK_MS, sampleRate),
+    },
   };
+}
+
+/**
+ * The peak of the render's last `checkSamples`, when that is loud enough to mean
+ * the buffer ended mid-tail; undefined when the render faded out properly.
+ *
+ * Reported as a warning rather than fixed by silently extending the buffer. The
+ * length of a reverb tail or a feedback delay is a property of the DSP, and making
+ * the rendered length depend on it would mean `--tail 2` sometimes produced two
+ * seconds and sometimes forty, so the same command would no longer describe its own
+ * output. Surfacing it as a measurement is the §6.3 rule: say what happened, do not
+ * paper over it.
+ *
+ * The gate is the same silence threshold everything else uses, so a release tail
+ * that has fallen below −60 dBFS — which is every project without an effect chain —
+ * does not warn.
+ */
+function tailStillSounding(master: StereoAudio, checkSamples: number): number | undefined {
+  const start = Math.max(0, master.left.length - checkSamples);
+  let peak = 0;
+  for (let sample = start; sample < master.left.length; sample++) {
+    peak = Math.max(peak, Math.abs(master.left[sample]!), Math.abs(master.right[sample]!));
+  }
+  return peak < SILENCE_PEAK_THRESHOLD ? undefined : peak;
 }
 
 function analyzeSignal(audio: StereoAudio): SignalAnalysis {

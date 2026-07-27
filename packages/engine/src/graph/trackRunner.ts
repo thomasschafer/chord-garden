@@ -2,23 +2,32 @@ import type { CompiledAutomationLane, CompiledNoteEvent, CompiledTrack } from ".
 import {
   CONTROL_BLOCK_SIZE,
   DrumkitProcessor,
+  EffectChain,
   createSynthProcessor,
   type DrumHitCommand,
   type DrumVoiceSettings,
   type NoteCommand,
+  type ParamRamps,
   type SampleData,
   type SynthProcessor,
   type SynthSettings,
 } from "../dsp/index.js";
-import type { DrumkitInstrumentDoc, InstrumentDoc, SynthInstrumentDoc } from "@chord-garden/format";
+import type { DrumkitInstrumentDoc, EffectDoc, InstrumentDoc, SynthInstrumentDoc } from "@chord-garden/format";
 import { AutomationRamps } from "./automation.js";
 import { compareNoteCommandOrder, noteCommandRank } from "./commands.js";
+import { effectChainSpecs, effectStaticValues } from "./effectSettings.js";
 import {
   drumkitConfiguration,
   synthAutomationValues,
   synthSettings,
   type SampleResolver,
 } from "./instrumentSettings.js";
+
+/** A pair of planar channel buffers; the shape the runner reads and writes. */
+export interface StereoBuffers {
+  left: Float32Array;
+  right: Float32Array;
+}
 
 /**
  * One track's audio, driven block by block.
@@ -47,12 +56,17 @@ export interface TrackRunner {
   reset(position: number): void;
   activeVoiceCount(): number;
   /**
-   * Adopt new parameter values in place, restarting nothing. Anything the DSP
-   * fixes at construction — the engine, the polyphony, the kit's voices, which
-   * file a voice plays — cannot change this way and throws, because that is a
+   * Adopt new parameter values in place, restarting nothing and clearing no
+   * effect tail. Anything the DSP fixes at construction — the engine, the
+   * polyphony, the kit's voices, which file a voice plays, and the shape of the
+   * effect chain — cannot change this way and throws, because that is a
    * structural change and belongs at a bar boundary (PLAN.md §12 step 6).
    */
-  updateInstrument(instrument: InstrumentDoc, automation: readonly CompiledAutomationLane[]): void;
+  updateSettings(
+    instrument: InstrumentDoc,
+    effects: readonly EffectDoc[],
+    automation: readonly CompiledAutomationLane[],
+  ): void;
   /**
    * Point every voice using `path` at replacement content, for its next trigger
    * onwards (see `SampleStore`, and `DrumkitTrackRunner.replaceSample` for why it
@@ -89,7 +103,32 @@ abstract class BaseTrackRunner<Command> implements TrackRunner {
   protected readonly pool: Command[] = [];
   protected readonly active: Command[] = [];
 
-  constructor(readonly trackId: string) {}
+  /**
+   * The track's inserts, or undefined when it has none — undefined rather than an
+   * empty chain so a project without effects pays nothing at all, neither a call
+   * nor a branch per effect.
+   */
+  protected readonly chain: EffectChain | undefined;
+
+  constructor(
+    readonly trackId: string,
+    effects: readonly EffectDoc[],
+    sampleRate: number,
+    /**
+     * Offline only: a full-length buffer to receive this track's audio *before*
+     * its effect chain.
+     *
+     * `render --analyze` needs it because onset detection is a question about the
+     * source, not about the room it is played in: a delay's repeats are sound at
+     * positions nothing scheduled, and measuring them as unaccounted-for would
+     * report a false `spurious` on a healthy project. The live engine never asks
+     * for it and never allocates it.
+     */
+    private readonly dryOutput?: StereoBuffers,
+  ) {
+    const specs = effectChainSpecs(effects);
+    this.chain = specs.length === 0 ? undefined : new EffectChain(sampleRate, specs);
+  }
 
   enqueue(events: readonly CompiledNoteEvent[]): void {
     for (const event of events) {
@@ -120,7 +159,17 @@ abstract class BaseTrackRunner<Command> implements TrackRunner {
     }
     this.active.length = 0;
     this.collect(blockStart, blockStart + length);
-    this.run(left, right, length, blockStart);
+    // Ramps are computed once here rather than inside each `run`, because the
+    // effect chain needs the same block's ramps: an automation lane on
+    // `fx.<id>.<param>` is one entry in this record beside `filter.cutoff`, which
+    // is what lets an effect param be automated with no new machinery at all.
+    const ramps = this.updateRamps(blockStart, length);
+    this.run(left, right, length, blockStart, ramps);
+    if (this.dryOutput !== undefined) {
+      this.dryOutput.left.set(left.subarray(0, length), blockStart);
+      this.dryOutput.right.set(right.subarray(0, length), blockStart);
+    }
+    this.chain?.processBlock(left, right, length, ramps);
     this.processedThrough = blockStart + length;
     if (this.head >= COMPACT_THRESHOLD) {
       this.pending.copyWithin(0, this.head);
@@ -137,11 +186,22 @@ abstract class BaseTrackRunner<Command> implements TrackRunner {
     this.active.length = 0;
     this.processedThrough = position;
     this.lastEnqueuedSample = -1;
+    // Tails are cut, not left ringing: the transport's position stops advancing or
+    // jumps, so a delay repeat still sounding would be audible at a position the
+    // playhead is no longer at — the same reason `SynthProcessor.reset` drops
+    // releases rather than letting them finish.
+    this.chain?.reset();
     this.onReset();
   }
 
   abstract activeVoiceCount(): number;
-  abstract updateInstrument(instrument: InstrumentDoc, automation: readonly CompiledAutomationLane[]): void;
+  abstract updateSettings(
+    instrument: InstrumentDoc,
+    effects: readonly EffectDoc[],
+    automation: readonly CompiledAutomationLane[],
+  ): void;
+  /** This block's parameter ramps, including any on `fx.<id>.<param>`. */
+  protected abstract updateRamps(blockStart: number, length: number): ParamRamps;
   /** A fresh command object for the pool; called only while the pool grows. */
   protected abstract createCommand(): Command;
 
@@ -150,7 +210,30 @@ abstract class BaseTrackRunner<Command> implements TrackRunner {
   protected abstract onEnqueued(event: CompiledNoteEvent): void;
   protected abstract onReset(): void;
   protected abstract collect(blockStart: number, blockEnd: number): void;
-  protected abstract run(left: Float32Array, right: Float32Array, length: number, blockStart: number): void;
+  protected abstract run(
+    left: Float32Array,
+    right: Float32Array,
+    length: number,
+    blockStart: number,
+    ramps: ParamRamps,
+  ): void;
+
+  /**
+   * Adopt the effect chain's new param values, or refuse a change of shape.
+   *
+   * Separate from the instrument half so both subclasses share it: an effect chain
+   * belongs to the track, and neither the engine nor the kit has an opinion on it.
+   */
+  protected updateChain(effects: readonly EffectDoc[]): void {
+    const specs = effectChainSpecs(effects);
+    if (this.chain === undefined) {
+      if (specs.length === 0) return;
+      throw new Error(
+        `cannot update track "${this.trackId}" in place: an effect chain was added, which is structural`,
+      );
+    }
+    this.chain.updateSettings(specs);
+  }
 
   /**
    * The pooled slot for command `index` of this block; never one already in use,
@@ -188,10 +271,12 @@ export class SynthTrackRunner extends BaseTrackRunner<NoteCommand> {
   private readonly staticValues: Record<string, number>;
   private readonly engine: SynthInstrumentDoc["engine"];
 
-  constructor(track: CompiledTrack, instrument: SynthInstrumentDoc, sampleRate: number) {
-    super(track.trackId);
+  constructor(track: CompiledTrack, instrument: SynthInstrumentDoc, sampleRate: number, dryOutput?: StereoBuffers) {
+    super(track.trackId, track.effects, sampleRate, dryOutput);
     this.settings = synthSettings(instrument);
-    this.staticValues = synthAutomationValues(this.settings);
+    // The instrument's ramped params and the chain's in one record: the DSP asks
+    // for `fx.room.mix` exactly as it asks for `filter.cutoff`.
+    this.staticValues = { ...synthAutomationValues(this.settings), ...effectStaticValues(track.effects) };
     this.engine = instrument.engine;
     this.processor = createSynthProcessor(instrument.engine, sampleRate, this.settings);
     this.ramps = new AutomationRamps(track.automation, this.staticValues);
@@ -201,7 +286,15 @@ export class SynthTrackRunner extends BaseTrackRunner<NoteCommand> {
     return this.processor.activeVoiceCount();
   }
 
-  updateInstrument(instrument: InstrumentDoc, automation: readonly CompiledAutomationLane[]): void {
+  protected updateRamps(blockStart: number, length: number): ParamRamps {
+    return this.ramps.update(blockStart, length);
+  }
+
+  updateSettings(
+    instrument: InstrumentDoc,
+    effects: readonly EffectDoc[],
+    automation: readonly CompiledAutomationLane[],
+  ): void {
     if (instrument.type !== "synth") {
       throw new Error(`cannot update track "${this.trackId}" in place: instrument became a ${instrument.type}`);
     }
@@ -216,10 +309,12 @@ export class SynthTrackRunner extends BaseTrackRunner<NoteCommand> {
         `cannot update track "${this.trackId}" in place: maxVoices went from ${this.settings.maxVoices} to ${next.maxVoices}`,
       );
     }
+    this.updateChain(effects);
     // Envelope segment times are copied by each note-on, so a change to them
     // lands on the next note rather than bending one already sounding.
     Object.assign(this.settings, next);
     Object.assign(this.staticValues, synthAutomationValues(next));
+    Object.assign(this.staticValues, effectStaticValues(effects));
     this.ramps.replaceLanes(automation);
   }
 
@@ -264,8 +359,8 @@ export class SynthTrackRunner extends BaseTrackRunner<NoteCommand> {
     }
   }
 
-  protected run(left: Float32Array, right: Float32Array, length: number, blockStart: number): void {
-    this.processor.processBlock(left, right, length, this.active, this.ramps.update(blockStart, length));
+  protected run(left: Float32Array, right: Float32Array, length: number, _blockStart: number, ramps: ParamRamps): void {
+    this.processor.processBlock(left, right, length, this.active, ramps);
   }
 
   protected createCommand(): NoteCommand {
@@ -324,18 +419,27 @@ export class DrumkitTrackRunner extends BaseTrackRunner<DrumHitCommand> {
     sampleRate: number,
     resolveSample: SampleResolver,
     voiceOutputs?: ReadonlyMap<string, { left: Float32Array; right: Float32Array }>,
+    dryOutput?: StereoBuffers,
   ) {
-    super(track.trackId);
+    super(track.trackId, track.effects, sampleRate, dryOutput);
     const configuration = drumkitConfiguration(instrument, resolveSample);
     this.settings = configuration.settings;
-    this.staticValues = configuration.staticValues;
+    this.staticValues = { ...configuration.staticValues, ...effectStaticValues(track.effects) };
     this.samplePaths = new Map(Object.entries(instrument.kit).map(([voice, kit]) => [voice, kit.sample]));
     this.processor = new DrumkitProcessor(sampleRate, configuration.settings);
-    this.ramps = new AutomationRamps(track.automation, configuration.staticValues);
+    this.ramps = new AutomationRamps(track.automation, this.staticValues);
     this.voiceOutputs = voiceOutputs;
   }
 
-  updateInstrument(instrument: InstrumentDoc, automation: readonly CompiledAutomationLane[]): void {
+  protected updateRamps(blockStart: number, length: number): ParamRamps {
+    return this.ramps.update(blockStart, length);
+  }
+
+  updateSettings(
+    instrument: InstrumentDoc,
+    effects: readonly EffectDoc[],
+    automation: readonly CompiledAutomationLane[],
+  ): void {
     if (instrument.type !== "drumkit") {
       throw new Error(`cannot update track "${this.trackId}" in place: instrument became a ${instrument.type}`);
     }
@@ -353,6 +457,7 @@ export class DrumkitTrackRunner extends BaseTrackRunner<DrumHitCommand> {
         );
       }
     }
+    this.updateChain(effects);
     // Resolving to the sample already in place keeps this free of any loading
     // concern: the paths were just proven identical.
     const next = drumkitConfiguration(instrument, (path) => this.sampleFor(path));
@@ -365,6 +470,7 @@ export class DrumkitTrackRunner extends BaseTrackRunner<DrumHitCommand> {
       before.chokeGroup = after.chokeGroup;
     }
     Object.assign(this.staticValues, next.staticValues);
+    Object.assign(this.staticValues, effectStaticValues(effects));
     this.ramps.replaceLanes(automation);
   }
 
@@ -425,8 +531,7 @@ export class DrumkitTrackRunner extends BaseTrackRunner<DrumHitCommand> {
     }
   }
 
-  protected run(left: Float32Array, right: Float32Array, length: number, blockStart: number): void {
-    const ramps = this.ramps.update(blockStart, length);
+  protected run(left: Float32Array, right: Float32Array, length: number, blockStart: number, ramps: ParamRamps): void {
     if (this.voiceOutputs === undefined) {
       this.processor.processBlock(left, right, length, this.active, ramps);
       return;
@@ -452,7 +557,8 @@ export function createTrackRunner(
   sampleRate: number,
   resolveSample: SampleResolver,
   voiceOutputs?: ReadonlyMap<string, { left: Float32Array; right: Float32Array }>,
+  dryOutput?: StereoBuffers,
 ): TrackRunner {
-  if (instrument.type === "synth") return new SynthTrackRunner(track, instrument, sampleRate);
-  return new DrumkitTrackRunner(track, instrument, sampleRate, resolveSample, voiceOutputs);
+  if (instrument.type === "synth") return new SynthTrackRunner(track, instrument, sampleRate, dryOutput);
+  return new DrumkitTrackRunner(track, instrument, sampleRate, resolveSample, voiceOutputs, dryOutput);
 }

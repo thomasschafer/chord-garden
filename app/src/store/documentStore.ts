@@ -1,20 +1,27 @@
-import { paramEditEffect } from "@chord-garden/engine/params";
+import { effectParamEditEffect, paramEditEffect } from "@chord-garden/engine/params";
 import {
   canonicalFiles,
   checkExpressionValue,
   checkParamValue,
+  EFFECTS_MIN_FORMAT,
   formatSteps,
+  ID_PATTERN,
   HIGHEST_MIDI,
   LOWEST_MIDI,
   NOTE_EXPRESSION_FIELDS,
   parseSteps,
   pitchToMidi,
+  parseEffectParamKey,
+  resolveEffectParam,
   resolveParam,
-  staticParamValue,
+  resolveTrackParam,
+  staticTrackParamValue,
   ticksPerBar,
   type AutomationDoc,
   type AutomationInterp,
   type AutomationLane,
+  type EffectDoc,
+  type EffectType,
   type ExpressionField,
   type GridLane,
   type GridPatternDoc,
@@ -322,6 +329,42 @@ export interface DocumentState {
    * param the DSP fixes at construction makes the whole batch structural.
    */
   setInstrumentParams(instrumentId: string, patch: InstrumentParamPatch): void;
+  /**
+   * Set, change or clear one param of one effect on one track's chain.
+   *
+   * Same rules as an instrument param — `undefined` or the registry default clears
+   * the key, and an effect overriding nothing loses its `params` object — and the
+   * same classification: nothing in an effect is sized by a param value, so every
+   * effect param edit is `parameters` and is heard in the next scheduling window.
+   * The effect is addressed by `effectId`, never by chain position.
+   */
+  setEffectParam(trackId: string, effectId: string, param: string, value: number | string | undefined): void;
+  /**
+   * Append an effect to a track's chain.
+   *
+   * `structural`: a new effect is a new processor, so it needs a new graph and
+   * lands at the next bar boundary. Also the point at which a format-1 project
+   * becomes a format-2 one — see `promoteFormatForEffects`.
+   */
+  addEffect(trackId: string, effectId: string, type: EffectType): void;
+  /**
+   * Remove an effect, and every automation lane that targeted it.
+   *
+   * The lanes go because a lane naming an absent effect is `ref.missing-effect` —
+   * leaving them would write a document `musictool validate` rejects, which is a
+   * worse outcome than an edit that visibly takes the lanes with it.
+   */
+  removeEffect(trackId: string, effectId: string): void;
+  /**
+   * Move an effect to a new index in the chain, changing only the order audio
+   * passes through it.
+   *
+   * `structural`, because the graph's shape changed — and deliberately *not* a
+   * re-targeting: every automation lane still names the same effect afterwards,
+   * because it names it by id. That is the whole reason effects carry ids
+   * (PLAN.md §18: never key on an array position).
+   */
+  moveEffect(trackId: string, effectId: string, toIndex: number): void;
   /**
    * Start automating `param` on `track`, seeded with one point at tick 0 holding
    * the value the instrument already produces — so creating a lane changes
@@ -923,6 +966,88 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         });
       },
 
+      setEffectParam(trackId, effectId, param, value) {
+        const project = get().project;
+        if (project === undefined) throw new Error("no project is open");
+        const effect = chainEffectOf(project, trackId, effectId);
+        const spec = resolveEffectParam(effect.type, param);
+        if (spec === undefined) {
+          throw new Error(`"${param}" is not a param of the "${effect.type}" effect "${effectId}"`);
+        }
+        if (value !== undefined) {
+          const problem = checkParamValue(spec, value);
+          if (problem !== undefined) {
+            throw new Error(`${JSON.stringify(value)} is not a valid "${param}" value: ${problem}`);
+          }
+        }
+        // `effectParamEditEffect` rather than a literal, for the same reason
+        // `setInstrumentParams` asks `paramEditEffect`: the engine owns the answer,
+        // and the worklet refuses a claim it cannot honour.
+        applyEdit(effectParamEditEffect(effect, param), (draft) => {
+          const target = chainEffectOf(draft, trackId, effectId);
+          const params = { ...(target.params ?? {}) };
+          if (value === undefined || value === spec.default) delete params[param];
+          else params[param] = value;
+          if (Object.keys(params).length === 0) delete target.params;
+          else target.params = params;
+        });
+      },
+
+      addEffect(trackId, effectId, type) {
+        if (!ID_PATTERN.test(effectId)) {
+          throw new Error(`"${effectId}" is not a valid id; ids are lowercase kebab-case (${ID_PATTERN.source})`);
+        }
+        applyEdit("structural", (draft) => {
+          const track = draft.tracks.get(trackId);
+          if (track === undefined) throw new Error(`no track "${trackId}"`);
+          const effects = track.effects ?? [];
+          if (effects.some((effect) => effect.id === effectId)) {
+            throw new Error(`track "${trackId}" already has an effect "${effectId}"; ids must be unique in a chain`);
+          }
+          track.effects = [...effects, { id: effectId, type }];
+          promoteFormatForEffects(draft);
+        });
+      },
+
+      removeEffect(trackId, effectId) {
+        applyEdit("structural", (draft) => {
+          const track = draft.tracks.get(trackId);
+          if (track === undefined) throw new Error(`no track "${trackId}"`);
+          const remaining = (track.effects ?? []).filter((effect) => effect.id !== effectId);
+          if (remaining.length === (track.effects ?? []).length) {
+            throw new Error(`track "${trackId}" has no effect "${effectId}"`);
+          }
+          if (remaining.length === 0) delete track.effects;
+          else track.effects = remaining;
+
+          const automation = draft.automation.get(trackId);
+          if (automation === undefined) return;
+          automation.lanes = automation.lanes.filter(
+            (lane) => parseEffectParamKey(lane.param)?.effectId !== effectId,
+          );
+          // An automation document with no lanes is not one the schema accepts, so
+          // the last lane takes the file with it, exactly as `removeAutomationLane`
+          // does.
+          if (automation.lanes.length === 0) draft.automation.delete(trackId);
+        });
+      },
+
+      moveEffect(trackId, effectId, toIndex) {
+        applyEdit("structural", (draft) => {
+          const track = draft.tracks.get(trackId);
+          if (track === undefined) throw new Error(`no track "${trackId}"`);
+          const effects = [...(track.effects ?? [])];
+          const from = effects.findIndex((effect) => effect.id === effectId);
+          if (from < 0) throw new Error(`track "${trackId}" has no effect "${effectId}"`);
+          if (!Number.isInteger(toIndex) || toIndex < 0 || toIndex >= effects.length) {
+            throw new Error(`cannot move "${effectId}" to index ${toIndex}: the chain has ${effects.length} effects`);
+          }
+          const [moved] = effects.splice(from, 1);
+          effects.splice(toIndex, 0, moved!);
+          track.effects = effects;
+        });
+      },
+
       /**
        * Every automation edit is a `parameters` change, and that is a claim worth
        * spelling out because it is the one place PLAN.md §12 step 6 is genuinely
@@ -949,13 +1074,12 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
        */
       addAutomationLane(trackId, param, interp = "linear") {
         applyEdit("parameters", (draft) => {
-          const instrument = instrumentOf(draft, trackId);
-          resolveAutomatable(instrument, trackId, param);
+          resolveAutomatable(draft, trackId, param);
           const existing = draft.automation.get(trackId);
           if (existing?.lanes.some((lane) => lane.param === param) === true) {
             throw new Error(`track "${trackId}" already automates "${param}"; a param may have only one lane`);
           }
-          const seed = staticParamValue(instrument, param);
+          const seed = staticTrackParamValue(instrumentOf(draft, trackId), draft.tracks.get(trackId)?.effects, param);
           if (seed === undefined) {
             throw new Error(`cannot automate "${param}" on "${trackId}": it has no numeric value to start from`);
           }
@@ -1306,6 +1430,38 @@ function checkField(field: ExpressionField, value: number): void {
   if (problem !== undefined) throw new Error(problem);
 }
 
+/**
+ * Raise `project.json` `format` to 2 when the project has gained a feature that
+ * needs it, and never otherwise.
+ *
+ * A document's existing version is preserved rather than promoted: a format-1
+ * project edited in the UI keeps writing `"format": 1`, so opening the app cannot
+ * quietly age every project a user owns out of a format-1 tool's reach.
+ *
+ * When it does promote, it does so because the document now *has* an effect chain
+ * and a format-1 document may not (`format.effects-require-2`) — that is, the
+ * alternative is writing a file `musictool validate` rejects. `AGENTS.md` tells
+ * agents never to bump `format` themselves, so this is the tool doing it on their
+ * behalf and it must be visible: it lands in `project.json` as a one-line diff in
+ * the same write batch as the chain that required it, next to the chain in the
+ * track file, and it is the only edit in this store that touches `format` at all.
+ */
+function promoteFormatForEffects(draft: Project): void {
+  const needsEffects = [...draft.tracks.values()].some((track) => (track.effects ?? []).length > 0);
+  if (needsEffects && draft.project.format < EFFECTS_MIN_FORMAT) {
+    draft.project.format = EFFECTS_MIN_FORMAT;
+  }
+}
+
+/** One effect of one track's chain, addressed by id. */
+function chainEffectOf(project: Project, trackId: string, effectId: string): EffectDoc {
+  const track = project.tracks.get(trackId);
+  if (track === undefined) throw new Error(`no track "${trackId}"`);
+  const effect = (track.effects ?? []).find((candidate) => candidate.id === effectId);
+  if (effect === undefined) throw new Error(`track "${trackId}" has no effect "${effectId}"`);
+  return effect;
+}
+
 function instrumentOf(draft: Project, trackId: string): InstrumentDoc {
   const track = draft.tracks.get(trackId);
   if (track === undefined) throw new Error(`no track "${trackId}"`);
@@ -1323,10 +1479,13 @@ function instrumentOf(draft: Project, trackId: string): InstrumentDoc {
  * here, before the document moves — writing a file the validator rejects is a
  * worse outcome than a thrown error the UI can show.
  */
-function resolveAutomatable(instrument: InstrumentDoc, trackId: string, param: string): ParamSpec {
-  const resolved = resolveParam(instrument, param);
+function resolveAutomatable(draft: Project, trackId: string, param: string): ParamSpec {
+  const instrument = instrumentOf(draft, trackId);
+  // Resolved against the track, so `fx.<id>.<param>` on its effect chain is a
+  // legal target beside every instrument param (docs/format-spec.md §7).
+  const resolved = resolveTrackParam(instrument, draft.tracks.get(trackId)?.effects, param);
   if (resolved === undefined) {
-    throw new Error(`"${param}" is not a param of instrument "${instrument.id}" on track "${trackId}"`);
+    throw new Error(`"${param}" is not a param of track "${trackId}"`);
   }
   if (!resolved.spec.automatable) {
     throw new Error(`"${param}" is not automatable`);
@@ -1344,7 +1503,7 @@ function automationLane(
   const index = doc.lanes.findIndex((lane) => lane.param === param);
   const lane = doc.lanes[index];
   if (lane === undefined) throw new Error(`track "${trackId}" has no automation lane for "${param}"`);
-  return { doc, lane, index, spec: resolveAutomatable(instrumentOf(draft, trackId), trackId, param) };
+  return { doc, lane, index, spec: resolveAutomatable(draft, trackId, param) };
 }
 
 /** Automation ticks are song time, so the arrangement is the bound (§7). */

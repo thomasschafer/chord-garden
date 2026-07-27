@@ -1,0 +1,15 @@
+{
+  "track": "bass",
+  "description": "A sweep on the track filter, addressed by the effect's id.",
+  "lanes": [
+    {
+      "param": "fx.tone.cutoff",
+      "interp": "linear",
+      "points": [
+        [0, 400],
+        [7680, 5000],
+        [15360, 500]
+      ]
+    }
+  ]
+}

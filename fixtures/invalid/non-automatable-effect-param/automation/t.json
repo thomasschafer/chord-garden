@@ -1,0 +1,15 @@
+{
+  "track": "t",
+  "lanes": [
+    {
+      "param": "fx.slap.time",
+      "interp": "linear",
+      "points": [
+        [
+          0,
+          400
+        ]
+      ]
+    }
+  ]
+}

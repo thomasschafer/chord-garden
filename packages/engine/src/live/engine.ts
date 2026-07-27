@@ -156,7 +156,7 @@ export class LiveEngine {
         }
         const runner = this.graph.runners[command.trackIndex];
         if (runner === undefined) throw new Error(`cannot apply params: no track ${command.trackIndex}`);
-        runner.updateInstrument(command.instrument, command.automation);
+        runner.updateSettings(command.instrument, command.effects, command.automation);
         return;
       }
       case "start":
@@ -302,6 +302,7 @@ export class LiveEngine {
       instrumentId: config.instrument.id,
       events: [],
       automation: config.automation as CompiledAutomationLane[],
+      effects: config.effects,
     };
     const runner = createTrackRunner(track, config.instrument, this.sampleRate, (path) => {
       const data = this.samples.get(path);

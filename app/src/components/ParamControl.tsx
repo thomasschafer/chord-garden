@@ -44,11 +44,48 @@ export function ParamControl({
   label: string;
   onError: (message: string | undefined) => void;
 }): React.JSX.Element {
-  const apply = useParamApply(instrument, param.key, onError);
-  const override = instrument.params?.[param.key];
-  const effective = effectiveParamValue(instrument, param.key);
-  const field = `${instrument.id} ${param.key}`;
+  return (
+    <ParamField
+      param={param}
+      label={label}
+      field={`${instrument.id} ${param.key}`}
+      override={instrument.params?.[param.key]}
+      effective={effectiveParamValue(instrument, param.key)}
+      apply={useParamApply(instrument, param.key, onError)}
+      onError={onError}
+    />
+  );
+}
 
+/**
+ * The control itself, with no opinion about what owns the param.
+ *
+ * Split out from `ParamControl` when effects arrived, because an effect param is
+ * the same two shapes — an enum choice and a bounded integer with the default as
+ * its placeholder — owned by an entry in a track's chain rather than by an
+ * instrument. A second copy of this would be a second place for "an empty box
+ * means the default" to be got subtly wrong on one surface only.
+ */
+export function ParamField({
+  param,
+  label,
+  field,
+  override,
+  effective,
+  apply,
+  onError,
+}: {
+  param: InstrumentParam;
+  label: string;
+  /** Accessible name, which must be unique on the page. */
+  field: string;
+  /** The owner's own entry for this param, or undefined when it inherits. */
+  override: number | string | undefined;
+  /** The value in force: the override, or the registry default. */
+  effective: number | string | undefined;
+  apply: (value: number | string | undefined) => void;
+  onError: (message: string | undefined) => void;
+}): React.JSX.Element {
   return (
     <label className={override === undefined ? "param" : "param overridden"}>
       <span className="param-name">{label}</span>

@@ -47,6 +47,23 @@ time:
    two lists rather than doing arithmetic over tempo and ppqn. A voice with
    scheduled events that renders silent is warned about by name.
 
+   **On a track with effects, onsets are measured before the chain.** A delay
+   repeat and a reverb tail are real sound at positions nothing scheduled, so
+   asking "does the audio match the schedule?" of the wet signal would report a
+   healthy reverb as hundreds of spurious onsets. An onset question is a question
+   about the source, so it is asked of the pre-effect bus; levels, clipping and
+   spectrum are measured on what you actually hear. A track's `effects` lists its
+   chain and `onsetSource` says which bus its onsets came from. Adding an effect
+   cannot change an onset number — if it does, that is a bug worth reporting.
+
+   **A tail can outlast `--tail`.** A reverb or a long delay keeps sounding after
+   the last note, and `render` does not silently grow the buffer to fit it, since
+   `--tail 2` sometimes producing forty seconds would be worse. A truncated tail
+   is reported as a warning; pass a longer `--tail` if you want the whole decay.
+   `musicalSamples` says how much of the render is scheduled music rather than
+   tail, so a level measured across a long decay is readable rather than quietly
+   depending on the flag.
+
 Don't consider an edit done until `validate` passes with no errors. Read
 `musictool validate <project>` output for `error`-severity `code` values —
 they're stable identifiers, not prose to parse loosely.
@@ -59,7 +76,10 @@ Three things about the render that look like bugs and aren't:
   `--stems` writes `stems/<track>.wav` for every track and, for a drumkit track,
   also `stems/<track>.<voice>.wav` per kit voice; the per-voice files sum back to
   their track's stem to within 24-bit rounding, since each file is quantised on
-  its own.
+  its own. On a track with an effect chain the per-voice files are the sound
+  *before* the chain, since a chain belongs to the whole track and cannot be
+  divided between its voices — so they sum to that track's dry signal rather than
+  to its stem, and the difference between the two is exactly what the effects did.
 - **`onsets.expected` already accounts for `probability`.** It counts the
   distinct sample positions of the events the compiler actually scheduled —
   after probability was resolved, with coincident events collapsed to one. A
@@ -127,10 +147,17 @@ Three things about the render that look like bugs and aren't:
   from the next hit onward, with no reload, and the next `render` uses it too.
   A replacement that isn't valid PCM WAV fails as `sample.not-wav` naming the
   file, and nothing is adopted until you fix it.
-- **Never bump `project.json.format`.** A newer format than the tool
+- **Never bump `project.json.format` yourself.** A newer format than the tool
   supports is rejected outright, not migrated. If you think the format
   itself needs to change, that's a format-spec change, not a project edit —
   flag it rather than doing it unilaterally.
+
+  The one exception is not yours to make: **adding an effect chain to a track
+  requires format 2, and the tool raises `format` for you** when it writes one.
+  You will see that as a one-line change to `project.json` in the same batch as
+  the track file. Adding `effects` to a format-1 project by hand and leaving the
+  version alone fails as `format.effects-require-2` — set the chain and let the
+  tool move the number, or set both in one edit.
 
 ## Common mistakes (and their diagnostic codes)
 
