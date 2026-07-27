@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   canonicalFiles,
+  EXPRESSION_FIELDS,
   loadProject,
   type AutomationDoc,
   type Clip,
@@ -547,5 +548,85 @@ describe("compile", () => {
     project.arrangement.clips[0]!.pattern = "missing-pattern";
 
     expect(() => compile(project)).toThrow('cannot compile clip 0: pattern "missing-pattern" does not exist');
+  });
+});
+
+/**
+ * The values a hit or a note gets when the document says nothing.
+ *
+ * Nothing pinned these before, and the hole was not theoretical: changing the
+ * grid velocity default from 800 to 700 moved the worked example's kick from
+ * −9.95 to −11.11 dBFS and its master from −2.91 to −3.32, and the whole suite
+ * still passed. Every default is now stated twice — once as the number a
+ * musician would recognise, once against `EXPRESSION_FIELDS` — because the UI
+ * shows these as the placeholder in an empty box, and a UI promising 800 over a
+ * compiler applying 700 is exactly the divergence the shared registry exists to
+ * make impossible.
+ */
+describe("the defaults an unadorned event compiles at", () => {
+  const gridPattern: GridPatternDoc = {
+    id: "grid-main",
+    kind: "grid",
+    lengthTicks: 3840,
+    lanes: [{ lane: "kick", grid: { stepsPerBar: 16 }, steps: "x... x... x... x..." }],
+  };
+
+  it("gives a grid hit with no defaults and no override the registry's velocity", () => {
+    const events = trackEvents(compile(makeProject({ pattern: gridPattern })), "main-track");
+
+    expect(events).not.toHaveLength(0);
+    expect(new Set(events.map((event) => event.velocity))).toEqual(new Set([800]));
+    expect(EXPRESSION_FIELDS.velocity.default).toBe(800);
+  });
+
+  it("gates a grid hit for one step when nothing overrides it", () => {
+    const events = trackEvents(compile(makeProject({ pattern: gridPattern })), "main-track");
+
+    // 16 steps to a 3840-tick bar is 240 ticks a step, which at 120 BPM, 960
+    // ppqn and 48 kHz is 6000 samples — one *step*, not the gap to the next hit,
+    // which here is four steps away.
+    expect(events.map((event) => event.durationSamples)).toEqual([6000, 6000, 6000, 6000]);
+    // Stated as `null` in the registry because the default is derived rather
+    // than constant; this is what deriving it comes to.
+    expect(EXPRESSION_FIELDS.gateTicks.default).toBeNull();
+  });
+
+  it("fires every event when nothing sets a probability, and ratchets once", () => {
+    const withProbability: GridPatternDoc = {
+      ...gridPattern,
+      lanes: [{ ...gridPattern.lanes[0]!, stepEvents: [{ step: 0, probability: 0 }] }],
+    };
+
+    // Four hits with no probability at all; one of them silenced by an explicit
+    // 0 proves the other three are firing because the default is 1000, not
+    // because probability is being ignored.
+    expect(trackEvents(compile(makeProject({ pattern: gridPattern })), "main-track")).toHaveLength(4);
+    expect(trackEvents(compile(makeProject({ pattern: withProbability })), "main-track")).toHaveLength(3);
+    expect(EXPRESSION_FIELDS.probability.default).toBe(1000);
+    expect(EXPRESSION_FIELDS.ratchet.default).toBe(1);
+  });
+
+  it("places a hit on its step exactly when nothing nudges or swings it", () => {
+    const events = trackEvents(compile(makeProject({ pattern: gridPattern })), "main-track");
+
+    // 240 ticks a step at 120 BPM, 960 ppqn, 48 kHz is 6000 samples a step.
+    expect(events.map((event) => event.startSample)).toEqual([0, 24_000, 48_000, 72_000]);
+    expect(EXPRESSION_FIELDS.microTicks.default).toBe(0);
+    expect(EXPRESSION_FIELDS.swing.default).toBe(0);
+  });
+
+  it("leaves a note's own velocity alone and defaults the rest of its expression", () => {
+    const project = makeProject({
+      pattern: notesPattern([{ pitch: "A2", startTick: 480, durationTicks: 240, velocity: 333 }]),
+    });
+
+    const events = trackEvents(compile(project), "main-track");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.velocity).toBe(333);
+    // No microTicks, so the note is exactly on its own startTick.
+    expect(events[0]!.startSample).toBe(12_000);
+    // No ratchet, so one event; a note's gate is its own duration.
+    expect(events[0]!.durationSamples).toBe(6000);
   });
 });

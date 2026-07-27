@@ -29,7 +29,7 @@ export const seed = Number(new URLSearchParams(window.location.search).get("seed
 export const client = ProjectClient.fromPage(window as unknown as Record<string, unknown>);
 
 const sink: DocumentSink = {
-  async write(files) {
+  async write(files, deletes) {
     if (projectSocket.session === undefined) {
       // The sidecar only accepts writes from the window holding its read-write
       // session, and this window does not hold one right now. Failing here rather
@@ -40,7 +40,7 @@ const sink: DocumentSink = {
       );
     }
     try {
-      const response = await client.write(projectName, files);
+      const response = await client.write(projectName, files, deletes);
       return { diagnostics: response.summary.diagnostics };
     } catch (error) {
       // Translated at the boundary, so the store depends on its own contract

@@ -14,6 +14,7 @@ import {
   type ProjectList,
   type ProjectSnapshot,
   type ProjectSummary,
+  type WriteDeleteFile,
   type WriteRequest,
   type WriteRequestFile,
   type WriteResponse,
@@ -198,16 +199,20 @@ export class ProjectClient {
    * a `WriteConflict` when the disk moved under the caller so that a UI can tell
    * "someone else edited this" apart from "the write failed".
    */
-  async write(name: string, files: readonly WriteRequestFile[]): Promise<WriteResponse> {
+  async write(
+    name: string,
+    files: readonly WriteRequestFile[],
+    deletes: readonly WriteDeleteFile[] = [],
+  ): Promise<WriteResponse> {
     const url = `${this.projectUrl(name)}/write`;
-    const body: WriteRequest = { files: [...files] };
+    const body: WriteRequest = { files: [...files], ...(deletes.length === 0 ? {} : { deletes: [...deletes] }) };
     const response = await this.fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
     if (response.status === WRITE_CONFLICT_STATUS) {
-      throw new WriteConflict(await response.text(), files.map((file) => file.path));
+      throw new WriteConflict(await response.text(), [...files, ...deletes].map((file) => file.path));
     }
     if (!response.ok) {
       throw new Error(`write to "${name}" failed: ${response.status} ${await response.text()}`);

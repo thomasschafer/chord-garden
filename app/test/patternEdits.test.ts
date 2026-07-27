@@ -349,7 +349,10 @@ describe("editing a step's expression", () => {
     expect(() => store.getState().setStepEvent("drums-verse", "kick", 3, { velocity: 1200 })).toThrow(/0\.\.1000/);
     expect(() => store.getState().setStepEvent("drums-verse", "kick", 3, { velocity: 12.5 })).toThrow(/integer/);
     expect(() => store.getState().setStepEvent("drums-verse", "kick", 3, { ratchet: 0 })).toThrow(/at least 1/);
-    expect(() => store.getState().setStepEvent("drums-verse", "kick", 3, { gateTicks: 0 })).toThrow(/positive/);
+    // The refusal names the range as well as the bound, because the box the value
+    // was typed into is about to show this message and "gateTicks must be at
+    // least 1" alone does not say what unit it is counting.
+    expect(() => store.getState().setStepEvent("drums-verse", "kick", 3, { gateTicks: 0 })).toThrow(/ticks ≥ 1/);
     expect(store.getState().dirty).toEqual([]);
   });
 });

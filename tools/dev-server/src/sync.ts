@@ -297,6 +297,19 @@ export class ProjectSync {
   }
 
   /**
+   * Record a document this sidecar just removed on the UI's behalf, for exactly
+   * the reason `noteWrite` records one it wrote.
+   *
+   * Forgetting this would not lose data, but it would produce a `projectChanged`
+   * naming the removal back to the window that asked for it — a push the browser
+   * has to reconcile against a model it has already moved past, and the same
+   * class of self-inflicted round trip echo detection exists to stop.
+   */
+  noteRemoval(path: string): void {
+    this.established.delete(path);
+  }
+
+  /**
    * Record bytes this sidecar just served to the session holder as a whole-project
    * snapshot, for the same reason `noteWrite` records bytes it wrote: the browser
    * now has them, so re-announcing them would be a push with nothing in it.

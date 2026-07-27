@@ -71,11 +71,38 @@ export interface WriteRequestFile {
 }
 
 /**
+ * One document of a write batch to remove from disk.
+ *
+ * Deletion exists because some documents are legitimately *optional* and the
+ * format will not let them be empty: `automation/<track>.json` requires at least
+ * one lane, so removing a track's last automation lane has nowhere to land
+ * except removing the file. Without this the UI would have to refuse that edit
+ * and tell the human to go and delete a file by hand — a UI that cannot undo
+ * what it can do.
+ */
+export interface WriteDeleteFile {
+  path: string;
+  /**
+   * Content hash of the bytes the caller believes it is removing. Not nullable,
+   * unlike a write's: "delete a file I believe does not exist" is not an
+   * intention, it is a lost update waiting to happen. A caller that finds the
+   * file already gone gets the same 409 as any other stale precondition.
+   */
+  expectedHash: string;
+}
+
+/**
  * A write batch. Batched because one UI edit can touch several files and the
  * project should not be observed half-updated (PLAN.md §12).
+ *
+ * `deletes` land in the same batch as `files`, and every precondition in the
+ * batch is checked before anything is touched, so an edit that rewrites one
+ * document and removes another cannot half-apply.
  */
 export interface WriteRequest {
   files: WriteRequestFile[];
+  /** Absent and empty mean the same thing: this batch removes nothing. */
+  deletes?: WriteDeleteFile[];
 }
 
 /**
@@ -94,6 +121,8 @@ export const WRITE_CONFLICT_STATUS = 409;
 export interface WriteResponse {
   ok: true;
   written: WriteAck[];
+  /** Paths the batch removed, in the order they were removed. */
+  removed: string[];
   /** The project re-validated after the batch landed, so the UI can show errors. */
   summary: ProjectSummary;
 }

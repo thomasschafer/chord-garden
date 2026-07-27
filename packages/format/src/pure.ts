@@ -23,6 +23,20 @@ export {
   type Severity,
   type Span,
 } from "./diagnostics.js";
+export {
+  EXPRESSION_FIELDS,
+  LANE_DEFAULT_FIELDS,
+  NOTE_EXPRESSION_FIELDS,
+  STEP_EVENT_FIELDS,
+  checkExpressionValue,
+  describeExpressionRange,
+  type ExpressionField,
+  type ExpressionSpec,
+  type ExpressionUnit,
+  type LaneDefaultField,
+  type NoteExpressionField,
+  type StepEventField,
+} from "./expression.js";
 export { parseStrictJson, type JsonObject, type JsonValue, type ParseResult } from "./jsonParse.js";
 export * from "./model.js";
 export { ticksPerBar, type TimeSignature } from "./musicTime.js";
@@ -32,9 +46,14 @@ export {
   BASIC_MONO_PARAMS,
   BASIC_POLY_PARAMS,
   DRUMKIT_VOICE_PARAMS,
+  PARAM_UNIT_LABELS,
+  automatableParams,
   checkParamValue,
+  describeParamRange,
   resolveParam,
+  staticParamValue,
   validParamKeys,
+  type AutomatableParam,
   type ParamSpec,
   type ParamUnit,
   type ResolvedParam,

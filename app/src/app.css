@@ -22,6 +22,9 @@
   --note-selected: #b4531f;
   --playhead: #cc3322;
   --black-key: #e6e6e2;
+  /* The unfilled part of a hit: what velocity is drawn *against*. */
+  --hit-dim: #cfe3d8;
+  --swung: #b8862f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -37,6 +40,8 @@
     --note-selected: #e08040;
     --playhead: #ef5a44;
     --black-key: #191b1f;
+    --hit-dim: #22392e;
+    --swung: #e0b25a;
   }
 }
 
@@ -189,6 +194,27 @@ section:has(.editor) {
   white-space: nowrap;
 }
 
+/* A lane label is a button — clicking it selects the lane — without looking like one. */
+.lane-label {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.lane-label:hover {
+  background: var(--surface);
+}
+
+.lane-label.selected {
+  outline: 2px solid var(--note-selected);
+  outline-offset: -2px;
+}
+
 .ruler-label {
   font-size: 0.8rem;
   opacity: 0.7;
@@ -256,13 +282,30 @@ section:has(.editor) {
   background: var(--sunken);
 }
 
+/*
+ * A hit's fill is set inline, as a gradient stopping at its velocity: the lane's
+ * dynamics read as a contour rather than as numbers you have to open one cell at
+ * a time. The colour here is the fallback for a hit whose velocity is not known
+ * yet (a lane that does not parse).
+ */
 .cell.hit {
   background: var(--hit);
   color: var(--hit-text);
+  touch-action: none;
 }
 
 .cell.hit:hover {
   filter: brightness(1.15);
+}
+
+.cell.dragging {
+  filter: brightness(1.3);
+  cursor: ns-resize;
+}
+
+/* A hit swing actually displaces: an odd-indexed step with swing turned on. */
+.cell.swung {
+  border-top: 2px solid var(--swung);
 }
 
 /* A step carrying `stepEvents` overrides. The dot is the content, this is the ring. */
@@ -285,6 +328,35 @@ section:has(.editor) {
 }
 
 /* --- piano roll ----------------------------------------------------------- */
+
+/*
+ * The roll scrolls in both directions inside itself. A pattern spanning four
+ * octaves is 60 rows tall, and without this the page grows to fit it and the
+ * transport, the inspector and every other pattern go off screen — so placing a
+ * note means scrolling away from the controls that place it.
+ *
+ * One scroll box for both axes, rather than the step sequencer's horizontal-only
+ * `.lane-scroll`, because the velocity strip below the canvas has to stay
+ * aligned with the notes above it: two scroll boxes would need their positions
+ * kept in sync by hand.
+ */
+.roll-grid {
+  overflow: auto;
+  max-height: 26rem;
+}
+
+.roll-body {
+  display: grid;
+  grid-template-columns: auto auto;
+  width: fit-content;
+}
+
+/* Sticky so the keyboard stays put while the canvas scrolls sideways. */
+.roll-body .keys {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+}
 
 .keys {
   flex: none;
@@ -384,6 +456,134 @@ section:has(.editor) {
 
 .note-label {
   pointer-events: none;
+}
+
+/*
+ * The velocity strip. Sticky to the bottom of the roll's viewport so it stays
+ * visible however far the pitch rows are scrolled — a dynamics editor you have
+ * to scroll to is one nobody uses.
+ */
+.vel-strip,
+.vel-label {
+  position: sticky;
+  bottom: 0;
+  border-top: 1px solid var(--line-bar);
+  background: var(--sunken);
+}
+
+.vel-label {
+  left: 0;
+  z-index: 4;
+  min-width: 4rem;
+  padding: 0 0.3rem;
+  font-size: 0.65rem;
+  display: flex;
+  align-items: flex-end;
+  border-right: 1px solid var(--line-bar);
+}
+
+.vel-strip {
+  position: sticky;
+  z-index: 2;
+}
+
+.vel-bar {
+  position: absolute;
+  bottom: 0;
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-right: 1px solid var(--surface);
+  background: var(--note);
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.vel-bar.selected {
+  background: var(--note-selected);
+  z-index: 2;
+}
+
+/* --- automation ----------------------------------------------------------- */
+
+.auto-lane {
+  margin-bottom: 0.75rem;
+}
+
+.auto-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.25rem;
+}
+
+.auto-grid {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--line-bar);
+  background: var(--surface);
+  width: fit-content;
+  max-width: 100%;
+}
+
+/* The param's own range, top and bottom, so the axis is never a guess. */
+.auto-axis {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 5rem;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.7rem;
+  text-align: right;
+  border-right: 1px solid var(--line-bar);
+  background: var(--sunken);
+}
+
+.auto-canvas {
+  position: relative;
+}
+
+.auto-canvas svg {
+  display: block;
+  cursor: crosshair;
+}
+
+.auto-bar {
+  stroke: var(--line-bar);
+  stroke-width: 1;
+  opacity: 0.5;
+}
+
+.auto-curve {
+  stroke: var(--note);
+  stroke-width: 2;
+}
+
+/*
+ * The stretch before the first breakpoint, where the lane does not apply and the
+ * instrument's static value is what sounds. Dashed and faint because it is not
+ * automation — drawing it solid would claim the curve starts at the first point's
+ * value, which is a different sound from the one the engine makes.
+ */
+.auto-curve-before {
+  stroke: var(--line-bar);
+  stroke-width: 2;
+  stroke-dasharray: 4 4;
+}
+
+.auto-point {
+  fill: var(--note);
+  stroke: var(--surface);
+  stroke-width: 1.5;
+  cursor: grab;
+  touch-action: none;
+}
+
+.auto-point.selected {
+  fill: var(--note-selected);
 }
 
 /* --- inspectors ----------------------------------------------------------- */

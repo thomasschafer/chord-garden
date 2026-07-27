@@ -383,15 +383,37 @@ async function handleWrite(
     sendText(res, 400, 'write batch must be an object with a "files" array');
     return;
   }
+  const deletes = request.deletes ?? [];
+  if (!Array.isArray(deletes)) {
+    sendText(res, 400, 'a write batch\'s "deletes" must be an array if present');
+    return;
+  }
 
-  const result = writeBatch(mount.root, request.files, (path, contents) => sync?.noteWrite(path, contents));
+  const result = writeBatch(
+    mount.root,
+    request.files,
+    {
+      written: (path, contents) => sync?.noteWrite(path, contents),
+      removed: (path) => sync?.noteRemoval(path),
+    },
+    deletes,
+  );
   if (!result.ok) {
     log(`${result.status} write ${mount.name} ${result.message}`);
     sendText(res, result.status, result.message);
     return;
   }
-  log(`wrote ${result.acks.map((ack) => ack.path).join(", ")} in ${mount.name}`);
-  const response: WriteResponse = { ok: true, written: result.acks, summary: summarise(mount) };
+  log(
+    `wrote ${result.acks.map((ack) => ack.path).join(", ") || "nothing"} in ${mount.name}${
+      result.removed.length > 0 ? `, removed ${result.removed.join(", ")}` : ""
+    }`,
+  );
+  const response: WriteResponse = {
+    ok: true,
+    written: result.acks,
+    removed: result.removed,
+    summary: summarise(mount),
+  };
   sendJson(res, 200, response);
 }
 

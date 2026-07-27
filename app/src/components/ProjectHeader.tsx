@@ -1,26 +1,53 @@
-import { ticksPerBar, type Project } from "@chord-garden/format/pure";
+import { describeExpressionRange, EXPRESSION_FIELDS, ticksPerBar, type Project } from "@chord-garden/format/pure";
+import { useState } from "react";
 import { useStore } from "zustand";
 import { documentStore } from "../session";
 
 /**
- * The project's own fields, with the two editable ones the write path is proved
- * through end to end: the name, and the tempo.
+ * The project's own fields: the name, the tempo, and the swing every grid lane
+ * inherits.
  *
  * Tempo is the interesting one. On disk it is an integer in bpm×100 (PLAN.md
  * §6.2 — no floats anywhere in a canonical file), and the input shows BPM. The
  * conversion happens here, at the edge, and rounds to the stored unit before it
  * reaches the model, so nothing downstream ever holds a tempo the format cannot
  * represent.
+ *
+ * Swing is a slider as well as a number because it is the one setting nobody
+ * types a value for — you move it until the groove sits right. Its bounds come
+ * from the expression registry rather than from `0` and `1000` written here, and
+ * the caption names the two landmarks (straight, and roughly triplet) that make
+ * the range mean something. What it does *not* do is claim the whole project
+ * will change: only odd-indexed steps move, and which hits that reaches is a
+ * per-lane fact the lane panel states.
  */
 export function ProjectHeader({ project }: { project: Project }): React.JSX.Element {
   const setProjectName = useStore(documentStore, (state) => state.setProjectName);
   const setTempoBpmX100 = useStore(documentStore, (state) => state.setTempoBpmX100);
+  const setProjectSwing = useStore(documentStore, (state) => state.setProjectSwing);
+  const [error, setError] = useState<string | undefined>(undefined);
 
   const doc = project.project;
   const meter = doc.meterMap[0]!.timeSignature;
   const barTicks = ticksPerBar(doc.ppqn, meter);
   const bars = project.arrangement.lengthTicks / barTicks;
   const tempo = doc.tempoMap[0]!.bpm;
+
+  /**
+   * A half-typed number box parses to NaN, and a slider never can, so both go
+   * through one commit that refuses anything the model would not accept. The
+   * store checks the range against the registry; this only has to keep NaN out.
+   */
+  function commitSwing(text: string): void {
+    const permille = Number(text);
+    if (!Number.isFinite(permille)) return;
+    try {
+      setProjectSwing(Math.round(permille));
+      setError(undefined);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
 
   return (
     <section>
@@ -52,7 +79,33 @@ export function ProjectHeader({ project }: { project: Project }): React.JSX.Elem
             }}
           />
         </label>
+        <label>
+          swing
+          <input
+            type="range"
+            min={EXPRESSION_FIELDS.swing.min}
+            max={EXPRESSION_FIELDS.swing.max}
+            step={5}
+            value={doc.swing}
+            aria-label="project swing"
+            onChange={(event) => commitSwing(event.target.value)}
+          />
+          <input
+            type="number"
+            min={EXPRESSION_FIELDS.swing.min}
+            max={EXPRESSION_FIELDS.swing.max}
+            step={1}
+            value={doc.swing}
+            size={6}
+            aria-label="project swing permille"
+            onChange={(event) => commitSwing(event.target.value)}
+          />
+          <span className="muted">
+            {describeExpressionRange("swing")} — 0 straight, ~667 triplet; delays odd-indexed steps only
+          </span>
+        </label>
       </div>
+      {error !== undefined && <p className="error">{error}</p>}
       <div className="status">
         <span>key</span>
         <span>{doc.key === undefined ? "-" : `${doc.key.root} ${doc.key.scale}`}</span>

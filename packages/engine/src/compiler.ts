@@ -2,6 +2,7 @@
 // `loadProject`, and this module has to bundle for the browser (see the format
 // package's `pure.ts`).
 import {
+  EXPRESSION_FIELDS,
   parseSteps,
   pitchToMidi,
   resolveParam,
@@ -355,9 +356,16 @@ function compileGridPattern(
     for (const step of parsed.hits) {
       const stepEvent = eventsByStep.get(step);
       const swingTicks = step % 2 === 1 ? Math.round((swing * stepTicks) / 2000) : 0;
-      const startTick = repetitionStartTick + step * stepTicks + swingTicks + (stepEvent?.microTicks ?? 0);
+      const startTick =
+        repetitionStartTick +
+        step * stepTicks +
+        swingTicks +
+        (stepEvent?.microTicks ?? EXPRESSION_FIELDS.microTicks.default);
+      // `gateTicks` is the one field with no constant default: a hit lasts its own
+      // step unless something says otherwise, which is why the registry states
+      // `null` rather than a number for it.
       const gateTicks = stepEvent?.gateTicks ?? lane.defaults?.gateTicks ?? stepTicks;
-      const probability = stepEvent?.probability ?? lane.defaults?.probability ?? 1000;
+      const probability = stepEvent?.probability ?? lane.defaults?.probability ?? EXPRESSION_FIELDS.probability.default;
       const identity: EventIdentity = {
         trackId: track.id,
         patternId: pattern.id,
@@ -370,9 +378,9 @@ function compileGridPattern(
         context,
         startTick,
         gateTicks,
-        stepEvent?.ratchet ?? 1,
+        stepEvent?.ratchet ?? EXPRESSION_FIELDS.ratchet.default,
         60,
-        stepEvent?.velocity ?? lane.defaults?.velocity ?? 800,
+        stepEvent?.velocity ?? lane.defaults?.velocity ?? EXPRESSION_FIELDS.velocity.default,
         lane.lane,
         output,
       );
@@ -406,12 +414,12 @@ function compileNotesPattern(
         durationTicks: note.durationTicks,
       },
     };
-    if (!fires(context.seed, identity, note.probability ?? 1000)) return;
+    if (!fires(context.seed, identity, note.probability ?? EXPRESSION_FIELDS.probability.default)) return;
     emitRatchets(
       context,
-      repetitionStartTick + note.startTick + (note.microTicks ?? 0),
+      repetitionStartTick + note.startTick + (note.microTicks ?? EXPRESSION_FIELDS.microTicks.default),
       note.durationTicks,
-      note.ratchet ?? 1,
+      note.ratchet ?? EXPRESSION_FIELDS.ratchet.default,
       midi,
       note.velocity,
       undefined,

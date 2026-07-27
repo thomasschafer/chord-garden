@@ -41,6 +41,20 @@ export interface PatternPlayhead {
  * playing, it has no sample rate yet, or no clip of this pattern is sounding on this
  * track — because they are one question to a caller ("is there a line, and where").
  */
+/**
+ * Where a transport status puts the playhead in *song* time, or `undefined` when
+ * there is nothing to draw.
+ *
+ * The automation editor needs this rather than `livePatternTick`: an automation
+ * lane is per track and spans the whole arrangement (docs/format-spec.md §7), so
+ * unlike a pattern it has no clips to be located through and its playhead is
+ * simply the transport's own position.
+ */
+export function liveSongTick(project: Project, status: PlayerStatus): number | undefined {
+  if (status.phase !== "playing" || status.sampleRate === null) return undefined;
+  return songTickAt(project, status.sampleRate, status.positionSample);
+}
+
 export function livePatternTick(
   project: Project,
   trackId: string,

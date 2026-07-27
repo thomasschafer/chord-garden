@@ -1,7 +1,7 @@
 import type { Project } from "@chord-garden/format/pure";
 import { useCallback, useSyncExternalStore } from "react";
 import { livePlayer } from "../session";
-import { livePatternTick } from "../view/playback";
+import { livePatternTick, liveSongTick } from "../view/playback";
 
 /**
  * The playhead line inside one pattern's canvas, or nothing when no clip of that
@@ -43,4 +43,20 @@ export function PatternPlayhead({
 
   if (localTick === undefined) return null;
   return <div className="playhead" style={{ left: localTick * pxPerTick }} aria-hidden="true" />;
+}
+
+/**
+ * The playhead in song time, for a canvas drawn over the whole arrangement.
+ *
+ * Subscribes to the player for exactly the reasons above: an automation lane
+ * being dragged must not re-render because the transport moved, and the lane
+ * canvas above this is the thing that must stay still under the pointer.
+ */
+export function SongPlayhead({ project, pxPerTick }: { project: Project; pxPerTick: number }): React.JSX.Element | null {
+  const subscribe = useCallback((onChange: () => void) => livePlayer.subscribe(onChange), []);
+  const getSnapshot = useCallback(() => liveSongTick(project, livePlayer.getStatus()), [project]);
+  const songTick = useSyncExternalStore(subscribe, getSnapshot);
+
+  if (songTick === undefined) return null;
+  return <div className="playhead" style={{ left: songTick * pxPerTick }} aria-hidden="true" />;
 }

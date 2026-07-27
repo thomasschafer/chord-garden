@@ -94,6 +94,75 @@ export function validParamKeys(instrument: InstrumentDoc): string[] {
   return keys;
 }
 
+/**
+ * How each unit is written for a person. Lives here rather than in whoever is
+ * printing, because `docs/format-spec.md` and `PLAN.md` both publish these
+ * spellings and `test/registryDocs.test.ts` pins the tables to them.
+ */
+export const PARAM_UNIT_LABELS: Record<ParamUnit, string> = {
+  Hz: "Hz",
+  ms: "ms",
+  cents: "cents",
+  permille: "permille",
+  dB100: "dB×100",
+  bpm100: "bpm×100",
+  count: "count",
+  enum: "enum",
+};
+
+/** The unit and range as one short label, for a control's caption. */
+export function describeParamRange(spec: ParamSpec): string {
+  if (spec.unit === "enum") return (spec.values ?? []).join(", ");
+  const low = spec.min === undefined ? "" : String(spec.min);
+  const high = spec.max === undefined ? "" : String(spec.max);
+  return `${PARAM_UNIT_LABELS[spec.unit]} ${low}..${high}`;
+}
+
+/** A param an automation lane may target, resolved against one instrument. */
+export interface AutomatableParam {
+  /** The dotted key an automation lane's `param` holds, e.g. `kick.gain`. */
+  key: string;
+  spec: ParamSpec;
+  /** For drumkit params, the voice this key addresses. */
+  voice?: string;
+}
+
+/**
+ * Every param on this instrument an automation lane may target, sorted by key.
+ *
+ * The one place a UI should ask "what can I automate here?". Derived from
+ * `validParamKeys` and `resolveParam` rather than from a second list, so a param
+ * added to the registry — or flipped to `automatable: true` — appears in every
+ * picker without anything else being edited, and one flipped the other way
+ * disappears from them. `docs/format-spec.md` §7 is the rule this implements:
+ * a lane may only target a param with `automatable: yes`.
+ */
+export function automatableParams(instrument: InstrumentDoc): AutomatableParam[] {
+  const params: AutomatableParam[] = [];
+  for (const key of validParamKeys(instrument)) {
+    const resolved = resolveParam(instrument, key);
+    if (resolved === undefined || !resolved.spec.automatable) continue;
+    params.push(resolved.voice === undefined ? { key, spec: resolved.spec } : { key, spec: resolved.spec, voice: resolved.voice });
+  }
+  return params.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
+}
+
+/**
+ * The value a param holds when no automation is running: the instrument's own
+ * setting, or the registry default when it sets none.
+ *
+ * What a new automation lane should start from, so adding one changes nothing
+ * until a point is moved — an automation lane that jumps the sound the moment it
+ * is created is an editor guessing at music the author did not ask for.
+ */
+export function staticParamValue(instrument: InstrumentDoc, key: string): number | undefined {
+  const resolved = resolveParam(instrument, key);
+  if (resolved === undefined) return undefined;
+  const set = instrument.params?.[key];
+  const value = set ?? resolved.spec.default;
+  return typeof value === "number" ? value : undefined;
+}
+
 export function checkParamValue(spec: ParamSpec, value: number | string): string | undefined {
   if (spec.unit === "enum") {
     if (typeof value !== "string") return "expected a string";

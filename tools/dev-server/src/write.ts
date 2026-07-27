@@ -2,7 +2,7 @@ import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, w
 import { basename, dirname, join } from "node:path";
 import { hashContent } from "@chord-garden/engine/live";
 import { docKindFromHint, docKindHintForPath, parseStrictJson, serializeCanonical } from "@chord-garden/format/pure";
-import { WRITE_CONFLICT_STATUS, type WriteAck, type WriteRequestFile } from "./api.js";
+import { WRITE_CONFLICT_STATUS, type WriteAck, type WriteDeleteFile, type WriteRequestFile } from "./api.js";
 import { resolveDocumentWrite } from "./paths.js";
 
 /** One batch may not exceed this many bytes of JSON body. */
@@ -13,8 +13,19 @@ export const MAX_BATCH_FILES = 64;
 export const MAX_FILE_BYTES = 512 * 1024;
 
 export type WriteBatchResult =
-  | { ok: true; acks: WriteAck[] }
+  | { ok: true; acks: WriteAck[]; removed: string[] }
   | { ok: false; status: 400 | 403 | 409 | 422; message: string };
+
+/**
+ * What the sidecar wants to know about a batch as it lands, in the same
+ * synchronous block as the filesystem call. Grouped into one object rather than
+ * two positional callbacks because forgetting to pass the second one would make
+ * the watcher announce the UI's own deletion back to it as an external change.
+ */
+export interface WriteBatchObserver {
+  written?: (path: string, contents: string) => void;
+  removed?: (path: string) => void;
+}
 
 /**
  * Content hash of a document as it currently sits on disk, or `null` when there
@@ -61,16 +72,22 @@ export function hashOnDisk(path: string): string | null {
 export function writeBatch(
   root: string,
   files: readonly WriteRequestFile[],
-  onWritten?: (path: string, contents: string) => void,
+  observer: WriteBatchObserver = {},
+  deletes: readonly WriteDeleteFile[] = [],
 ): WriteBatchResult {
-  if (files.length === 0) {
+  if (files.length === 0 && deletes.length === 0) {
     return { ok: false, status: 400, message: "write batch contained no files" };
   }
-  if (files.length > MAX_BATCH_FILES) {
-    return { ok: false, status: 400, message: `write batch has ${files.length} files, more than the limit of ${MAX_BATCH_FILES}` };
+  if (files.length + deletes.length > MAX_BATCH_FILES) {
+    return {
+      ok: false,
+      status: 400,
+      message: `write batch has ${files.length + deletes.length} files, more than the limit of ${MAX_BATCH_FILES}`,
+    };
   }
 
   const planned: { target: string; relative: string; contents: string; expectedHash: string | null; hash: string }[] = [];
+  const removals: { target: string; relative: string; expectedHash: string }[] = [];
   const seen = new Set<string>();
 
   for (const file of files) {
@@ -109,9 +126,31 @@ export function writeBatch(
     });
   }
 
+  for (const file of deletes) {
+    if (typeof file.path !== "string") {
+      return { ok: false, status: 400, message: 'every write batch deletion needs a string "path"' };
+    }
+    if (typeof file.expectedHash !== "string") {
+      return {
+        ok: false,
+        status: 400,
+        message: `"${file.path}" has no "expectedHash"; a deletion must say which bytes it believes it is removing`,
+      };
+    }
+    const resolved = resolveDocumentWrite(root, file.path);
+    if (!resolved.ok) return resolved;
+    if (seen.has(resolved.relative)) {
+      return { ok: false, status: 400, message: `"${resolved.relative}" appears twice in one write batch` };
+    }
+    seen.add(resolved.relative);
+    removals.push({ target: resolved.path, relative: resolved.relative, expectedHash: file.expectedHash });
+  }
+
   // Preconditions are checked for the whole batch before a single file is
   // written, so a conflict on the last file cannot leave the first one applied.
-  const conflicts = planned
+  // Deletions are in the same pass: a removal whose file has already changed is
+  // exactly as much of a lost update as an overwrite would be.
+  const conflicts = [...planned, ...removals]
     .filter((entry) => hashOnDisk(entry.target) !== entry.expectedHash)
     .map((entry) => entry.relative);
   if (conflicts.length > 0) {
@@ -130,10 +169,19 @@ export function writeBatch(
     // these bytes before it can possibly scan them, and "the caller remembers to
     // tell the watcher" is exactly the kind of ordering assumption that decays
     // into an infinite write/watch loop (PLAN.md §18).
-    onWritten?.(entry.relative, entry.contents);
+    observer.written?.(entry.relative, entry.contents);
     acks.push({ path: entry.relative, bytes: Buffer.byteLength(entry.contents, "utf8"), contentHash: entry.hash });
   }
-  return { ok: true, acks };
+  const removed: string[] = [];
+  for (const entry of removals) {
+    unlinkSync(entry.target);
+    // The mirror of `written`, and for the same reason: a removal the sidecar has
+    // not been told about is one its next scan reads as an external deletion and
+    // announces back to the window that asked for it.
+    observer.removed?.(entry.relative);
+    removed.push(entry.relative);
+  }
+  return { ok: true, acks, removed };
 }
 
 /** Refuse anything that is not the canonical serialization of its own content. */

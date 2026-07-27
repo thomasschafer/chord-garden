@@ -1,15 +1,27 @@
 import {
   canonicalFiles,
+  checkExpressionValue,
+  checkParamValue,
   formatSteps,
   HIGHEST_MIDI,
   LOWEST_MIDI,
+  NOTE_EXPRESSION_FIELDS,
   parseSteps,
   pitchToMidi,
+  resolveParam,
+  staticParamValue,
   ticksPerBar,
+  type AutomationDoc,
+  type AutomationInterp,
+  type AutomationLane,
+  type ExpressionField,
   type GridLane,
   type GridPatternDoc,
+  type InstrumentDoc,
+  type LaneDefaults,
   type NoteEvent,
   type NotesPatternDoc,
+  type ParamSpec,
   type Project,
   type StepEvent,
 } from "@chord-garden/format/pure";
@@ -93,6 +105,21 @@ export interface DocumentDiagnostic {
   message: string;
 }
 
+/**
+ * One document to remove from disk.
+ *
+ * Removal exists because `automation/<track>.json` may not hold zero lanes
+ * (docs/format-spec.md §7 and the schema's `minItems`), so deleting a track's
+ * last automation lane has nowhere to go except deleting the file. An editor
+ * that can add a lane and cannot take the last one away is an editor with a
+ * one-way door in it.
+ */
+export interface PendingDelete {
+  path: string;
+  /** Hash of the bytes this editor believes it is removing; never null. */
+  expectedHash: string;
+}
+
 export interface WriteOutcome {
   /** The project's diagnostics after the batch landed, so errors surface at once. */
   diagnostics: readonly DocumentDiagnostic[];
@@ -104,7 +131,7 @@ export interface WriteOutcome {
  * without any of them having to pretend to be a browser.
  */
 export interface DocumentSink {
-  write(files: readonly PendingFile[]): Promise<WriteOutcome>;
+  write(files: readonly PendingFile[], deletes: readonly PendingDelete[]): Promise<WriteOutcome>;
 }
 
 /** What the store was opened with: the model, and the bytes it came from. */
@@ -136,7 +163,13 @@ export interface DocumentState {
   onDisk: ReadonlyMap<string, string>;
   /** Paths whose canonical bytes differ from `persisted`, sorted. */
   dirty: readonly string[];
-  /** Paths in the write batch currently in flight. */
+  /**
+   * Paths the model no longer has that the disk still does, sorted. Derived the
+   * same way `dirty` is — by comparing the re-serialized project against the
+   * baseline — so an edit cannot forget to declare that it dropped a document.
+   */
+  removing: readonly string[];
+  /** Paths in the write batch currently in flight, written or removed. */
   writing: readonly string[];
   /**
    * Files that were already on disk in non-canonical form when the project was
@@ -198,6 +231,11 @@ export interface DocumentState {
   open(loaded: OpenedProject): void;
   setProjectName(name: string): void;
   setTempoBpmX100(bpm: number): void;
+  /**
+   * The project-wide swing, in permille (docs/format-spec.md §4). Structural:
+   * every odd-indexed grid step in the project moves.
+   */
+  setProjectSwing(permille: number): void;
   setPatternLaneSteps(patternId: string, lane: string, steps: string): void;
   /**
    * Turn one grid step of one lane on or off.
@@ -218,6 +256,45 @@ export interface DocumentState {
    * `step` is dropped, because `fmt` does not emit empty overrides.
    */
   setStepEvent(patternId: string, lane: string, step: number, patch: StepEventPatch): void;
+  /**
+   * Set, change or clear a lane's `defaults`, the expression every hit in the
+   * lane inherits. Same rules as `setStepEvent`: a field given as `undefined` is
+   * removed, and a `defaults` object left with nothing in it is dropped, because
+   * the schema's `minProperties` refuses an empty one and `fmt` would not write
+   * it.
+   */
+  setLaneDefaults(patternId: string, lane: string, patch: LaneDefaultsPatch): void;
+  /**
+   * Change a lane's grid resolution, keeping every hit at the tick it is at now.
+   *
+   * Refused rather than rounded when a hit would not land on the new grid: a
+   * coarser grid genuinely cannot hold an off-grid hit, and quietly moving or
+   * dropping one is requantisation nobody asked for (PLAN.md §18's rule about
+   * grids being a view).
+   */
+  setLaneStepsPerBar(patternId: string, lane: string, stepsPerBar: number): void;
+  /**
+   * Start automating `param` on `track`, seeded with one point at tick 0 holding
+   * the value the instrument already produces — so creating a lane changes
+   * nothing until a point is moved. Creates `automation/<track>.json` if the
+   * track has none.
+   */
+  addAutomationLane(trackId: string, param: string, interp?: AutomationInterp): void;
+  /** Stop automating `param`; removes the track's automation file if it was the last lane. */
+  removeAutomationLane(trackId: string, param: string): void;
+  setAutomationInterp(trackId: string, param: string, interp: AutomationInterp): void;
+  /** Add a breakpoint. Refused at a tick the lane already has a point at. */
+  addAutomationPoint(trackId: string, param: string, tick: number, value: number): void;
+  /**
+   * Move one breakpoint. `tick` must stay strictly between its neighbours
+   * (docs/format-spec.md §7) and inside the arrangement, and `value` must be in
+   * the param's own registry range; anything else throws rather than being
+   * clamped here. Dragging clamps before it calls this — see `view/automation.ts`
+   * — so the clamp lives where the pointer is and the model stays strict.
+   */
+  moveAutomationPoint(trackId: string, param: string, index: number, tick: number, value: number): void;
+  /** Remove a breakpoint. Refused for the last one: a lane must keep a point. */
+  removeAutomationPoint(trackId: string, param: string, index: number): void;
   /** Append a note. Its array position is a handle for this session only. */
   addNote(patternId: string, note: NoteEvent): void;
   /** Change one note in place, by its position in the in-memory `notes` array. */
@@ -250,10 +327,19 @@ export type StepEventPatch = {
   [K in keyof Omit<StepEvent, "step">]?: number | undefined;
 };
 
+/** The same present-and-`undefined`-means-remove rule, for a lane's `defaults`. */
+export type LaneDefaultsPatch = {
+  [K in keyof LaneDefaults]?: number | undefined;
+};
+
 /** Fields every note must have, which a patch may change but not remove. */
 export const REQUIRED_NOTE_FIELDS = ["pitch", "startTick", "durationTicks", "velocity"] as const;
-/** Fields a note may carry, which a patch may also remove by passing `undefined`. */
-export const OPTIONAL_NOTE_FIELDS = ["microTicks", "probability", "ratchet"] as const;
+/**
+ * Fields a note may carry, which a patch may also remove by passing `undefined`.
+ * The format package's list, not a second one: a field added to the expression
+ * registry becomes editable here without this file being touched.
+ */
+export const OPTIONAL_NOTE_FIELDS = NOTE_EXPRESSION_FIELDS;
 
 export type RequiredNoteField = (typeof REQUIRED_NOTE_FIELDS)[number];
 export type OptionalNoteField = (typeof OPTIONAL_NOTE_FIELDS)[number];
@@ -321,14 +407,15 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
       mutate(draft);
       const canonical = canonicalFiles(draft);
       const { dirty, removed } = diffAgainst(get().persisted, canonical);
-      if (removed.length > 0) {
-        // No edit in this stage can delete a document, and the write endpoint
-        // cannot express a deletion, so this is a bug rather than a state to
-        // paper over.
-        throw new Error(`edit would remove ${removed.join(", ")}, which the write path cannot express`);
-      }
       const revision = get().revision + 1;
-      set({ project: draft, canonical, dirty, revision, audioEdit: { revision, effect, project: draft } });
+      set({
+        project: draft,
+        canonical,
+        dirty,
+        removing: removed,
+        revision,
+        audioEdit: { revision, effect, project: draft },
+      });
       scheduleFlush();
     }
 
@@ -348,14 +435,14 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
      */
     function flush(): Promise<void> {
       if (inFlight !== undefined) {
-        return inFlight.then(() => (get().dirty.length > 0 ? flush() : undefined));
+        return inFlight.then(() => (pendingWork(get()) ? flush() : undefined));
       }
       // A conflict is not a transient failure, so it is not retried. The edits
       // stay in the model and stay dirty; nothing more goes to disk until the
       // human reloads and decides what to do.
       if (get().conflict !== undefined) return Promise.resolve();
+      if (!pendingWork(get())) return Promise.resolve();
       const dirty = get().dirty;
-      if (dirty.length === 0) return Promise.resolve();
       const canonical = get().canonical;
       const onDisk = get().onDisk;
       const files = dirty.map((path) => {
@@ -364,17 +451,27 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         const believed = onDisk.get(path);
         return { path, contents, expectedHash: believed === undefined ? null : hashText(believed) };
       });
+      // A path the model dropped that this editor never saw on disk needs no
+      // deletion — there is nothing there to delete — so it is dropped from the
+      // batch rather than sent with a precondition that cannot be satisfied.
+      const deletes: PendingDelete[] = [];
+      for (const path of get().removing) {
+        const believed = onDisk.get(path);
+        if (believed !== undefined) deletes.push({ path, expectedHash: hashText(believed) });
+      }
 
       // What this editor believed about disk when the batch left, per path. Only
       // an accepted external edit can change that while a batch is open, and an
       // external edit is *newer news about the disk* than the ack of a write that
       // was already in flight. So the ack is not allowed to overwrite it — see
       // the filter in the success handler.
-      const believedAtSend = new Map(files.map((file) => [file.path, onDisk.get(file.path)]));
+      const believedAtSend = new Map(
+        [...files, ...deletes].map((file) => [file.path, onDisk.get(file.path)] as const),
+      );
 
-      set({ writing: dirty, lastWriteError: undefined });
+      set({ writing: [...dirty, ...deletes.map((file) => file.path)].sort(), lastWriteError: undefined });
       const run = options.sink
-        .write(files)
+        .write(files, deletes)
         .then((outcome) => {
           // The bytes we sent become the new baseline, and the new belief about
           // disk. Dirtiness is recomputed against the *current* model, which may
@@ -394,11 +491,21 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
             persisted.set(file.path, file.contents);
             written.set(file.path, file.contents);
           }
-          const { dirty: stillDirty } = diffAgainst(persisted, get().canonical);
+          for (const file of deletes) {
+            // The same rule as a write: an external edit adopted while this batch
+            // was open is newer news than the batch's own ack. It cannot have been
+            // adopted here without the server having refused the whole batch, but
+            // the check costs nothing and the asymmetry would be invisible.
+            if (written.get(file.path) !== believedAtSend.get(file.path)) continue;
+            persisted.delete(file.path);
+            written.delete(file.path);
+          }
+          const { dirty: stillDirty, removed: stillRemoving } = diffAgainst(persisted, get().canonical);
           set({
             persisted,
             onDisk: written,
             dirty: stillDirty,
+            removing: stillRemoving,
             writing: [],
             unformatted: unformattedIn(written, persisted),
             batchesWritten: get().batchesWritten + 1,
@@ -426,6 +533,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
       persisted: new Map(),
       onDisk: new Map(),
       dirty: [],
+      removing: [],
       writing: [],
       unformatted: [],
       revision: 0,
@@ -457,6 +565,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           persisted: new Map(canonical),
           onDisk,
           dirty: [],
+          removing: [],
           writing: [],
           unformatted: unformattedIn(onDisk, canonical),
           revision: get().revision + 1,
@@ -486,6 +595,17 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           const first = draft.project.tempoMap[0];
           if (first === undefined) throw new Error("cannot set tempo: the project has an empty tempoMap");
           first.bpm = bpm;
+        });
+      },
+
+      setProjectSwing(permille) {
+        // Structural: swing displaces every odd-indexed grid step in the project
+        // (docs/format-spec.md §4), so the events move and the scheduler would
+        // refuse a softer claim.
+        applyEdit("structural", (draft) => {
+          const problem = checkExpressionValue("swing", permille);
+          if (problem !== undefined) throw new Error(problem);
+          draft.project.swing = permille;
         });
       },
 
@@ -552,10 +672,13 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           const merged: StepEvent = { ...(existing ?? { step }) };
           for (const [field, value] of Object.entries(patch) as [keyof StepEventPatch, number | undefined][]) {
             if (value === undefined) {
+              // Removed, never written back as the value it was inheriting. The
+              // file stays as sparse as the author left it, and a diff shows the
+              // one line that changed rather than five that were made explicit.
               delete merged[field];
               continue;
             }
-            checkStepEventField(field, value);
+            checkField(field, value);
             merged[field] = value;
           }
           const rest = lane.stepEvents?.filter((entry) => entry.step !== step) ?? [];
@@ -567,6 +690,170 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           } else {
             lane.stepEvents = next.sort((a, b) => a.step - b.step);
           }
+        });
+      },
+
+      setLaneDefaults(patternId, laneName, patch) {
+        applyEdit("structural", (draft) => {
+          const { lane } = gridLane(draft, patternId, laneName);
+          const merged: LaneDefaults = { ...(lane.defaults ?? {}) };
+          for (const [field, value] of Object.entries(patch) as [keyof LaneDefaultsPatch, number | undefined][]) {
+            if (value === undefined) {
+              delete merged[field];
+              continue;
+            }
+            checkField(field, value);
+            merged[field] = value;
+          }
+          // `minProperties: 1` in the schema: an empty `defaults` is not a
+          // document, so a lane that has stopped defaulting anything drops it.
+          if (Object.keys(merged).length === 0) delete lane.defaults;
+          else lane.defaults = merged;
+        });
+      },
+
+      setLaneStepsPerBar(patternId, laneName, stepsPerBar) {
+        applyEdit("structural", (draft) => {
+          const { lane, bars } = gridLane(draft, patternId, laneName);
+          assertStepGrid(draft, stepsPerBar);
+          const from = lane.grid.stepsPerBar;
+          if (stepsPerBar === from) return;
+          const barTicks = ticksPerBar(draft.project.ppqn, draft.project.meterMap[0]!.timeSignature);
+          const wasStepTicks = barTicks / from;
+          const nowStepTicks = barTicks / stepsPerBar;
+
+          const remap = (step: number): number => {
+            const tick = step * wasStepTicks;
+            const moved = tick / nowStepTicks;
+            if (!Number.isInteger(moved)) {
+              throw new Error(
+                `cannot change lane "${laneName}" to ${stepsPerBar} steps per bar: the hit at step ${step} is at tick ${tick}, which is between steps of that grid. Move or remove it first.`,
+              );
+            }
+            return moved;
+          };
+
+          const hits = hitsOf(lane, patternId, bars).map(remap);
+          const stepEvents = lane.stepEvents?.map((entry) => ({ ...entry, step: remap(entry.step) }));
+          lane.grid.stepsPerBar = stepsPerBar;
+          lane.steps = formatSteps(hits, stepsPerBar, bars);
+          if (stepEvents !== undefined) lane.stepEvents = stepEvents.sort((a, b) => a.step - b.step);
+        });
+      },
+
+      /**
+       * Every automation edit is a `parameters` change, and that is a claim worth
+       * spelling out because it is the one place PLAN.md §12 step 6 is genuinely
+       * interesting.
+       *
+       * An automation lane produces no events. `compile` builds `CompiledTrack.events`
+       * from patterns and clips and `CompiledTrack.automation` beside it, and nothing
+       * in an `automation/<track>.json` can reach the first: a lane cannot add, remove,
+       * move, retime or re-velocity a single note. So the events the worklet already
+       * holds past the horizon stay correct, and a filter sweep can be dragged and
+       * heard in the next control block instead of at the next bar line — which is the
+       * only way dragging a curve is usable at all. Deferring it to a bar would make a
+       * sweep feel like a text field with a one-bar lag.
+       *
+       * That holds for adding and removing a lane too, not only for moving a point:
+       * `AutomationRamps`' buffer is keyed by the instrument's whole automatable param
+       * set, so every registry-legal lane already has a slot, and a removed lane falls
+       * back to the instrument's static value with nothing to rebuild.
+       *
+       * It is checked rather than trusted. `LiveScheduler.updateParameters` recompiles
+       * and compares every event from the horizon on, and throws if one moved — so if
+       * this reasoning is ever made false by a change to the compiler, the failure is
+       * an error naming the divergence, not audio that quietly stops matching the file.
+       */
+      addAutomationLane(trackId, param, interp = "linear") {
+        applyEdit("parameters", (draft) => {
+          const instrument = instrumentOf(draft, trackId);
+          resolveAutomatable(instrument, trackId, param);
+          const existing = draft.automation.get(trackId);
+          if (existing?.lanes.some((lane) => lane.param === param) === true) {
+            throw new Error(`track "${trackId}" already automates "${param}"; a param may have only one lane`);
+          }
+          const seed = staticParamValue(instrument, param);
+          if (seed === undefined) {
+            throw new Error(`cannot automate "${param}" on "${trackId}": it has no numeric value to start from`);
+          }
+          // One point at tick 0 holding what the instrument already produces, so
+          // the lane is audible only once it is shaped. A lane seeded at the
+          // param's minimum would silently rewrite the sound the moment it was
+          // added.
+          const lane: AutomationLane = { param, interp, points: [[0, seed]] };
+          if (existing === undefined) {
+            const doc: AutomationDoc = { track: trackId, lanes: [lane] };
+            draft.automation.set(trackId, doc);
+          } else {
+            existing.lanes.push(lane);
+          }
+        });
+      },
+
+      removeAutomationLane(trackId, param) {
+        applyEdit("parameters", (draft) => {
+          const { doc, index } = automationLane(draft, trackId, param);
+          doc.lanes.splice(index, 1);
+          // A document with no lanes is not a document the schema accepts, so the
+          // last lane takes the file with it. The write path expresses that as a
+          // deletion; see `PendingDelete`.
+          if (doc.lanes.length === 0) draft.automation.delete(trackId);
+        });
+      },
+
+      setAutomationInterp(trackId, param, interp) {
+        applyEdit("parameters", (draft) => {
+          automationLane(draft, trackId, param).lane.interp = interp;
+        });
+      },
+
+      addAutomationPoint(trackId, param, tick, value) {
+        applyEdit("parameters", (draft) => {
+          const { lane, spec } = automationLane(draft, trackId, param);
+          checkAutomationTick(draft, tick);
+          checkAutomationValue(spec, param, value);
+          if (lane.points.some((point) => point[0] === tick)) {
+            throw new Error(`"${param}" already has a point at tick ${tick}; points must be strictly increasing`);
+          }
+          lane.points.push([tick, value]);
+          lane.points.sort((left, right) => left[0] - right[0]);
+        });
+      },
+
+      moveAutomationPoint(trackId, param, index, tick, value) {
+        applyEdit("parameters", (draft) => {
+          const { lane, spec } = automationLane(draft, trackId, param);
+          const point = lane.points[index];
+          if (point === undefined) {
+            throw new Error(`"${param}" on "${trackId}" has ${lane.points.length} points, so there is no point ${index}`);
+          }
+          checkAutomationTick(draft, tick);
+          checkAutomationValue(spec, param, value);
+          const before = lane.points[index - 1]?.[0];
+          const after = lane.points[index + 1]?.[0];
+          if (before !== undefined && tick <= before) {
+            throw new Error(`tick ${tick} is not after the previous point at ${before}; points must be strictly increasing`);
+          }
+          if (after !== undefined && tick >= after) {
+            throw new Error(`tick ${tick} is not before the next point at ${after}; points must be strictly increasing`);
+          }
+          lane.points[index] = [tick, value];
+        });
+      },
+
+      removeAutomationPoint(trackId, param, index) {
+        applyEdit("parameters", (draft) => {
+          const { lane } = automationLane(draft, trackId, param);
+          if (lane.points[index] === undefined) {
+            throw new Error(`"${param}" on "${trackId}" has ${lane.points.length} points, so there is no point ${index}`);
+          }
+          if (lane.points.length === 1) {
+            throw new Error(
+              `"${param}" on "${trackId}" has only one point, and a lane must keep at least one. Remove the lane instead.`,
+            );
+          }
+          lane.points.splice(index, 1);
         });
       },
 
@@ -672,7 +959,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           persisted.set(path, bytes);
           onDisk.set(path, text);
         }
-        const { dirty } = diffAgainst(persisted, canonical);
+        const { dirty, removed: removing } = diffAgainst(persisted, canonical);
         const revision = state.revision + 1;
 
         // The conflict was "the disk moved under us and we do not know how". Now
@@ -689,6 +976,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
           persisted,
           onDisk,
           dirty,
+          removing,
           unformatted: unformattedIn(onDisk, canonical),
           revision,
           conflict,
@@ -711,7 +999,7 @@ export function createDocumentStore(options: DocumentStoreOptions): DocumentStor
         // A file the external edit took over may have been dirty, and now is not.
         // Anything still dirty is an edit to a file the agent did not touch, so it
         // is still owed a write.
-        if (dirty.length > 0) scheduleFlush();
+        if (dirty.length > 0 || removing.length > 0) scheduleFlush();
       },
 
       noteDiskInvalid(diagnostics) {
@@ -807,18 +1095,75 @@ function assertStepGrid(draft: Project, stepsPerBar: number): void {
   }
 }
 
-/** permille fields, per PLAN.md §6.2. */
-function checkPermille(field: string, value: number): void {
-  if (!Number.isInteger(value) || value < 0 || value > 1000) {
-    throw new Error(`${field} must be an integer permille in 0..1000, got ${value}`);
+/**
+ * Refuse a value the expression registry does not allow.
+ *
+ * The ranges are not restated here. `EXPRESSION_FIELDS` is where velocity is
+ * permille and ratchet is at least one, the compiler reads its defaults from the
+ * same table, and `packages/format/test/expressionSchema.test.ts` pins it to the
+ * JSON Schemas — so a bound this store enforced on its own would be a fourth
+ * copy waiting to disagree with the validator.
+ */
+function checkField(field: ExpressionField, value: number): void {
+  const problem = checkExpressionValue(field, value);
+  if (problem !== undefined) throw new Error(problem);
+}
+
+function instrumentOf(draft: Project, trackId: string): InstrumentDoc {
+  const track = draft.tracks.get(trackId);
+  if (track === undefined) throw new Error(`no track "${trackId}"`);
+  const instrument = draft.instruments.get(track.instrument);
+  if (instrument === undefined) {
+    throw new Error(`track "${trackId}" names instrument "${track.instrument}", which does not exist`);
+  }
+  return instrument;
+}
+
+/**
+ * The registry entry an automation lane may target, or a refusal saying which
+ * rule it broke. Both diagnostics `musictool validate` would emit
+ * (`registry.unknown-param`, `automation.param-not-automatable`) are refused
+ * here, before the document moves — writing a file the validator rejects is a
+ * worse outcome than a thrown error the UI can show.
+ */
+function resolveAutomatable(instrument: InstrumentDoc, trackId: string, param: string): ParamSpec {
+  const resolved = resolveParam(instrument, param);
+  if (resolved === undefined) {
+    throw new Error(`"${param}" is not a param of instrument "${instrument.id}" on track "${trackId}"`);
+  }
+  if (!resolved.spec.automatable) {
+    throw new Error(`"${param}" is not automatable`);
+  }
+  return resolved.spec;
+}
+
+function automationLane(
+  draft: Project,
+  trackId: string,
+  param: string,
+): { doc: AutomationDoc; lane: AutomationLane; index: number; spec: ParamSpec } {
+  const doc = draft.automation.get(trackId);
+  if (doc === undefined) throw new Error(`track "${trackId}" has no automation`);
+  const index = doc.lanes.findIndex((lane) => lane.param === param);
+  const lane = doc.lanes[index];
+  if (lane === undefined) throw new Error(`track "${trackId}" has no automation lane for "${param}"`);
+  return { doc, lane, index, spec: resolveAutomatable(instrumentOf(draft, trackId), trackId, param) };
+}
+
+/** Automation ticks are song time, so the arrangement is the bound (§7). */
+function checkAutomationTick(draft: Project, tick: number): void {
+  if (!Number.isInteger(tick) || tick < 0) {
+    throw new Error(`an automation point's tick must be a non-negative integer, got ${tick}`);
+  }
+  if (tick > draft.arrangement.lengthTicks) {
+    throw new Error(`tick ${tick} is past the arrangement's ${draft.arrangement.lengthTicks} ticks`);
   }
 }
 
-function checkStepEventField(field: keyof StepEventPatch, value: number): void {
-  if (!Number.isInteger(value)) throw new Error(`${field} must be an integer, got ${value}`);
-  if (field === "velocity" || field === "probability") return checkPermille(field, value);
-  if (field === "gateTicks" && value <= 0) throw new Error(`gateTicks must be a positive tick count, got ${value}`);
-  if (field === "ratchet" && value < 1) throw new Error(`ratchet must be at least 1, got ${value}`);
+/** The value is in the param's own unit and range, checked by the registry. */
+function checkAutomationValue(spec: ParamSpec, param: string, value: number): void {
+  const problem = checkParamValue(spec, value);
+  if (problem !== undefined) throw new Error(`${value} is not a valid "${param}" value: ${problem}`);
 }
 
 /**
@@ -846,14 +1191,16 @@ function checkNote(note: NoteEvent, pattern: NotesPatternDoc): void {
   if (!Number.isInteger(note.durationTicks) || note.durationTicks <= 0) {
     throw new Error(`durationTicks must be a positive integer, got ${note.durationTicks}`);
   }
-  checkPermille("velocity", note.velocity);
-  if (note.probability !== undefined) checkPermille("probability", note.probability);
-  if (note.microTicks !== undefined && !Number.isInteger(note.microTicks)) {
-    throw new Error(`microTicks must be an integer, got ${note.microTicks}`);
+  checkField("velocity", note.velocity);
+  for (const field of NOTE_EXPRESSION_FIELDS) {
+    const value = note[field];
+    if (value !== undefined) checkField(field, value);
   }
-  if (note.ratchet !== undefined && (!Number.isInteger(note.ratchet) || note.ratchet < 1)) {
-    throw new Error(`ratchet must be an integer of at least 1, got ${note.ratchet}`);
-  }
+}
+
+/** Whether there is anything left to send: bytes to write, or a file to remove. */
+function pendingWork(state: DocumentState): boolean {
+  return state.dirty.length > 0 || state.removing.length > 0;
 }
 
 /** Documents whose bytes on disk are valid but not the canonical form. */

@@ -1,7 +1,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { BASIC_MONO_PARAMS, BASIC_POLY_PARAMS, DRUMKIT_VOICE_PARAMS, type ParamSpec } from "../src/registry.js";
+import {
+  BASIC_MONO_PARAMS,
+  BASIC_POLY_PARAMS,
+  DRUMKIT_VOICE_PARAMS,
+  PARAM_UNIT_LABELS,
+  type ParamSpec,
+} from "../src/registry.js";
 
 /**
  * The parameter registry is documented in two places an agent may read without
@@ -13,17 +19,6 @@ const DOCS = [
   { label: "docs/format-spec.md", path: fileURLToPath(new URL("../../../docs/format-spec.md", import.meta.url)) },
   { label: "PLAN.md", path: fileURLToPath(new URL("../../../PLAN.md", import.meta.url)) },
 ] as const;
-
-const UNIT_LABELS: Record<ParamSpec["unit"], string> = {
-  Hz: "Hz",
-  ms: "ms",
-  cents: "cents",
-  permille: "permille",
-  dB100: "dB×100",
-  bpm100: "bpm×100",
-  count: "count",
-  enum: "enum",
-};
 
 interface DocumentedParam {
   unit: string;
@@ -76,7 +71,7 @@ function registryFacts(spec: ParamSpec): ParamFacts {
   }
   if (spec.min === undefined || spec.max === undefined) throw new Error("numeric param has no bounds");
   return {
-    unit: UNIT_LABELS[spec.unit],
+    unit: PARAM_UNIT_LABELS[spec.unit],
     bounds: [spec.min, spec.max],
     values: undefined,
     default: String(spec.default),

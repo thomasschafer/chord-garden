@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -14,6 +14,7 @@ import {
   WriteConflictError,
   type DocumentSink,
   type DocumentStore,
+  type PendingDelete,
   type PendingFile,
 } from "../src/store/documentStore";
 import { FIXTURE, REPO_ROOT, openedFrom } from "./fixture";
@@ -70,10 +71,10 @@ afterEach(async () => {
  */
 function httpSink(): DocumentSink {
   return {
-    async write(files: readonly PendingFile[]) {
-      const response = await post("/api/projects/p/write", JSON.stringify({ files }));
+    async write(files: readonly PendingFile[], deletes: readonly PendingDelete[]) {
+      const response = await post("/api/projects/p/write", JSON.stringify({ files, deletes }));
       if (response.status === WRITE_CONFLICT_STATUS) {
-        throw new WriteConflictError(response.body, files.map((file) => file.path));
+        throw new WriteConflictError(response.body, [...files, ...deletes].map((file) => file.path));
       }
       if (response.status !== 200) throw new Error(`write failed: ${response.status} ${response.body}`);
       return { diagnostics: [] };
@@ -116,6 +117,25 @@ function fmtCheck(): { code: number; stdout: string } {
   const io: CliIo = { stdout: { write: (value) => (stdout += value) }, stderr: { write: (value) => (stderr += value) } };
   const code = runCli(["fmt", root, "--check"], io);
   return { code, stdout: stdout + stderr };
+}
+
+/**
+ * The lines that differ between two versions of one file, positionally.
+ *
+ * Deliberately naive — same line count or it throws — because that *is* the
+ * assertion: an edit that adds or removes a line of a document it was only
+ * supposed to change a value in has already failed, and a diff algorithm clever
+ * enough to align around it would hide that.
+ */
+function diffLines(before: string, after: string): { before: string; after: string }[] {
+  const left = before.split("\n");
+  const right = after.split("\n");
+  if (left.length !== right.length) {
+    throw new Error(`the file went from ${left.length} lines to ${right.length}; this edit should not resize it`);
+  }
+  return left
+    .map((line, index) => ({ before: line, after: right[index]! }))
+    .filter((pair) => pair.before !== pair.after);
 }
 
 /** Every document's bytes on disk right now. */
@@ -212,6 +232,155 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     ]);
   });
 
+  /**
+   * The expression half of stage 1. Worth its own case because a `stepEvents`
+   * entry is the densest thing in the format — five optional fields, sparse by
+   * design, sorted by `fmt` — and the failure mode a UI reaches for is writing
+   * back every field of the entry it touched, with the inherited values made
+   * explicit. That produces a valid, canonical, *bigger* file whose diff claims
+   * five changes for one edit, and `fmt --check` cannot see it because the bytes
+   * are canonical. So the assertions are on the content, not only on `fmt`.
+   */
+  it("leaves the project already canonical after editing per-step and lane expression", async () => {
+    store.getState().setStepEvent("drums-verse", "hat", 2, { velocity: 420 });
+    store.getState().setLaneDefaults("drums-verse", "hat", { swing: 300, probability: 950 });
+    await store.getState().flushNow();
+
+    const check = fmtCheck();
+    expect(check.stdout).toBe("already canonical\n");
+    expect(check.code).toBe(0);
+
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(onDisk()).toEqual(canonicalFiles(reloaded.project!));
+
+    const pattern = reloaded.project!.patterns.get("drums-verse")!;
+    if (pattern.kind !== "grid") throw new Error("the pattern stopped being a grid");
+    const hat = pattern.lanes.find((lane) => lane.lane === "hat")!;
+    // One field of one entry moved. `probability: 800` on step 2 is still there
+    // rather than having been re-stated or dropped, step 8 is untouched, and the
+    // lane gained exactly the two defaults asked for beside the velocity it had.
+    expect(hat.stepEvents).toEqual([
+      { step: 2, velocity: 420, probability: 800 },
+      { step: 8, microTicks: -12, gateTicks: 120, ratchet: 2 },
+    ]);
+    expect(hat.defaults).toEqual({ velocity: 600, probability: 950, swing: 300 });
+    expect(hat.steps).toBe("x.x. x.x. x.x. x.x.");
+    // And the lane nobody touched is byte-for-byte what it was.
+    expect(pattern.lanes.find((lane) => lane.lane === "kick")).toEqual({
+      lane: "kick",
+      grid: { stepsPerBar: 16 },
+      steps: "x..x ..x. x..x ..x.",
+    });
+  });
+
+  /**
+   * Clearing an override must remove it, not write the value it was inheriting.
+   * The difference is invisible in the sound and very visible in the file, which
+   * is exactly the kind of divergence a byte-level test is for.
+   */
+  it("removes a cleared override instead of writing the inherited value back", async () => {
+    store.getState().setStepEvent("drums-verse", "hat", 2, { probability: undefined });
+    store.getState().setStepEvent("drums-verse", "hat", 8, {
+      microTicks: undefined,
+      gateTicks: undefined,
+      ratchet: undefined,
+    });
+    await store.getState().flushNow();
+
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+    const text = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+    expect(text).not.toContain("probability");
+    // Step 8 had nothing left, so its whole entry went with it.
+    expect(text).not.toContain('"step": 8');
+    const pattern = loadProject(root).project!.patterns.get("drums-verse")!;
+    if (pattern.kind !== "grid") throw new Error("the pattern stopped being a grid");
+    expect(pattern.lanes.find((lane) => lane.lane === "hat")!.stepEvents).toEqual([{ step: 2, velocity: 350 }]);
+  });
+
+  it("leaves the project already canonical after editing an automation curve", async () => {
+    store.getState().moveAutomationPoint("pad", "filter.cutoff", 1, 26_880, 6500);
+    store.getState().addAutomationPoint("pad", "filter.cutoff", 46_080, 1200);
+    store.getState().setAutomationInterp("pad", "filter.cutoff", "step");
+    await store.getState().flushNow();
+
+    const check = fmtCheck();
+    expect(check.stdout).toBe("already canonical\n");
+    expect(check.code).toBe(0);
+
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(onDisk()).toEqual(canonicalFiles(reloaded.project!));
+    expect(reloaded.project!.automation.get("pad")!.lanes).toEqual([
+      {
+        param: "filter.cutoff",
+        interp: "step",
+        // Strictly increasing, with the untouched points exactly as they were.
+        points: [
+          [0, 200],
+          [26_880, 6500],
+          [46_080, 1200],
+          [61_440, 800],
+        ],
+      },
+    ]);
+  });
+
+  it("creates a track's first automation file in canonical bytes", async () => {
+    expect(existsSync(join(root, "automation/bass.json"))).toBe(false);
+
+    store.getState().addAutomationLane("bass", "gain");
+    store.getState().addAutomationPoint("bass", "gain", 30_720, -2400);
+    await store.getState().flushNow();
+
+    const check = fmtCheck();
+    expect(check.stdout).toBe("already canonical\n");
+    expect(check.code).toBe(0);
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(onDisk()).toEqual(canonicalFiles(reloaded.project!));
+    // Seeded from the instrument's own `gain` of -1000 (PLAN.md §8), not from
+    // the registry's 0 and not from the bottom of the range: adding a lane must
+    // not change the sound.
+    expect(reloaded.project!.automation.get("bass")!.lanes).toEqual([
+      { param: "gain", interp: "linear", points: [[0, -1000], [30_720, -2400]] },
+    ]);
+  });
+
+  it("removes the automation file when its last lane goes, rather than leaving an empty one", async () => {
+    store.getState().removeAutomationLane("pad", "filter.cutoff");
+    await store.getState().flushNow();
+
+    expect(existsSync(join(root, "automation/pad.json"))).toBe(false);
+    const reloaded = loadProject(root);
+    expect(reloaded.ok).toBe(true);
+    expect(reloaded.project!.automation.size).toBe(0);
+    expect(fmtCheck().stdout).toBe("already canonical\n");
+    expect(store.getState().removing).toEqual([]);
+  });
+
+  /**
+   * The no-data-loss claim, stated as a property rather than field by field:
+   * after one edit, every document except the one edited is byte-identical, and
+   * the edited one differs from its original in exactly the lines the edit was
+   * about.
+   */
+  it("changes one line of one file for an automation point move, and nothing else anywhere", async () => {
+    const before = onDisk();
+
+    store.getState().moveAutomationPoint("pad", "filter.cutoff", 1, 30_720, 4100);
+    await store.getState().flushNow();
+
+    const after = onDisk();
+    expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+    for (const [path, text] of after) {
+      if (path === "automation/pad.json") continue;
+      expect(text, `${path} was rewritten by an edit to automation/pad.json`).toBe(before.get(path));
+    }
+    const changed = diffLines(before.get("automation/pad.json")!, after.get("automation/pad.json")!);
+    expect(changed).toEqual([{ before: "        [30720, 4000],", after: "        [30720, 4100]," }]);
+  });
+
   it("writes exactly the bytes the store held, with no server-side reformatting", async () => {
     store.getState().setProjectName("Byte for byte");
     const expected = store.getState().canonical.get("project.json");
@@ -291,6 +460,63 @@ describe("a UI edit is byte-identical to what the CLI would write", () => {
     expect(check.code).toBe(1);
     expect(check.stdout).toContain("would rewrite patterns/bass-main.json");
     expect(check.stdout).toContain("sort order");
+  });
+
+  /**
+   * The automation assertions above are only worth anything if `fmt --check`
+   * would notice an automation file written the obvious wrong way. `fmt` puts
+   * each `[tick, value]` pair on one line (docs/format-spec.md §5.2), which is
+   * precisely what a generic pretty-printer does not do, so that is the shape to
+   * test with.
+   */
+  it("bites for automation: a pretty-printed points array is reported by fmt", () => {
+    const path = join(root, "automation/pad.json");
+    const doc = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    writeFileSync(path, `${JSON.stringify(doc, null, 2)}\n`);
+
+    // Still a project the loader accepts: this is layout, not a broken document,
+    // which is exactly why only `fmt` can catch it.
+    expect(loadProject(root).ok).toBe(true);
+    const check = fmtCheck();
+
+    expect(check.code).toBe(1);
+    expect(check.stdout).toContain("would rewrite automation/pad.json");
+  });
+
+  it("bites for automation: the server refuses hand-rolled automation bytes", async () => {
+    const path = join(root, "automation/pad.json");
+    const before = readFileSync(path, "utf8");
+    const naive = `${JSON.stringify(JSON.parse(before), null, 2)}\n`;
+    expect(naive).not.toBe(before);
+
+    const response = await post(
+      "/api/projects/p/write",
+      JSON.stringify({ files: [{ path: "automation/pad.json", contents: naive, expectedHash: hashText(before) }] }),
+    );
+
+    expect(response.status).toBe(422);
+    expect(response.body).toContain("canonical");
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  /**
+   * The deletion path's own precondition. Without it a window that has been open
+   * across an agent's edit would remove a file it has never read — the lost
+   * update the write path's `expectedHash` exists to prevent, in the one shape
+   * where the loss is total.
+   */
+  it("bites for deletion: a stale precondition refuses the removal and writes nothing", async () => {
+    const path = join(root, "automation/pad.json");
+    const before = readFileSync(path, "utf8");
+
+    const response = await post(
+      "/api/projects/p/write",
+      JSON.stringify({ files: [], deletes: [{ path: "automation/pad.json", expectedHash: hashText("not these bytes") }] }),
+    );
+
+    expect(response.status).toBe(409);
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(before);
   });
 
   it("bites the other way: a non-canonical file on disk is reported by fmt, so the check is not vacuous", () => {

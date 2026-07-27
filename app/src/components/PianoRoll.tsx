@@ -1,8 +1,19 @@
-import { midiToPitch, pitchToMidi, type NoteEvent, type NotesPatternDoc, type Project } from "@chord-garden/format/pure";
+import {
+  describeExpressionRange,
+  EXPRESSION_FIELDS,
+  midiToPitch,
+  NOTE_EXPRESSION_FIELDS,
+  pitchToMidi,
+  type ExpressionField,
+  type NoteEvent,
+  type NotesPatternDoc,
+  type Project,
+} from "@chord-garden/format/pure";
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useStore } from "zustand";
 import { documentStore } from "../session";
-import type { NotePatch, OptionalNoteField, RequiredNoteField } from "../store/documentStore";
+import type { NotePatch, RequiredNoteField } from "../store/documentStore";
+import { DRAG_THRESHOLD_PX, draggedVelocity, expressionFraction } from "../view/expression";
 import { defaultSnapTicks, gridGeometry, ROW_PX, snapNearest, snapOptions } from "../view/grid";
 import {
   hasExpression,
@@ -18,6 +29,7 @@ import {
 } from "../view/roll";
 import { DraftField } from "./DraftField";
 import { PatternPlayhead } from "./Playhead";
+import { useDragState } from "./useDragState";
 
 /**
  * A piano roll for one note pattern: notes placed by `startTick` and pitch, with a
@@ -43,6 +55,13 @@ import { PatternPlayhead } from "./Playhead";
  * untouched through a move or a resize, they are marked on the note, and they are
  * editable in the inspector. A roll that dropped them on the first drag would be
  * the quiet data loss this whole format is arranged to prevent.
+ *
+ * Velocity gets its own strip under the canvas rather than a vertical drag on
+ * the note itself, because a note's vertical axis already means pitch and one
+ * gesture cannot mean two things. The strip is inside the same scroll box as the
+ * canvas, so it stays aligned with the notes it belongs to at any scroll
+ * position, and sticks to the bottom of the viewport so it survives the roll's
+ * own vertical scroll.
  */
 export function PianoRoll({
   project,
@@ -60,7 +79,7 @@ export function PianoRoll({
 
   const [snapTicks, setSnapTicks] = useState(() => defaultSnapTicks(project));
   const [selected, setSelected] = useState<number | undefined>(undefined);
-  const [drag, setDrag] = useState<Drag | undefined>(undefined);
+  const { shown: drag, ref: dragRef, set: setDrag } = useDragState<Drag>();
   const [error, setError] = useState<string | undefined>(undefined);
   const rangeRef = useRef<{ patternId: string; range: PitchRange } | undefined>(undefined);
 
@@ -127,12 +146,13 @@ export function PianoRoll({
   }
 
   function moveDrag(event: ReactPointerEvent<HTMLElement>): void {
-    if (drag === undefined) return;
-    const ticks = snapNearest(Math.abs(event.clientX - drag.originX) / geometry.pxPerTick, snapTicks);
-    const signedTicks = event.clientX < drag.originX ? -ticks : ticks;
-    const rowsMoved = drag.mode === "move" ? -Math.round((event.clientY - drag.originY) / ROW_PX) : 0;
-    if (signedTicks === drag.deltaTicks && rowsMoved === drag.deltaRows) return;
-    setDrag({ ...drag, deltaTicks: signedTicks, deltaRows: rowsMoved });
+    const current = dragRef.current;
+    if (current === undefined) return;
+    const ticks = snapNearest(Math.abs(event.clientX - current.originX) / geometry.pxPerTick, snapTicks);
+    const signedTicks = event.clientX < current.originX ? -ticks : ticks;
+    const rowsMoved = current.mode === "move" ? -Math.round((event.clientY - current.originY) / ROW_PX) : 0;
+    if (signedTicks === current.deltaTicks && rowsMoved === current.deltaRows) return;
+    setDrag({ ...current, deltaTicks: signedTicks, deltaRows: rowsMoved });
   }
 
   /** The change the drag in progress would make, for both the preview and the commit. */
@@ -143,11 +163,12 @@ export function PianoRoll({
   }
 
   function endDrag(): void {
-    if (drag === undefined) return;
-    const next = pendingChange(drag);
+    const current = dragRef.current;
+    if (current === undefined) return;
+    const next = pendingChange(current);
     setDrag(undefined);
     if (next === undefined) return;
-    attempt(() => updateNote(pattern.id, drag.index, next));
+    attempt(() => updateNote(pattern.id, current.index, next));
   }
 
   return (
@@ -170,15 +191,15 @@ export function PianoRoll({
           click empty space to add a note · drag to move · drag the right edge to resize · Delete removes
         </span>
       </div>
-      <div className="editor-grid">
-        <div className="keys">
-          {rows.map((midi) => (
-            <div key={midi} className={isBlackKey(midi) ? "key black" : "key"}>
-              {midi % 12 === 0 || rows.length <= 14 ? midiToPitch(midi) : ""}
-            </div>
-          ))}
-        </div>
-        <div className="lane-scroll">
+      <div className="editor-grid roll-grid">
+        <div className="roll-body">
+          <div className="keys">
+            {rows.map((midi) => (
+              <div key={midi} className={isBlackKey(midi) ? "key black" : "key"}>
+                {midi % 12 === 0 || rows.length <= 14 ? midiToPitch(midi) : ""}
+              </div>
+            ))}
+          </div>
           <div
             className="roll-canvas"
             style={{
@@ -279,6 +300,15 @@ export function PianoRoll({
               pxPerTick={geometry.pxPerTick}
             />
           </div>
+          <div className="vel-label">velocity</div>
+          <VelocityStrip
+            notes={pattern.notes}
+            pxPerTick={geometry.pxPerTick}
+            width={canvasWidth}
+            selected={selected}
+            onSelect={setSelected}
+            onCommit={(index, velocity) => attempt(() => updateNote(pattern.id, index, { velocity }))}
+          />
         </div>
       </div>
       <NoteInspector
@@ -297,8 +327,99 @@ export function PianoRoll({
   );
 }
 
-/** Velocity a newly placed note gets: the same 800 the compiler uses for a grid hit. */
-const DEFAULT_VELOCITY = 800;
+/**
+ * Velocity a newly placed note gets. The format's own default for a hit that
+ * says nothing, taken from the registry rather than written down again here — a
+ * note the roll places and a grid hit with no override should not be able to
+ * disagree about what "normal" is.
+ */
+const DEFAULT_VELOCITY = EXPRESSION_FIELDS.velocity.default;
+
+/** Height of the velocity strip under the roll, in CSS pixels. */
+const STRIP_PX = 56;
+
+/** A press on a velocity bar, until it is known to be a drag. */
+interface VelocityPress {
+  index: number;
+  originY: number;
+  from: number;
+  velocity: number;
+  dragging: boolean;
+}
+
+/**
+ * A draggable bar per note, at the note's own position and width.
+ *
+ * Velocity is the one note field worth a direct gesture: it is edited more than
+ * everything else combined, and reading a part's dynamics as a row of bars is
+ * the difference between seeing a phrase and reading a table. Everything else
+ * stays in the inspector, where a number is what you actually want.
+ *
+ * A press that never moves is a selection, so clicking a bar is how you find the
+ * note it belongs to in a crowded roll.
+ */
+function VelocityStrip({
+  notes,
+  pxPerTick,
+  width,
+  selected,
+  onSelect,
+  onCommit,
+}: {
+  notes: readonly NoteEvent[];
+  pxPerTick: number;
+  width: number;
+  selected: number | undefined;
+  onSelect: (index: number) => void;
+  onCommit: (index: number, velocity: number) => void;
+}): React.JSX.Element {
+  const { shown: press, ref: pressRef, set: setPress } = useDragState<VelocityPress>();
+
+  return (
+    <div className="vel-strip" style={{ width, height: STRIP_PX }}>
+      {notes.map((note, index) => {
+        const velocity = press?.index === index && press.dragging ? press.velocity : note.velocity;
+        const label = `${note.pitch} velocity ${velocity}`;
+        return (
+          <button
+            key={index}
+            type="button"
+            className={`vel-bar${selected === index ? " selected" : ""}`}
+            style={{
+              left: note.startTick * pxPerTick,
+              width: Math.max(3, note.durationTicks * pxPerTick),
+              height: Math.max(2, expressionFraction("velocity", velocity) * STRIP_PX),
+            }}
+            title={`${label} — drag up or down to change it`}
+            aria-label={label}
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              onSelect(index);
+              setPress({ index, originY: event.clientY, from: note.velocity, velocity: note.velocity, dragging: false });
+            }}
+            onPointerMove={(event) => {
+              const current = pressRef.current;
+              if (current?.index !== index) return;
+              const deltaY = event.clientY - current.originY;
+              if (!current.dragging && Math.abs(deltaY) < DRAG_THRESHOLD_PX) return;
+              const next = draggedVelocity(current.from, deltaY);
+              if (current.dragging && next === current.velocity) return;
+              setPress({ ...current, dragging: true, velocity: next });
+            }}
+            onPointerUp={() => {
+              const finished = pressRef.current;
+              setPress(undefined);
+              if (finished?.index !== index || !finished.dragging) return;
+              if (finished.velocity === note.velocity) return;
+              onCommit(index, finished.velocity);
+            }}
+            onPointerCancel={() => setPress(undefined)}
+          />
+        );
+      })}
+    </div>
+  );
+}
 
 type DragMode = "move" | "resize";
 
@@ -352,16 +473,25 @@ const BarLines = memo(function BarLines({
   );
 });
 
-/** Units, for the label beside each box; the format's, not a guess. */
-const NOTE_FIELD_UNITS: Record<RequiredNoteField | OptionalNoteField, string> = {
+/**
+ * Captions for the fields whose meaning is positional rather than expressive.
+ *
+ * The expression fields are deliberately absent: `describeExpressionRange` is
+ * where velocity is permille and ratchet is at least one, and a second table
+ * here is a second thing to update when the registry changes.
+ */
+const POSITION_FIELD_UNITS: Record<Exclude<RequiredNoteField, "velocity">, string> = {
   pitch: "C4 = MIDI 60",
   startTick: "ticks from pattern start",
   durationTicks: "ticks",
-  velocity: "permille 0..1000",
-  microTicks: "ticks, \u00b1",
-  probability: "permille 0..1000",
-  ratchet: "repeats \u2265 1",
 };
+
+/** The caption for any note field, whichever kind it is. */
+function noteFieldUnit(field: RequiredNoteField | ExpressionField): string {
+  return field === "pitch" || field === "startTick" || field === "durationTicks"
+    ? POSITION_FIELD_UNITS[field]
+    : describeExpressionRange(field);
+}
 
 /**
  * Every field of the selected note, including the optional ones it does not set.
@@ -420,7 +550,7 @@ function NoteInspector({
             size={5}
             onCommit={(text) => apply({ pitch: text.trim() })}
           />
-          <span className="muted">{NOTE_FIELD_UNITS.pitch}</span>
+          <span className="muted">{noteFieldUnit("pitch")}</span>
         </label>
         {(["startTick", "durationTicks", "velocity"] as const).map((field) => (
           <label key={field}>
@@ -436,22 +566,24 @@ function NoteInspector({
                 apply({ [field]: Number(text) });
               }}
             />
-            <span className="muted">{NOTE_FIELD_UNITS[field]}</span>
+            <span className="muted">{noteFieldUnit(field)}</span>
           </label>
         ))}
-        {(["microTicks", "probability", "ratchet"] as const).map((field) => (
+        {NOTE_EXPRESSION_FIELDS.map((field) => (
           <label key={field}>
             {field}
             <DraftField
               kind="number"
               label={`note ${index} ${field}`}
               value={note[field] === undefined ? "" : String(note[field])}
-              placeholder="unset"
+              // The value the compiler applies when the note says nothing, so an
+              // empty box reads as "inherits 1000" rather than "no probability".
+              placeholder={String(EXPRESSION_FIELDS[field].default ?? "")}
               onCommit={(text) => {
                 apply(text.trim() === "" ? { [field]: undefined } : { [field]: Number(text) });
               }}
             />
-            <span className="muted">{NOTE_FIELD_UNITS[field]}</span>
+            <span className="muted">{noteFieldUnit(field)}</span>
           </label>
         ))}
       </div>
