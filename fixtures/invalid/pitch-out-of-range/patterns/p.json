@@ -1,0 +1,19 @@
+{
+  "id": "p",
+  "kind": "notes",
+  "lengthTicks": 3840,
+  "notes": [
+    {
+      "pitch": "A9",
+      "startTick": 0,
+      "durationTicks": 480,
+      "velocity": 800
+    },
+    {
+      "pitch": "Cb-1",
+      "startTick": 960,
+      "durationTicks": 480,
+      "velocity": 800
+    }
+  ]
+}

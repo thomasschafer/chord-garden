@@ -1,0 +1,8 @@
+{
+  "id": "t",
+  "type": "instrument",
+  "instrument": "s",
+  "patterns": [
+    "ghost"
+  ]
+}

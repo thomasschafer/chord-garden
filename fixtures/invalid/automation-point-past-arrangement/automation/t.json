@@ -1,0 +1,19 @@
+{
+  "track": "t",
+  "lanes": [
+    {
+      "param": "filter.cutoff",
+      "interp": "linear",
+      "points": [
+        [
+          0,
+          800
+        ],
+        [
+          99999,
+          900
+        ]
+      ]
+    }
+  ]
+}

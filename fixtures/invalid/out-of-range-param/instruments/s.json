@@ -1,0 +1,8 @@
+{
+  "id": "s",
+  "type": "synth",
+  "engine": "basic-mono",
+  "params": {
+    "filter.cutoff": 50000
+  }
+}

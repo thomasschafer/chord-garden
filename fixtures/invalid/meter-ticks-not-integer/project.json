@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "name": "broken",
+  "ppqn": 25,
+  "tempoMap": [
+    {
+      "startTick": 0,
+      "bpm": 12000
+    }
+  ],
+  "meterMap": [
+    {
+      "startTick": 0,
+      "timeSignature": [
+        1,
+        16
+      ]
+    }
+  ],
+  "swing": 0,
+  "trackOrder": []
+}

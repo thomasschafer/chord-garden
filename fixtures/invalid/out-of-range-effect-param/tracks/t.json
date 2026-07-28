@@ -1,0 +1,15 @@
+{
+  "id": "t",
+  "type": "instrument",
+  "instrument": "s",
+  "patterns": [],
+  "effects": [
+    {
+      "id": "slap",
+      "type": "delay",
+      "params": {
+        "feedback": 5000
+      }
+    }
+  ]
+}

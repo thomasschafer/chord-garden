@@ -8,7 +8,11 @@ export interface JsonObject {
 export interface ParseResult {
   /** Present only when parsing succeeded with no diagnostics. */
   value?: JsonValue;
-  /** JSON Pointer → location of the value (or key, for object members). */
+  /**
+   * JSON Pointer → location of the value it points at. Always the value, never
+   * the member's key: a semantic diagnostic placed through this map points at
+   * the thing that is wrong rather than at the name in front of it.
+   */
   locs: Map<string, Loc>;
   diagnostics: Diagnostic[];
 }
