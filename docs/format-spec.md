@@ -49,6 +49,18 @@ persisted numeric quantity is an integer in one of these units:
 this rule; a float anywhere in a canonical file is a validation error
 (`number.float`).
 
+**A permille that scales a signal is a linear amplitude coefficient** — never a
+power, a decibel value, or a perceived-loudness curve. `velocity: 500` renders at
+exactly half the amplitude of `velocity: 1000` (−6.02 dB), and `velocity: 0` is
+exactly silent; `amp.sustain: 900` holds the envelope at 0.9 of its peak. This is
+a decision rather than an inherited convention: MIDI implementations disagree
+about whether velocity is amplitude or power, and this format settles it as
+amplitude so that one unit means one thing everywhere. Levels wanting a
+logarithmic response have a unit of their own — `gain` is dB×100 — and an author
+wanting a steeper velocity response shapes it in the velocity values themselves
+rather than in a hidden curve. The law is identical for a synth note's `velocity`
+and a drum hit's, so the two instrument types answer the same edit the same way.
+
 The rule is about numbers, and not every field is one. The fields that are
 strings, and so appear in no unit table: a note event's `pitch`, which is a
 note name like `"A1"` and **not** a MIDI number — `"pitch": 33` fails

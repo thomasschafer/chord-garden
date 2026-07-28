@@ -1,5 +1,5 @@
 import { rampValue, type ParamRamps } from "./control.js";
-import { centsToRatio, db100ToGain, panGains } from "./units.js";
+import { centsToRatio, db100ToGain, panGains, velocityToGain } from "./units.js";
 
 export interface SampleData {
   sampleRate: number;
@@ -201,7 +201,7 @@ export class DrumkitProcessor {
       // Linear interpolation is deterministic and sufficient for v1, though
       // it is not an audiophile-grade resampler.
       rate: (sample.sampleRate / this.sampleRate) * centsToRatio(settings.pitchCents),
-      velocityGain: command.velocity / 1000,
+      velocityGain: velocityToGain(command.velocity),
       chokeSamplesRemaining: 0,
       chokeSamplesTotal: 1,
     });

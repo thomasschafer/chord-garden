@@ -3,7 +3,7 @@ import { rampValue, type ParamRamps } from "./control.js";
 import { AdsrEnvelope } from "./envelope.js";
 import { BiquadFilter, type FilterType } from "./filter.js";
 import { Oscillator, type OscillatorShape } from "./oscillator.js";
-import { centsToRatio, db100ToGain, midiToFrequency, msToSamples, panGains } from "./units.js";
+import { centsToRatio, db100ToGain, midiToFrequency, msToSamples, panGains, velocityToGain } from "./units.js";
 
 export interface SynthSettings {
   oscillator: OscillatorShape;
@@ -78,8 +78,7 @@ class SynthVoice {
   noteOn(command: NoteCommand, settings: SynthSettings, startedOrder: number, glide: boolean): void {
     this.noteId = command.noteId;
     this.midi = command.midi;
-    // Linear-amplitude velocity is monotonic and makes velocity zero exactly silent.
-    this.velocityGain = command.velocity / 1000;
+    this.velocityGain = velocityToGain(command.velocity);
     this.keyDown = true;
     this.startedOrder = startedOrder;
     this.releasedOrder = -1;
