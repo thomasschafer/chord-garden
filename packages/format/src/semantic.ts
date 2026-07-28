@@ -4,8 +4,16 @@ import { readRegularFile } from "./readFile.js";
 import type { DiagnosticCollector, Loc, Severity } from "./diagnostics.js";
 import { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
 import type { LoadedFile } from "./loadProject.js";
-import type { GridPatternDoc, InstrumentDoc, NotesPatternDoc, Project, TrackDoc } from "./model.js";
-import { ticksPerBar } from "./musicTime.js";
+import type {
+  GridPatternDoc,
+  InstrumentDoc,
+  NotesPatternDoc,
+  PatternDoc,
+  Project,
+  TrackDoc,
+} from "./model.js";
+import { EXPRESSION_FIELDS } from "./expression.js";
+import { gridStepOffsetTicks, ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
 import { pitchToMidi } from "./pitch.js";
 import {
@@ -56,6 +64,44 @@ export function semanticValidate(
   const referencedPatterns = new Set<string>();
   const referencedInstruments = new Set<string>();
 
+  /**
+   * A pattern is used by a track through two independent references — the
+   * track's own `patterns` list and an `arrangement` clip — and both have to be
+   * judged the same way, because the *renderer* only ever sees the clip. A
+   * pairing checked here but not there is a project that validates and then
+   * fails to render; the reverse is a project that renders and is refused.
+   *
+   * Only the kit check is deduplicated: it reports into the pattern file at a
+   * pointer that does not mention the reference, so the same pairing reached
+   * twice would produce two byte-identical diagnostics. A kind mismatch names
+   * the reference itself, so every reference that is wrong is worth saying.
+   */
+  const kitCheckedPairings = new Set<string>();
+  const checkPatternPairing = (track: TrackDoc, pattern: PatternDoc, file: string, pointer: string): void => {
+    const expectedKind = track.type === "drumkit" ? "grid" : "notes";
+    if (pattern.kind !== expectedKind) {
+      report(
+        "error",
+        "track.pattern-kind-mismatch",
+        file,
+        pointer,
+        `track "${track.id}" (type "${track.type}") may only use "${expectedKind}" patterns, but "${pattern.id}" is a "${pattern.kind}" pattern`,
+      );
+    }
+    const instrument = project.instruments.get(track.instrument);
+    if (pattern.kind !== "grid" || instrument?.type !== "drumkit") return;
+    const pairing = `${track.id} ${pattern.id}`;
+    if (kitCheckedPairings.has(pairing)) return;
+    kitCheckedPairings.add(pairing);
+    checkGridLanesAgainstKit(track, pattern, instrument.kit, report);
+  };
+
+  // Clip references are collected before the orphan sweep below: a pattern a
+  // clip plays is in use, whatever any track's `patterns` list says.
+  for (const clip of project.arrangement.clips) {
+    referencedPatterns.add(clip.pattern);
+  }
+
   for (const track of project.tracks.values()) {
     const file = trackFileOf(track.id);
     checkEffects(project, track, file, report);
@@ -97,19 +143,7 @@ export function semanticValidate(
         );
         return;
       }
-      const expectedKind = track.type === "drumkit" ? "grid" : "notes";
-      if (pattern.kind !== expectedKind) {
-        report(
-          "error",
-          "track.pattern-kind-mismatch",
-          file,
-          `/patterns/${i}`,
-          `track "${track.id}" (type "${track.type}") may only use "${expectedKind}" patterns, but "${patternId}" is a "${pattern.kind}" pattern`,
-        );
-      }
-      if (pattern.kind === "grid" && instrument?.type === "drumkit") {
-        checkGridLanesAgainstKit(track, pattern, instrument.kit, report);
-      }
+      checkPatternPairing(track, pattern, file, `/patterns/${i}`);
     });
   }
 
@@ -139,7 +173,8 @@ export function semanticValidate(
     }
   }
 
-  checkArrangement(project, report);
+  checkArrangement(project, report, checkPatternPairing);
+  checkEventsReachTimeline(project, barTicks, report);
   checkAutomation(project, report);
   checkSamples(project, report);
 }
@@ -219,8 +254,17 @@ function checkTrackOrder(project: Project, report: Report): void {
       );
     }
   });
+  const clipCounts = new Map<string, number>();
+  for (const clip of project.arrangement.clips) {
+    clipCounts.set(clip.track, (clipCounts.get(clip.track) ?? 0) + 1);
+  }
+
   for (const id of project.tracks.keys()) {
-    if (!seen.has(id)) {
+    if (seen.has(id)) continue;
+    const clips = clipCounts.get(id) ?? 0;
+    if (clips === 0) {
+      // Nothing plays on it, so leaving it out of `trackOrder` costs no music.
+      // PLAN.md §8.1 calls this an orphan, warning for now.
       report(
         "warning",
         "orphan.track",
@@ -229,7 +273,24 @@ function checkTrackOrder(project: Project, report: Report): void {
         `track "${id}" is not listed in project.json trackOrder`,
         `add "${id}" to trackOrder`,
       );
+      continue;
     }
+    // With clips it is a different mistake entirely. `compile` walks
+    // `trackOrder`, so this track and every clip on it are dropped from the
+    // render — the whole part gone, with a `warnings: none` report to say so.
+    // The document is self-inconsistent: `arrangement.json` schedules music on a
+    // track that `project.json` does not place, and there is no render setting
+    // under which both statements can hold. That makes it an error rather than a
+    // louder warning; a warning is for something an author might have meant, and
+    // nobody means "play this part, but not really".
+    report(
+      "error",
+      "trackorder.missing-track",
+      "project.json",
+      "/trackOrder",
+      `track "${id}" has ${clips} clip${clips === 1 ? "" : "s"} in arrangement.json but is not listed in project.json trackOrder, so nothing on it would be rendered`,
+      `add "${id}" to trackOrder`,
+    );
   }
 }
 
@@ -240,7 +301,9 @@ function checkGridLanesAgainstKit(
   report: Report,
 ): void {
   pattern.lanes.forEach((lane, i) => {
-    if (!(lane.lane in kit)) {
+    // `Object.hasOwn`, not `in`: a lane named `constructor` is a lane name like
+    // any other, and `in` would say the kit has it.
+    if (!Object.hasOwn(kit, lane.lane)) {
       report(
         "error",
         "pattern.lane-unknown-voice",
@@ -427,7 +490,10 @@ function describeEngine(instrument: { type: string; engine?: string }): string {
   return instrument.type === "synth" ? `engine "${instrument.engine}"` : "a drumkit instrument";
 }
 
-function checkArrangement(project: Project, report: Report): void {
+/** Judges one track's use of one pattern; see `checkPatternPairing`. */
+type CheckPatternPairing = (track: TrackDoc, pattern: PatternDoc, file: string, pointer: string) => void;
+
+function checkArrangement(project: Project, report: Report, checkPatternPairing: CheckPatternPairing): void {
   const file = "arrangement.json";
   project.arrangement.clips.forEach((clip, i) => {
     const track = project.tracks.get(clip.track);
@@ -453,6 +519,9 @@ function checkArrangement(project: Project, report: Report): void {
       );
       return;
     }
+    // The renderer compiles a clip's pattern against the clip's track, so the
+    // pairing has to hold here exactly as it does on `track.patterns`.
+    if (track !== undefined) checkPatternPairing(track, pattern, file, `/clips/${i}/pattern`);
     const end = clip.startTick + clip.repeatCount * pattern.lengthTicks;
     if (end > project.arrangement.lengthTicks) {
       report(
@@ -464,6 +533,93 @@ function checkArrangement(project: Project, report: Report): void {
       );
     }
   });
+}
+
+/** The earliest tick a pattern's events reach, relative to a repetition start. */
+interface EarliestEvent {
+  offsetTicks: number;
+  /** What to call the event in a diagnostic. */
+  description: string;
+}
+
+/**
+ * A negative `microTicks` can nudge an event before its pattern, which is
+ * musically ordinary — a hit that lands slightly early — and is exactly what the
+ * field is for. It only becomes a problem when the clip sits at the very start
+ * of the arrangement, because then the event lands before tick 0 and the
+ * compiler drops it (`emitRatchets` refuses `start.tick < rangeStartTick`) with
+ * nothing said.
+ *
+ * So the rule is deliberately about the *clip*, not the pattern: the same
+ * pattern placed at bar 2 is fine and must keep validating. Reported as an error
+ * rather than a warning because no seed, `--bars` range or sample rate can make
+ * the event sound — the document is asking for a position the timeline does not
+ * have.
+ */
+function checkEventsReachTimeline(project: Project, barTicks: number | undefined, report: Report): void {
+  if (barTicks === undefined) return;
+  const file = "arrangement.json";
+  project.arrangement.clips.forEach((clip, i) => {
+    const pattern = project.patterns.get(clip.pattern);
+    if (pattern === undefined) return; // already reported as ref.missing-pattern
+    const earliest = earliestEvent(pattern, barTicks, project.project.swing);
+    if (earliest === undefined) return;
+    // Repetitions only ever start later, so the first one bounds the clip.
+    const tick = clip.startTick + earliest.offsetTicks;
+    if (tick >= 0) return;
+    report(
+      "error",
+      "event.before-timeline-start",
+      file,
+      `/clips/${i}`,
+      `${earliest.description} in pattern "${pattern.id}" lands at tick ${tick} when the clip starts at tick ${clip.startTick}, which is before the start of the arrangement, so it cannot sound`,
+      `move the clip later or raise the event's microTicks`,
+    );
+  });
+}
+
+/**
+ * The earliest position any of a pattern's events reaches, or undefined when the
+ * pattern has no events or is already malformed in a way another rule reports.
+ */
+function earliestEvent(pattern: PatternDoc, barTicks: number, projectSwing: number): EarliestEvent | undefined {
+  const defaultMicroTicks = EXPRESSION_FIELDS.microTicks.default;
+  let earliest: EarliestEvent | undefined;
+  const consider = (offsetTicks: number, description: string): void => {
+    if (earliest === undefined || offsetTicks < earliest.offsetTicks) earliest = { offsetTicks, description };
+  };
+
+  if (pattern.kind === "notes") {
+    for (const note of pattern.notes) {
+      consider(note.startTick + (note.microTicks ?? defaultMicroTicks), `note "${note.pitch}" at tick ${note.startTick}`);
+    }
+    return earliest;
+  }
+
+  const bars = pattern.lengthTicks / barTicks;
+  if (!Number.isInteger(bars)) return undefined; // pattern.length-not-bar-multiple
+  pattern.lanes.forEach((lane, laneIndex) => {
+    const { stepsPerBar } = lane.grid;
+    if (barTicks % stepsPerBar !== 0) return; // pattern.grid-not-divisible
+    const stepTicks = barTicks / stepsPerBar;
+    const parsed = parseSteps(lane.steps, {
+      file: `patterns/${pattern.id}.json`,
+      pointer: `/lanes/${laneIndex}/steps`,
+      stepsPerBar,
+      bars,
+    });
+    if (parsed.hits === undefined) return; // the parse diagnostics say why
+    const microByStep = new Map((lane.stepEvents ?? []).map((event) => [event.step, event.microTicks]));
+    const swing = lane.defaults?.swing ?? projectSwing;
+    for (const step of parsed.hits) {
+      const microTicks = microByStep.get(step) ?? defaultMicroTicks;
+      consider(
+        gridStepOffsetTicks(step, stepTicks, swing, microTicks),
+        `step ${step} of lane "${lane.lane}"`,
+      );
+    }
+  });
+  return earliest;
 }
 
 function checkAutomation(project: Project, report: Report): void {

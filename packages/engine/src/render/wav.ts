@@ -1,3 +1,4 @@
+import { parseWavHeader } from "@chord-garden/format/pure";
 
 export interface DecodedWav {
   sampleRate: number;
@@ -13,63 +14,36 @@ export interface WavAudio {
 
 export type PcmBitDepth = 16 | 24;
 
+/**
+ * Decode a PCM WAV to float channels.
+ *
+ * Every structural check lives in `parseWavHeader`, which `validate` also calls:
+ * this function is the sample-reading half and nothing more. The two used to
+ * carry separate, unequal copies of the rules, so the validator accepted files
+ * the renderer could not read — and, for `sampleRate: 0`, files it read wrongly
+ * without complaining.
+ */
 export function decodeWav(bytes: Uint8Array): DecodedWav {
-  if (bytes.length < 12 || ascii(bytes, 0, 4) !== "RIFF" || ascii(bytes, 8, 4) !== "WAVE") {
-    throw new Error("cannot decode WAV: expected a RIFF/WAVE container");
-  }
+  const parsed = parseWavHeader(bytes);
+  if (!parsed.ok) throw new Error(`cannot decode WAV: ${parsed.reason}`);
+  const { sampleRate, channels, bitsPerSample, blockAlign, dataOffset, dataSize } = parsed.header;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let format:
-    | { channels: 1 | 2; sampleRate: number; bitsPerSample: 8 | 16 | 24 | 32; blockAlign: number }
-    | undefined;
-  let dataOffset = -1;
-  let dataSize = 0;
 
-  for (let offset = 12; offset + 8 <= bytes.length; ) {
-    const chunk = ascii(bytes, offset, 4);
-    const size = view.getUint32(offset + 4, true);
-    const body = offset + 8;
-    if (body + size > bytes.length) throw new Error(`cannot decode WAV: truncated "${chunk}" chunk`);
-    if (chunk === "fmt ") {
-      if (size < 16) throw new Error("cannot decode WAV: fmt chunk is too small");
-      const audioFormat = view.getUint16(body, true);
-      const channels = view.getUint16(body + 2, true);
-      const sampleRate = view.getUint32(body + 4, true);
-      const blockAlign = view.getUint16(body + 12, true);
-      const bitsPerSample = view.getUint16(body + 14, true);
-      if (audioFormat !== 1) throw new Error(`cannot decode WAV: unsupported audio format ${audioFormat}`);
-      if (channels !== 1 && channels !== 2) throw new Error(`cannot decode WAV: unsupported channel count ${channels}`);
-      if (bitsPerSample !== 8 && bitsPerSample !== 16 && bitsPerSample !== 24 && bitsPerSample !== 32) {
-        throw new Error(`cannot decode WAV: unsupported PCM depth ${bitsPerSample}`);
-      }
-      format = { channels, sampleRate, blockAlign, bitsPerSample };
-    } else if (chunk === "data" && dataOffset < 0) {
-      dataOffset = body;
-      dataSize = size;
-    }
-    offset = body + size + (size % 2);
-  }
-
-  if (format === undefined) throw new Error("cannot decode WAV: missing fmt chunk");
-  if (dataOffset < 0) throw new Error("cannot decode WAV: missing data chunk");
-  if (format.blockAlign === 0 || dataSize % format.blockAlign !== 0) {
-    throw new Error("cannot decode WAV: data size is not aligned to PCM frames");
-  }
-
-  const frames = dataSize / format.blockAlign;
+  const frames = dataSize / blockAlign;
   const left = new Float32Array(frames);
-  const right = format.channels === 2 ? new Float32Array(frames) : undefined;
-  const bytesPerSample = format.bitsPerSample / 8;
+  const right = channels === 2 ? new Float32Array(frames) : undefined;
+  const bytesPerSample = bitsPerSample / 8;
   for (let frame = 0; frame < frames; frame++) {
-    const frameOffset = dataOffset + frame * format.blockAlign;
-    left[frame] = decodePcm(view, frameOffset, format.bitsPerSample);
+    const frameOffset = dataOffset + frame * blockAlign;
+    left[frame] = decodePcm(view, frameOffset, bitsPerSample);
     if (right !== undefined) {
-      right[frame] = decodePcm(view, frameOffset + bytesPerSample, format.bitsPerSample);
+      right[frame] = decodePcm(view, frameOffset + bytesPerSample, bitsPerSample);
     }
   }
 
   return {
-    sampleRate: format.sampleRate,
-    bitsPerSample: format.bitsPerSample,
+    sampleRate,
+    bitsPerSample,
     channels: right === undefined ? [left] : [left, right],
   };
 }
@@ -133,12 +107,6 @@ function writePcm(view: DataView, offset: number, sample: number, bits: PcmBitDe
   view.setUint8(offset + 1, (value >> 8) & 0xff);
   view.setUint8(offset + 2, (value >> 16) & 0xff);
   return offset + 3;
-}
-
-function ascii(bytes: Uint8Array, offset: number, length: number): string {
-  let value = "";
-  for (let index = 0; index < length; index++) value += String.fromCharCode(bytes[offset + index]!);
-  return value;
 }
 
 function writeAscii(bytes: Uint8Array, offset: number, value: string): void {

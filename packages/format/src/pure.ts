@@ -39,7 +39,7 @@ export {
 } from "./expression.js";
 export { parseStrictJson, type JsonObject, type JsonValue, type ParseResult } from "./jsonParse.js";
 export * from "./model.js";
-export { ticksPerBar, type TimeSignature } from "./musicTime.js";
+export { gridStepOffsetTicks, swingOffsetTicks, ticksPerBar, type TimeSignature } from "./musicTime.js";
 export { formatSteps, parseSteps, type StepsContext, type StepsParseResult } from "./pattern.js";
 export { HIGHEST_MIDI, LOWEST_MIDI, midiToPitch, pitchToMidi, transposePitch } from "./pitch.js";
 export {
@@ -82,4 +82,10 @@ export { referencedSamplePaths, sampleReferences, type SampleReference } from ".
 export { serializeCanonical, type DocKind } from "./serialize.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";
 export { EFFECTS_MIN_FORMAT, SUPPORTED_FORMAT } from "./formatVersion.js";
-export { checkWavHeader, type WavCheckResult } from "./wav.js";
+export {
+  checkWavHeader,
+  parseWavHeader,
+  type WavCheckResult,
+  type WavHeader,
+  type WavHeaderResult,
+} from "./wav.js";

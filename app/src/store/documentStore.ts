@@ -1385,7 +1385,7 @@ function assertVoiceExists(draft: Project, patternId: string, laneName: string):
     if (!track.patterns.includes(patternId)) continue;
     const instrument = draft.instruments.get(track.instrument);
     if (instrument === undefined || instrument.type !== "drumkit") continue;
-    if (!(laneName in instrument.kit)) {
+    if (!Object.hasOwn(instrument.kit, laneName)) {
       throw new Error(
         `cannot add lane "${laneName}" to "${patternId}": drumkit "${instrument.id}" on track "${track.id}" has no such voice`,
       );

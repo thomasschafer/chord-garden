@@ -71,6 +71,12 @@ export { canonicalFiles } from "./canonical.js";
 export { docKindFromHint, docKindHintForPath, type DocKindHint } from "./docKind.js";
 export { describeProject, type DescribePattern, type DescribeReport, type DescribeTrack } from "./describe.js";
 export { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
-export { checkWavHeader, type WavCheckResult } from "./wav.js";
+export {
+  checkWavHeader,
+  parseWavHeader,
+  type WavCheckResult,
+  type WavHeader,
+  type WavHeaderResult,
+} from "./wav.js";
 export { referencedSamplePaths, sampleReferences, type SampleReference } from "./samples.js";
 export { closestMatch, levenshtein, ID_PATTERN } from "./util.js";

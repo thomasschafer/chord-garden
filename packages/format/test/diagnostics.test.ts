@@ -19,6 +19,12 @@ const EXPECTED: Record<string, string> = {
   "bad-engine-param": "registry.unknown-param",
   "bad-id": "schema.pattern",
   "bad-step-events": "pattern.step-event-not-a-hit",
+  // The two clip-side twins of `pattern-kind-mismatch` and a kit-lane mistake:
+  // the pattern is reached only through `arrangement.clips`, which is the one
+  // reference the *renderer* uses, so these are the pairings that used to
+  // validate clean and then fail to render.
+  "clip-lane-unknown-voice": "pattern.lane-unknown-voice",
+  "clip-pattern-kind-mismatch": "track.pattern-kind-mismatch",
   comment: "json.comment",
   "dangling-sample": "sample.missing",
   "dotdot-sample-path": "sample.path-invalid",
@@ -34,18 +40,42 @@ const EXPECTED: Record<string, string> = {
   "format-newer": "project.format-unsupported",
   "id-file-mismatch": "id.file-mismatch",
   "malformed-pattern-string": "pattern.invalid-char",
+  // A note nudged before tick 0 by `microTicks`: the compiler drops it and says
+  // nothing. The same pattern in a clip that starts later is legal and stays so.
+  "microticks-before-zero": "event.before-timeline-start",
   "missing-reference": "ref.missing-instrument",
   "mixed-pattern": "schema.unevaluatedProperties",
   "non-automatable-effect-param": "automation.param-not-automatable",
   "non-automatable-param": "automation.param-not-automatable",
   "not-wav-sample": "sample.not-wav",
   "pattern-kind-mismatch": "track.pattern-kind-mismatch",
+  // Four surfaces of one mistake: a name a project file chose that happens to be
+  // a member of `Object.prototype`. Each used to be accepted by an `in` test or a
+  // bare index against a table, and each fails differently afterwards — a crash,
+  // a silently ignored automation lane, a param nothing reads.
+  // Schema, not registry: `__proto__` fails the param-name pattern, which is the
+  // closed-schema guarantee doing its job. The bug was never the rule — it was
+  // that the key vanished during parsing, so no rule ever saw it.
+  "proto-key-param": "schema.additionalProperties",
+  "prototype-automation-voice": "registry.unknown-param",
+  "prototype-kit-lane": "pattern.lane-unknown-voice",
+  "prototype-synth-param": "registry.unknown-param",
   "tie-marker": "pattern.tie-unsupported",
   "trackorder-duplicate": "trackorder.duplicate",
+  // A track with clips that `trackOrder` does not place. `compile` walks
+  // `trackOrder`, so the whole part is absent from the render — previously with
+  // `warnings: none` to report it.
+  "trackorder-missing-track": "trackorder.missing-track",
   "trackorder-unknown": "trackorder.unknown-track",
   "unknown-effect-automation": "ref.missing-effect",
   "unknown-field": "schema.unevaluatedProperties",
   "wrong-step-count": "pattern.step-count-mismatch",
+  // A structurally perfect WAV whose sample rate is 0. It used to pass both the
+  // header check and the decoder, and rendered every hit pinned to its first
+  // sample at +33 dBFS — the one case in this group that produced audio rather
+  // than a crash, and so the one an agent could not have caught by reading
+  // `warnings`.
+  "zero-rate-sample": "sample.not-wav",
 };
 
 describe("invalid fixtures", () => {

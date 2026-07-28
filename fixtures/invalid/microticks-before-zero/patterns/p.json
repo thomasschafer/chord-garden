@@ -1,0 +1,14 @@
+{
+  "id": "p",
+  "kind": "notes",
+  "lengthTicks": 3840,
+  "notes": [
+    {
+      "pitch": "A2",
+      "startTick": 0,
+      "durationTicks": 480,
+      "velocity": 900,
+      "microTicks": -8
+    }
+  ]
+}

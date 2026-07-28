@@ -1,0 +1,10 @@
+{
+  "track": "t",
+  "lanes": [
+    {
+      "param": "constructor.gain",
+      "interp": "linear",
+      "points": [[0, 0], [1920, -600]]
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 // package's `pure.ts`).
 import {
   EXPRESSION_FIELDS,
+  gridStepOffsetTicks,
   parseSteps,
   pitchToMidi,
   resolveTrackParam,
@@ -340,7 +341,7 @@ function compileGridPattern(
   }
 
   pattern.lanes.forEach((lane, laneIndex) => {
-    if (!(lane.lane in instrument.kit)) {
+    if (!Object.hasOwn(instrument.kit, lane.lane)) {
       throw new Error(
         `cannot compile lane "${lane.lane}" in pattern "${pattern.id}": voice does not exist in drumkit "${instrument.id}"`,
       );
@@ -367,12 +368,14 @@ function compileGridPattern(
 
     for (const step of parsed.hits) {
       const stepEvent = eventsByStep.get(step);
-      const swingTicks = step % 2 === 1 ? Math.round((swing * stepTicks) / 2000) : 0;
       const startTick =
         repetitionStartTick +
-        step * stepTicks +
-        swingTicks +
-        (stepEvent?.microTicks ?? EXPRESSION_FIELDS.microTicks.default);
+        gridStepOffsetTicks(
+          step,
+          stepTicks,
+          swing,
+          stepEvent?.microTicks ?? EXPRESSION_FIELDS.microTicks.default,
+        );
       // `gateTicks` is the one field with no constant default: a hit lasts its own
       // step unless something says otherwise, which is why the registry states
       // `null` rather than a number for it.

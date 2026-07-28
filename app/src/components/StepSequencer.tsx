@@ -89,7 +89,7 @@ export function StepSequencer({
     ...Object.keys(kit.kit)
       .sort()
       .map((voice) => ({ voice, lane: lanesByVoice.get(voice) })),
-    ...pattern.lanes.filter((lane) => !(lane.lane in kit.kit)).map((lane) => ({ voice: lane.lane, lane })),
+    ...pattern.lanes.filter((lane) => !Object.hasOwn(kit.kit, lane.lane)).map((lane) => ({ voice: lane.lane, lane })),
   ];
 
   const patternId = pattern.id;

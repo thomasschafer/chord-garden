@@ -187,18 +187,21 @@ export interface ResolvedParam {
  * diagnostics.
  */
 export function resolveParam(instrument: InstrumentDoc, key: string): ResolvedParam | undefined {
+  // Every lookup below is keyed by a string out of a project file, so each one
+  // asks for an *own* property. `table["constructor"]` would otherwise hand back
+  // `Object.prototype.constructor` — a truthy value that passes for a spec, has
+  // no `unit`, `min` or `max`, and so validates any value at all.
   if (instrument.type === "synth") {
     const table = instrument.engine === "basic-mono" ? BASIC_MONO_PARAMS : BASIC_POLY_PARAMS;
-    const spec = table[key];
-    return spec ? { spec } : undefined;
+    return Object.hasOwn(table, key) ? { spec: table[key]! } : undefined;
   }
   const dot = key.indexOf(".");
   if (dot <= 0) return undefined;
   const voice = key.slice(0, dot);
   const param = key.slice(dot + 1);
-  if (!(voice in instrument.kit)) return undefined;
-  const spec = DRUMKIT_VOICE_PARAMS[param];
-  return spec ? { spec, voice } : undefined;
+  if (!Object.hasOwn(instrument.kit, voice)) return undefined;
+  if (!Object.hasOwn(DRUMKIT_VOICE_PARAMS, param)) return undefined;
+  return { spec: DRUMKIT_VOICE_PARAMS[param]!, voice };
 }
 
 export function validParamKeys(instrument: InstrumentDoc): string[] {
@@ -217,7 +220,8 @@ export function validParamKeys(instrument: InstrumentDoc): string[] {
 
 /** Resolves an effect's own param name (`mix`, `cutoff`) against its type. */
 export function resolveEffectParam(type: EffectType, param: string): ParamSpec | undefined {
-  return EFFECT_PARAMS[type][param];
+  const table = EFFECT_PARAMS[type];
+  return Object.hasOwn(table, param) ? table[param] : undefined;
 }
 
 /** Every param name an effect of this type accepts, in table order. */

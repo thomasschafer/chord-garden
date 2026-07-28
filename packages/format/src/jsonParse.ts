@@ -99,7 +99,19 @@ export function parseStrictJson(text: string, file: string): ParseResult {
 
   function parseObject(pointer: string): JsonObject {
     expect("{");
-    const result: JsonObject = {};
+    // Null-prototype, so that a JSON object is only ever the keys the file
+    // actually wrote. Two distinct bugs live in the `{}` this replaces. Reading:
+    // `"constructor" in obj` and `obj["constructor"]` answer from
+    // `Object.prototype`, so a kit voice or a param named after one of its
+    // members validated clean and then crashed — or worse, was silently ignored —
+    // at render time. Writing: `result["__proto__"] = ...` on a normal object
+    // hits the setter instead of creating an own property, so a `"__proto__"` key
+    // disappeared between the file and the parse result. Validation therefore
+    // never saw it and `fmt` wrote the file back without it, which is both a hole
+    // in the closed-schema guarantee and a value `fmt` changed
+    // (docs/format-spec.md §5.2). Fixing the prototype fixes the whole class;
+    // nothing here special-cases a key name.
+    const result = Object.create(null) as JsonObject;
     const seen = new Set<string>();
     skipWhitespace();
     if (text[pos] === "}") {
