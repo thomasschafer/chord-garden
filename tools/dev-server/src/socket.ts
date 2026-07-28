@@ -38,7 +38,15 @@ export interface SyncTransportHandlers {
 /** Opens a transport to a same-origin path such as `/api/projects/x/socket`. */
 export type SyncTransportFactory = (path: string, handlers: SyncTransportHandlers) => SyncTransport;
 
-/** Why the sidecar refused this session. Both cases are terminal. */
+/**
+ * Why the sidecar refused this session, once retrying has been ruled out.
+ *
+ * Both cases here are terminal. A refused *token* is deliberately not one of them:
+ * a page can only talk to the origin that served it, so a token this sidecar does
+ * not recognise means it restarted and minted a new one, and the answer is to fetch
+ * the current token and hand the handshake back — not to replace the page with a
+ * security notice and drop whatever it had not written yet.
+ */
 export type SyncRejection =
   | { kind: "alreadyOpen"; message: string }
   | { kind: "refused"; message: string };
@@ -103,6 +111,22 @@ export interface ProjectSocketOptions {
    * documents while its audio is a version behind, and only this can say so.
    */
   samples?: () => readonly SampleFile[] | undefined;
+  /**
+   * Fetch the sidecar's current session token, for when the one this page holds is
+   * refused because the sidecar restarted.
+   *
+   * A page without one keeps the old behaviour — a refused token is terminal —
+   * because there is then no way to come by a better one. Returning the *same* token
+   * is fine and expected in a race with a sidecar that is still shutting down; the
+   * handshake simply gets tried again until `maxTokenRefusals` runs out.
+   */
+  refreshToken?: () => Promise<string>;
+  /**
+   * How many consecutive token refusals to answer with a re-handshake before
+   * concluding this really is a refusal. Bounded so a client that is genuinely
+   * unwelcome does not retry for ever, and reset by every successful welcome.
+   */
+  maxTokenRefusals?: number;
   /** Retry delays, in order; the last one repeats. */
   retryDelaysMs?: readonly number[];
   setTimer?: (callback: () => void, ms: number) => unknown;
@@ -111,6 +135,14 @@ export interface ProjectSocketOptions {
 
 const DEFAULT_RETRIES = [250, 1000, 3000, 10_000] as const;
 
+/**
+ * Re-handshakes to attempt after a token refusal before giving up.
+ *
+ * Spans the whole retry ladder, so a sidecar that is slow to come back up is waited
+ * out rather than declared hostile.
+ */
+const DEFAULT_MAX_TOKEN_REFUSALS = 5;
+
 export class ProjectSocket {
   private transport: SyncTransport | undefined;
   private attempt = 0;
@@ -118,11 +150,23 @@ export class ProjectSocket {
   private retry: unknown;
   private stopped = false;
   private sessionId: string | undefined;
+  /** The token in use, which a sidecar restart replaces. */
+  private token: string;
+  /** Consecutive token refusals; reset by a welcome. */
+  private tokenRefusals = 0;
+  /**
+   * In flight while a refused token is being replaced, resolving to the reason the
+   * retry will report. Held rather than acted on directly because the sidecar closes
+   * the socket immediately after refusing it, and both that close and the fetch
+   * completing would otherwise each schedule a reconnect.
+   */
+  private tokenRefresh: Promise<string> | undefined;
   private readonly retryDelays: readonly number[];
   private readonly setTimer: (callback: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
 
   constructor(private readonly options: ProjectSocketOptions) {
+    this.token = options.token;
     this.retryDelays = options.retryDelaysMs ?? DEFAULT_RETRIES;
     this.setTimer = options.setTimer ?? ((callback, ms) => setTimeout(callback, ms));
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
@@ -154,7 +198,7 @@ export class ProjectSocket {
         const hello: HelloMessage = {
           type: "hello",
           protocol: SYNC_PROTOCOL,
-          token: this.options.token,
+          token: this.token,
           project: this.options.project,
           ...(inventory === undefined ? {} : { inventory }),
           ...(samples === undefined || samples.length === 0 ? {} : { samples }),
@@ -176,6 +220,17 @@ export class ProjectSocket {
         if (code === CLOSE_ALREADY_OPEN) {
           // Handled when the `rejected` message arrived; retrying would be a
           // second window fighting the first for the project.
+          return;
+        }
+        const refreshing = this.tokenRefresh;
+        if (refreshing !== undefined) {
+          // A refused token, already being replaced. The reconnect waits for the new
+          // token rather than racing it, so the retry cannot go out still holding the
+          // token that was just refused.
+          this.tokenRefresh = undefined;
+          void refreshing.then((why) => {
+            if (!this.stopped) this.scheduleRetry(why);
+          });
           return;
         }
         if (!settled && code === 1006) {
@@ -243,15 +298,21 @@ export class ProjectSocket {
         }
         this.sessionId = message.session;
         this.attempt = 0;
+        this.tokenRefusals = 0;
         this.connections += 1;
         this.options.handlers.ready(this.connections > 1);
         return;
       }
       case "rejected":
         markSettled();
+        if (message.code === "staleToken") {
+          // Not a refusal to report. See `reauthenticate`.
+          this.reauthenticate(message.reason);
+          return;
+        }
         this.stopped = true;
         this.options.handlers.rejected(
-          message.reason.includes("another window")
+          message.code === "alreadyOpen"
             ? { kind: "alreadyOpen", message: message.reason }
             : { kind: "refused", message: message.reason },
         );
@@ -310,6 +371,45 @@ export class ProjectSocket {
         return;
       }
     }
+  }
+
+  /**
+   * Answer a refused token by fetching the current one and handing the handshake
+   * back, instead of tearing the session down.
+   *
+   * This is the sidecar-restart path, and it is the whole point of telling a stale
+   * token apart from a refused window. The page keeps its model, its undo history
+   * and — the part that actually loses work — its unsaved edits, which go out as
+   * soon as `ready` fires again with a live write session. Replacing the page with
+   * "the session token is missing or wrong" instead discards all of it, and does so
+   * on the strength of a restart.
+   *
+   * Bounded, so a client the sidecar will genuinely never admit stops eventually and
+   * says so rather than spinning. The reconnect itself is scheduled by the socket's
+   * `closed` handler once this fetch has settled, so the retry always carries the new
+   * token and only one reconnect is ever in flight.
+   */
+  private reauthenticate(reason: string): void {
+    this.tokenRefusals += 1;
+    const refresh = this.options.refreshToken;
+    const limit = this.options.maxTokenRefusals ?? DEFAULT_MAX_TOKEN_REFUSALS;
+    if (refresh === undefined || this.tokenRefusals > limit) {
+      // Nowhere to get a better token, or asking has stopped helping.
+      this.stopped = true;
+      this.options.handlers.rejected({ kind: "refused", message: reason });
+      return;
+    }
+    this.tokenRefresh = refresh().then(
+      (token) => {
+        this.token = token;
+        return "the sidecar restarted; re-authenticating";
+      },
+      // The sidecar is very likely still coming back up, which is the same situation
+      // as a dropped connection and gets the same treatment: retry, do not give up,
+      // and above all do not throw the page's unsaved edits away over it.
+      (error: unknown) =>
+        `could not fetch the sidecar's current session token: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
   private scheduleRetry(reason: string): void {

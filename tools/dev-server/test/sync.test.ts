@@ -35,6 +35,20 @@ const SETTLE_MS = 20;
 const WAIT_MS = 4000;
 /** How long "nothing was pushed" waits before believing it. */
 const SILENCE_MS = 400;
+/**
+ * The watcher's idle re-scan, scaled to fit inside `WAIT_MS`.
+ *
+ * Not a nicety: `IDLE_RESCAN_MS` defaults to 5000, which is *longer* than a test
+ * is willing to wait, so any test that waits on a real filesystem event had no
+ * working safety net at all — when macOS dropped the event (which it does, and
+ * more often when the machine is loaded and many watchers are open), the test
+ * failed at 4030 ms while the fallback that exists for exactly that case was
+ * still a second away. Scaling the interval the way `settleMs` is already scaled
+ * puts the product's own guarantee — "a missed event is bounded by the next
+ * re-scan" — inside the window the test enforces, so a dropped event is late
+ * rather than fatal.
+ */
+const RESCAN_MS = 500;
 
 let server: Server;
 let sync: ProjectSync;
@@ -51,6 +65,7 @@ beforeEach(async () => {
     token: TOKEN,
     settleMs: SETTLE_MS,
     maxSettleMs: 200,
+    rescanMs: RESCAN_MS,
     helloTimeoutMs: 300,
   });
   // Held in a map the test can rewrite, so `manualSync` can swap the watcher out
@@ -101,6 +116,23 @@ afterEach(async () => {
   });
   rmSync(root, { recursive: true, force: true });
 });
+
+/**
+ * Wait until `condition` holds, or fail saying what never happened.
+ *
+ * The alternative — sleep a fixed interval and then assert — makes the test a
+ * measurement of how busy the machine is: it passes when the work fits in the
+ * interval and fails when it does not, without anything being wrong. Polling
+ * asserts the condition itself and lets the deadline be generous, so a loaded
+ * machine makes the test slower rather than red.
+ */
+async function until(what: string, condition: () => boolean, timeoutMs = WAIT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`${what} did not happen within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 /** A sync socket, with the queue-and-await plumbing a protocol test needs. */
 class TestSocket {
@@ -521,10 +553,7 @@ describe("the single-writer session", () => {
     const first = await editorSocket();
     first.dispose();
     // The slot is released by the socket closing, not by a timer.
-    for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(sync.hasEditor).toBe(false);
+    await untilNoEditor();
 
     const second = await editorSocket();
     externalEdit("project.json", renamedProject("For the second window"));
@@ -533,8 +562,14 @@ describe("the single-writer session", () => {
 
   it("pushes nothing when no browser is connected, and still tracks the disk", async () => {
     externalEdit("project.json", renamedProject("Nobody is watching"));
-    await new Promise((resolve) => setTimeout(resolve, SILENCE_MS));
-    expect(sync.establishedText("project.json")).toContain("Nobody is watching");
+    // Polled, not slept. What is under test is that the sidecar establishes the edit
+    // with nobody listening — and that it does so without a `broadcast` to an editor
+    // that is not there. A fixed sleep followed by an assertion tests something else:
+    // whether a filesystem event, a settle window and a whole-project load all fit
+    // inside that interval, which on a loaded machine they intermittently do not.
+    await until("the sidecar to establish the edit nobody was listening for", () =>
+      sync.establishedText("project.json")?.includes("Nobody is watching") === true,
+    );
 
     // A browser arriving later loads over HTTP, so the change is not lost; what
     // matters is that the next edit is still reported as a diff.
@@ -545,12 +580,22 @@ describe("the single-writer session", () => {
 });
 
 describe("socket authentication and limits", () => {
-  it("refuses a hello with the wrong token", async () => {
+  it("refuses a hello with the wrong token, and says so as a stale token rather than an intrusion", async () => {
     const socket = new TestSocket(port);
     sockets.push(socket);
     await socket.hello({ token: "not-the-session-token" });
 
-    expect(await socket.next()).toMatchObject({ type: "rejected", reason: expect.stringContaining("token") });
+    const message = await socket.next();
+    expect(message).toMatchObject({ type: "rejected", code: "staleToken", reason: expect.stringContaining("token") });
+    if (message.type !== "rejected") return;
+    // The token is minted per run, so far and away the commonest cause of this is a
+    // sidecar that was restarted under an open page. Calling that "missing or wrong"
+    // told a person their routine restart was a security problem, and the page acted
+    // on it by refusing itself for good and dropping everything it had not written.
+    // The code is what the page decides on; the prose is what the person reads, and
+    // neither may accuse anybody.
+    expect(message.reason).toContain("restarted");
+    expect(message.reason).not.toContain("missing or wrong");
     await socket.waitForClose();
     expect(sync.hasEditor).toBe(false);
   });
@@ -1048,10 +1093,7 @@ describe("writes bound to the session", () => {
     const socket = await editorSocket();
     const stale = socket.writeSession;
     socket.dispose();
-    for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect(sync.hasEditor).toBe(false);
+    await untilNoEditor();
 
     const response = await postWrite([{ path: "project.json", contents: renamedProject("After the socket went") }], stale);
 
@@ -1063,9 +1105,7 @@ describe("writes bound to the session", () => {
     const first = await editorSocket();
     const firstSession = first.writeSession;
     first.dispose();
-    for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await untilNoEditor();
 
     const second = await editorSocket();
 
@@ -1082,10 +1122,7 @@ function currentInventory(): string {
 
 /** Wait for the editor slot to be released, which the socket closing does. */
 async function untilNoEditor(): Promise<void> {
-  for (let attempt = 0; attempt < 200 && sync.hasEditor; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  expect(sync.hasEditor).toBe(false);
+  await until("the editor session slot to be released", () => !sync.hasEditor);
 }
 
 /** GET a project path with the token, and optionally a session id. */
@@ -1224,19 +1261,37 @@ describe("the snapshot endpoint and the watcher", () => {
     const manual = manualSync();
     const socket = await editorSocket();
     const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+    const projectBefore = readFileSync(join(root, "project.json"), "utf8");
 
+    // Step one of an agent's two-file edit: one file is finished and valid, the other
+    // leaves the project as a whole invalid. The *second* file is what makes this test
+    // able to fail. Asserting only on the broken file cannot distinguish the two
+    // behaviours — its bytes change again either way, so it is reported as changed
+    // whether or not the invalid snapshot was established. The finished file does not
+    // change again, so it is reported only if nothing was consumed while the project
+    // was broken.
+    externalEdit("project.json", renamedProject("Half of an agent's edit"));
     externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x"));
+
     const response = await get(`/api/projects/p/${SNAPSHOT_PATH}`, socket.writeSession);
     expect(response.status).toBe(200);
     expect(JSON.parse(response.body).ok).toBe(false);
 
-    // The browser could not have adopted that, so nothing about it is established:
-    // when the edit finishes, the whole thing still arrives.
+    // The browser threw that snapshot away — `loadProject` on the client refuses a
+    // bundle that does not validate — so not one byte of it may be established.
+    expect(manual.establishedText("project.json")).toBe(projectBefore);
+    expect(manual.establishedText("patterns/drums-verse.json")).toBe(pattern);
+
+    // When the edit finishes, the *whole* set of changed files arrives, including the
+    // one that was already finished when the snapshot was read. Establishing the
+    // invalid snapshot would consume project.json here and lose the rename for good:
+    // the disk would then hold a name the browser never hears about.
     externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x ..xx"));
     manual.scan();
 
     const message = changed(await socket.next());
-    expect(message.changed.map((file) => file.path)).toEqual(["patterns/drums-verse.json"]);
+    expect(message.changed.map((file) => file.path)).toEqual(["patterns/drums-verse.json", "project.json"]);
+    expect(message.changed.find((file) => file.path === "project.json")!.text).toContain("Half of an agent's edit");
     expect(manual.establishedText("patterns/drums-verse.json")).toContain("x..x ..x. x..x ..xx");
   });
 });

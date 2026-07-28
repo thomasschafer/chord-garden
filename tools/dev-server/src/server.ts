@@ -7,6 +7,7 @@ import { hashContent } from "@chord-garden/engine/live";
 import {
   MAX_SOCKET_MESSAGE_BYTES,
   SESSION_HEADER,
+  SESSION_TOKEN_PATH,
   SNAPSHOT_PATH,
   SOCKET_PATH,
   TOKEN_GLOBAL,
@@ -14,6 +15,7 @@ import {
   WRITE_SESSION_STATUS,
   type ProjectSnapshot,
   type ProjectSummary,
+  type SessionTokenResponse,
   type WriteRequest,
   type WriteResponse,
 } from "./api.js";
@@ -224,6 +226,19 @@ function handle(
       sendFile(res, join(options.bundleRoot, path.slice(1)), bundleType, method, log, {
         missing: "the web bundles are not built; run `npm run build`",
       });
+      return;
+    }
+    if (path === SESSION_TOKEN_PATH) {
+      // The current token, for a page that already had one and found it refused —
+      // which in practice means this sidecar restarted underneath it and minted a
+      // new one (see `SESSION_TOKEN_PATH`). Unauthenticated on exactly the terms the
+      // pages above are: they hand the same value to anything that fetches them, so
+      // there is nothing here that a `curl` of `/app/` does not already give up. It
+      // is the loopback bind, the `Host` check and the `Origin` check — all three
+      // already applied above — that keep this server to this machine and to its own
+      // pages.
+      const body: SessionTokenResponse = { token: options.token };
+      sendJson(res, 200, body, method);
       return;
     }
     if (path === "/app" || path === "/app/" || path === "/app/index.html") {

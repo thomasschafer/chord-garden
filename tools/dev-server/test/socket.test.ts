@@ -188,7 +188,10 @@ describe("the write session", () => {
     const transport = test.latest();
     transport.handlers.open();
 
-    transport.deliver({ type: "rejected", reason: 'project "p" is open in another window' });
+    // The `code` is what decides this, not the prose. The page used to search the
+    // reason for "another window", which put a restarted sidecar in the same bucket
+    // as a second window and threw the page's unsaved edits away for it.
+    transport.deliver({ type: "rejected", code: "alreadyOpen", reason: 'project "p" is open in another window' });
     transport.handlers.closed(CLOSE_ALREADY_OPEN, "already open");
 
     expect(test.socket.session).toBeUndefined();

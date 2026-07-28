@@ -370,8 +370,9 @@ export class WebSocketConnection {
   private readonly decoder: FrameDecoder;
   private handlers: WebSocketHandlers = {};
   private open = true;
-  private awaitingPong = false;
   private keepalive: ReturnType<typeof setInterval> | undefined;
+  /** Running while a ping is outstanding; cleared by the pong that answers it. */
+  private pongDeadline: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly socket: Duplex,
@@ -392,19 +393,37 @@ export class WebSocketConnection {
   }
 
   /**
-   * Start pinging. `intervalMs` is both the gap between pings and the deadline
-   * for a reply, so a dead peer is reaped within two intervals.
+   * Start pinging, and close the socket if a ping goes unanswered for
+   * `pongTimeoutMs`.
+   *
+   * The two are separate numbers on purpose. When the deadline for a reply *was*
+   * the ping interval, a peer that died the instant after answering was not
+   * noticed for two whole intervals, and that number is not an idle one: it is how
+   * long a crashed tab keeps the project's single write slot (PLAN.md §12), during
+   * which the human reopening their own project is told it "is open in another
+   * window". Splitting them bounds the wait at one interval plus one deadline and
+   * lets the deadline be short without making the pinging chatty.
+   *
+   * A short deadline does not punish a slow client, because the peer answering is
+   * not the page: a pong is emitted by the browser's own WebSocket implementation
+   * whatever the page's main thread is doing, so it is not delayed by a long paint,
+   * a big decode, or a busy audio callback. What it *is* delayed by is this
+   * server's event loop being blocked, which is why the deadline is seconds rather
+   * than milliseconds — a whole-project scan is two orders of magnitude short of it.
    */
-  startKeepalive(intervalMs: number): void {
+  startKeepalive(intervalMs: number, pongTimeoutMs: number): void {
     if (this.keepalive !== undefined) return;
     this.keepalive = setInterval(() => {
       if (!this.open) return;
-      if (this.awaitingPong) {
-        this.close(CLOSE_GOING_AWAY, "no pong within the keepalive window");
-        return;
-      }
-      this.awaitingPong = true;
+      // A ping is already outstanding and its own deadline is running; sending a
+      // second one would restart nothing and answer nothing.
+      if (this.pongDeadline !== undefined) return;
       this.send(OPCODE_PING, Buffer.alloc(0));
+      this.pongDeadline = setTimeout(() => {
+        this.pongDeadline = undefined;
+        this.close(CLOSE_GOING_AWAY, `no pong within ${pongTimeoutMs}ms; assuming this peer is gone`);
+      }, pongTimeoutMs);
+      this.pongDeadline.unref();
     }, intervalMs);
     this.keepalive.unref();
   }
@@ -456,7 +475,7 @@ export class WebSocketConnection {
           this.send(OPCODE_PONG, message.payload);
           break;
         case "pong":
-          this.awaitingPong = false;
+          this.clearPongDeadline();
           break;
         case "close":
           this.open = false;
@@ -474,11 +493,18 @@ export class WebSocketConnection {
     this.socket.write(encodeFrame(opcode, payload));
   }
 
+  private clearPongDeadline(): void {
+    if (this.pongDeadline === undefined) return;
+    clearTimeout(this.pongDeadline);
+    this.pongDeadline = undefined;
+  }
+
   private finish(reason: string): void {
     if (this.keepalive !== undefined) {
       clearInterval(this.keepalive);
       this.keepalive = undefined;
     }
+    this.clearPongDeadline();
     this.open = false;
     const closed = this.handlers.closed;
     this.handlers = {};

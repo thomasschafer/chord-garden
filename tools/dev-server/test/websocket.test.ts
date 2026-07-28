@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   CLOSE_PROTOCOL_ERROR,
@@ -8,40 +7,9 @@ import {
   acceptKey,
   encodeFrame,
 } from "../src/websocket.js";
+import { clientFrame, clientText as text } from "./helpers.js";
 
 const MAX = 1024;
-
-/**
- * Build a client frame the way a browser would: masked, with the length encoded
- * in whichever of the three forms the payload calls for.
- */
-function clientFrame(
-  opcode: number,
-  payload: Buffer,
-  options: { fin?: boolean; masked?: boolean; rsv?: number; declaredLength?: number } = {},
-): Buffer {
-  const fin = options.fin ?? true;
-  const masked = options.masked ?? true;
-  const length = options.declaredLength ?? payload.length;
-  const header: number[] = [((fin ? 0x80 : 0) | (options.rsv ?? 0) | opcode) & 0xff];
-  const maskBit = masked ? 0x80 : 0;
-  if (length < 126) {
-    header.push(maskBit | length);
-  } else if (length < 0x10000) {
-    header.push(maskBit | 126, (length >> 8) & 0xff, length & 0xff);
-  } else {
-    header.push(maskBit | 127, 0, 0, 0, 0, (length >>> 24) & 0xff, (length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff);
-  }
-  if (!masked) return Buffer.concat([Buffer.from(header), payload]);
-  const mask = randomBytes(4);
-  const masking = Buffer.allocUnsafe(payload.length);
-  for (let index = 0; index < payload.length; index++) masking[index] = payload[index]! ^ mask[index % 4]!;
-  return Buffer.concat([Buffer.from(header), mask, masking]);
-}
-
-function text(value: string, options?: Parameters<typeof clientFrame>[2]): Buffer {
-  return clientFrame(0x1, Buffer.from(value, "utf8"), options);
-}
 
 /** Decode a whole byte stream and return the messages, failing loudly if it errors. */
 function decodeAll(decoder: FrameDecoder, bytes: Buffer): string[] {

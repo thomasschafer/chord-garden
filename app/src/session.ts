@@ -124,6 +124,19 @@ export const projectSocket = new ProjectSocket({
   token: client.sessionToken,
   factory: transport,
   /**
+   * How this window recovers from a sidecar restart (PLAN.md §10: the token is
+   * minted per run).
+   *
+   * Without it, restarting the sidecar under an open page refuses that page for
+   * good — and because the refusal replaces the whole UI, every edit it had not yet
+   * written goes with it, moments after the page promised they would be "written
+   * when the connection returns". Routed through the client rather than fetched here
+   * so that the socket and the HTTP requests adopt the same token together; a page
+   * that re-handshaked while `ProjectClient` kept the old one would reconnect and
+   * then fail every write.
+   */
+  refreshToken: () => client.refreshToken(),
+  /**
    * What this window holds, hashed, so a reconnect can be replayed (PLAN.md §12).
    *
    * Built from the bytes this window believes are *on disk*, not from its canonical

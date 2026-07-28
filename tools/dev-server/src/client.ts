@@ -7,6 +7,7 @@ import {
 } from "@chord-garden/format/pure";
 import {
   SESSION_HEADER,
+  SESSION_TOKEN_PATH,
   SNAPSHOT_PATH,
   TOKEN_GLOBAL,
   TOKEN_HEADER,
@@ -14,6 +15,7 @@ import {
   type ProjectList,
   type ProjectSnapshot,
   type ProjectSummary,
+  type SessionTokenResponse,
   type WriteDeleteFile,
   type WriteRequest,
   type WriteRequestFile,
@@ -54,7 +56,12 @@ export interface LoadedProject {
 }
 
 export class ProjectClient {
-  private readonly token: string;
+  /**
+   * Not readonly, because the sidecar mints a new token every time it starts and a
+   * page that outlived a restart has to be able to adopt the current one. See
+   * `refreshToken`.
+   */
+  private token: string;
   private readonly base: string;
   private sessionProvider: () => string | undefined = () => undefined;
 
@@ -112,6 +119,31 @@ export class ProjectClient {
    */
   useSession(provider: () => string | undefined): void {
     this.sessionProvider = provider;
+  }
+
+  /**
+   * Fetch the token this sidecar is using now and adopt it for every later request.
+   *
+   * Called when the sidecar refuses this page's token, which — for a page that can
+   * only reach the origin that served it — means the sidecar was restarted and
+   * minted a new one. Refetching is what turns that from "this window is refused for
+   * good, and whatever it had not written is gone" into a reconnection.
+   *
+   * Deliberately not a silent auto-retry inside `fetch`: the caller has to know the
+   * token changed, because the socket authenticates with the same value and would
+   * otherwise keep offering the old one.
+   */
+  async refreshToken(): Promise<string> {
+    const response = await fetch(`${this.base}${SESSION_TOKEN_PATH}`, { headers: { accept: "application/json" } });
+    if (!response.ok) {
+      throw new Error(`GET ${SESSION_TOKEN_PATH} → ${response.status} ${await response.text()}`);
+    }
+    const body = (await response.json()) as SessionTokenResponse;
+    if (typeof body.token !== "string" || body.token.length === 0) {
+      throw new Error(`${SESSION_TOKEN_PATH} answered without a token`);
+    }
+    this.token = body.token;
+    return body.token;
   }
 
   async listProjects(): Promise<ProjectList> {

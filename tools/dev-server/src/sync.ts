@@ -12,6 +12,7 @@ import {
   type ApiDiagnostic,
   type HelloMessage,
   type SampleFile,
+  type RejectionCode,
   type ServerMessage,
   type SnapshotDocument,
   type SnapshotFile,
@@ -26,8 +27,26 @@ import {
 } from "./websocket.js";
 import { couldBeSample, DirectoryWatcher } from "./watch.js";
 
-/** How often an authenticated socket is pinged, and how long a pong may take. */
-export const KEEPALIVE_MS = 15_000;
+/**
+ * How often an authenticated socket is pinged.
+ *
+ * With `PONG_TIMEOUT_MS`, this bounds how long a browser that vanished without
+ * closing its TCP connection — a crashed tab, a killed renderer, a suspended
+ * machine — keeps this project's single write slot (PLAN.md §12). That bound is
+ * what the human sees: until it expires, reopening their own project is refused
+ * with "open in another window", naming a window that no longer exists.
+ */
+export const KEEPALIVE_MS = 5_000;
+
+/**
+ * How long a ping may go unanswered before the peer is treated as gone.
+ *
+ * Separate from `KEEPALIVE_MS` because when the interval was also the deadline, a
+ * peer dying just after a pong went unnoticed for two full intervals. One interval
+ * plus one deadline is the bound now, and it is deliberately generous relative to
+ * what actually delays a pong — see `WebSocketConnection.startKeepalive`.
+ */
+export const PONG_TIMEOUT_MS = 5_000;
 
 export interface ProjectSyncOptions {
   mount: ProjectMount;
@@ -38,6 +57,8 @@ export interface ProjectSyncOptions {
   /** How often the watcher re-scans an idle project (see `IDLE_RESCAN_MS`). */
   rescanMs?: number;
   keepaliveMs?: number;
+  /** How long a ping may go unanswered before the socket is closed. */
+  pongTimeoutMs?: number;
   /** How long an unauthenticated socket may stay silent. */
   helloTimeoutMs?: number;
   /**
@@ -141,6 +162,7 @@ export class ProjectSync {
   private readonly establishedSamples = new Map<string, string>();
   private readonly watcher: DirectoryWatcher | undefined;
   private readonly keepaliveMs: number;
+  private readonly pongTimeoutMs: number;
   private readonly log: (line: string) => void;
   /**
    * The one read-write session (PLAN.md §12, single-writer). Held rather than a
@@ -169,6 +191,7 @@ export class ProjectSync {
   constructor(private readonly options: ProjectSyncOptions) {
     this.log = options.log ?? (() => {});
     this.keepaliveMs = options.keepaliveMs ?? KEEPALIVE_MS;
+    this.pongTimeoutMs = options.pongTimeoutMs ?? PONG_TIMEOUT_MS;
     this.seed();
     if (options.watchFilesystem ?? true) {
       this.watcher = new DirectoryWatcher({
@@ -229,7 +252,7 @@ export class ProjectSync {
         }
         const outcome = this.readHello(text);
         if ("refusal" in outcome) {
-          this.refuse(connection, outcome.refusal.close, outcome.refusal.reason, outcome.refusal.kind);
+          this.refuse(connection, outcome.refusal.close, outcome.refusal.reason, outcome.refusal.code);
           return;
         }
         if (this.hasEditor) {
@@ -239,7 +262,7 @@ export class ProjectSync {
             connection,
             CLOSE_ALREADY_OPEN,
             `project "${this.options.mount.name}" is open in another window`,
-            "rejected",
+            "alreadyOpen",
           );
           return;
         }
@@ -247,7 +270,7 @@ export class ProjectSync {
         clearTimeout(timeout);
         this.editor = connection;
         this.session = randomBytes(16).toString("hex");
-        connection.startKeepalive(this.keepaliveMs);
+        connection.startKeepalive(this.keepaliveMs, this.pongTimeoutMs);
         this.send(connection, {
           type: "welcome",
           protocol: SYNC_PROTOCOL,
@@ -591,14 +614,25 @@ export class ProjectSync {
         refusal: {
           close: CLOSE_POLICY_VIOLATION,
           reason: `this page speaks sync protocol ${JSON.stringify(message["protocol"])} and the sidecar speaks ${SYNC_PROTOCOL}; reload the page`,
-          kind: "rejected",
+          code: "protocol",
         },
       };
     }
     const token = message["token"];
     if (typeof token !== "string" || !constantTimeEquals(token, this.options.token)) {
+      // Deliberately not phrased as a security failure. The token is minted per run,
+      // so much the commonest cause of this is that the sidecar was restarted while
+      // this page stayed open — and telling a person their routine restart is an
+      // authentication problem, while throwing away the edits they had not written
+      // yet, is wrong twice over. `staleToken` lets the page fetch the current token
+      // and hand the handshake back with everything it holds intact.
       return {
-        refusal: { close: CLOSE_UNAUTHORIZED, reason: "the session token is missing or wrong", kind: "rejected" },
+        refusal: {
+          close: CLOSE_UNAUTHORIZED,
+          reason:
+            "this page's session token is not the one the sidecar is using; if the sidecar has been restarted, reconnecting with the current token will fix it",
+          code: "staleToken",
+        },
       };
     }
     const project = message["project"];
@@ -607,7 +641,7 @@ export class ProjectSync {
         refusal: {
           close: CLOSE_POLICY_VIOLATION,
           reason: `this socket is for project "${this.options.mount.name}", not ${JSON.stringify(project)}`,
-          kind: "rejected",
+          code: "protocol",
         },
       };
     }
@@ -634,14 +668,9 @@ export class ProjectSync {
     };
   }
 
-  private refuse(
-    connection: WebSocketConnection,
-    close: number,
-    reason: string,
-    kind: "rejected" | "error" = "error",
-  ): void {
+  private refuse(connection: WebSocketConnection, close: number, reason: string, code?: RejectionCode): void {
     this.log(`sync ${this.options.mount.name}: refusing socket — ${reason}`);
-    this.send(connection, kind === "rejected" ? { type: "rejected", reason } : { type: "error", message: reason });
+    this.send(connection, code === undefined ? { type: "error", message: reason } : { type: "rejected", code, reason });
     connection.close(close, reason);
   }
 
@@ -726,11 +755,17 @@ function readDeclaredSamples(
   return { samples };
 }
 
-/** Why a socket is being closed, and what to tell it first. */
+/**
+ * Why a socket is being closed, and what to tell it first.
+ *
+ * A `code` accompanies every `rejected` refusal because the page has to tell a
+ * restarted sidecar from a window it will never admit, and prose is the wrong thing
+ * to decide that on.
+ */
 interface Refusal {
   close: number;
   reason: string;
-  kind?: "rejected";
+  code?: RejectionCode;
 }
 
 function toApiDiagnostic(diagnostic: { severity: string; code: string; file: string; message: string }): ApiDiagnostic {

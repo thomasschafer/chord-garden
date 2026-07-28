@@ -153,11 +153,35 @@ export const SOCKET_PATH = "socket";
 export const SNAPSHOT_PATH = "snapshot";
 
 /**
+ * Path serving the session token this sidecar is currently using.
+ *
+ * Unauthenticated, which reads like a hole and is not one: the served HTML already
+ * hands the same token to anything that asks for it (`curl http://127.0.0.1:PORT/app/`
+ * prints it, with no credential), so this exposes nothing the pages do not, and it
+ * is behind the same loopback-`Host` and same-`Origin` gates they are. What defends
+ * this server is the loopback bind plus those two checks; the token is a session
+ * handle, not the boundary — see PLAN.md §10 and the note on `TOKEN_HEADER`.
+ *
+ * It exists because the token is minted per run, so a sidecar restart leaves every
+ * open page holding a token that is no longer the right one. Without a way to ask
+ * for the current one, that page is refused for good and whatever it had not yet
+ * written is lost — a routine restart reported as a security failure. Outside
+ * `/api/` deliberately: this is served on the same terms as the pages, and the rule
+ * that every `/api/` request carries the token stays absolute.
+ */
+export const SESSION_TOKEN_PATH = "/session-token";
+
+/** The body of a `SESSION_TOKEN_PATH` response. */
+export interface SessionTokenResponse {
+  token: string;
+}
+
+/**
  * Version of the sync protocol below. Bumped when a message shape changes, and
  * checked in the handshake: a page left open across a rebuild is told to reload
  * rather than left silently misreading a message it half understands.
  */
-export const SYNC_PROTOCOL = 3;
+export const SYNC_PROTOCOL = 4;
 
 /** Largest client→server message the socket will read (PLAN.md §10). */
 export const MAX_SOCKET_MESSAGE_BYTES = 64 * 1024;
@@ -359,12 +383,36 @@ export interface WelcomeMessage {
 }
 
 /**
+ * Why a handshake was refused, in a form a page can act on.
+ *
+ * Machine-readable because the three cases need three different responses and the
+ * page used to tell them apart by searching the prose for "another window" — which
+ * is both fragile and, worse, lumped a *restarted sidecar* in with a genuinely
+ * refused window. They are opposites: one is recoverable by re-authenticating and
+ * must keep the page's unsaved edits, the other is terminal and must not.
+ */
+export type RejectionCode =
+  /** PLAN.md §12's single-writer rule: another window holds this project. Terminal. */
+  | "alreadyOpen"
+  /**
+   * The token in the hello is not this sidecar's.
+   *
+   * Overwhelmingly this means the sidecar restarted and minted a new one, because a
+   * page can only reach the origin that served it. Recoverable: the page fetches the
+   * current token and hands the handshake back, keeping everything it holds.
+   */
+  | "staleToken"
+  /** The page speaks a different protocol version, or asked for another project. Terminal. */
+  | "protocol";
+
+/**
  * The handshake was refused. Carries a human-readable reason because every case
  * — wrong token, wrong protocol, project already open elsewhere — is something
  * the person looking at the page has to be told (PLAN.md §12 single-writer).
  */
 export interface RejectedMessage {
   type: "rejected";
+  code: RejectionCode;
   reason: string;
 }
 
