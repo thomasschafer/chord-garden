@@ -28,7 +28,10 @@ export interface ExternalChange {
    * disagreement this window cannot explain. In a full snapshot — sent when this
    * window reconnected holding a state the sidecar had moved past — the sidecar
    * cannot know which removals this window already saw, so the inventory is the
-   * authority and a document missing from it is gone.
+   * authority and a document *this window believes is on disk* that it does not
+   * name is gone. Only such files: a document this window created and has not
+   * written yet is absent from every inventory there has ever been, and that says
+   * nothing at all about it.
    */
   scope: "diff" | "full";
   /** Every document on disk after the change. */
@@ -66,7 +69,11 @@ export type ReconcileResult =
       /** Paths taken from disk, with the exact bytes read there. */
       adopted: ReadonlyMap<string, string>;
       removed: readonly string[];
-      /** Adopted paths that had unsaved local edits, which are now gone. */
+      /**
+       * Adopted paths that had an unsaved local edit, which is now gone — either
+       * unwritten bytes the disk's version replaced, or a local deletion the disk
+       * contradicted by still having the file.
+       */
       discarded: readonly string[];
     };
 
@@ -113,12 +120,24 @@ export function reconcileExternalChange(input: ReconcileInput): ReconcileResult 
 
   const inventory = new Map(change.files.map((file) => [file.path, file.contentHash]));
   const newly = change.changed.filter((file) => onDisk.get(file.path) !== file.text);
+
+  // Documents the model and the disk disagree about because *this window* has not
+  // written its own edits yet — a file created here and never flushed, or one the
+  // model dropped whose deletion has not reached disk. Neither is anything the
+  // sidecar can know about, so neither may be read as news about the disk.
+  //
+  // This distinction is the whole reason `onDisk` exists beside `canonical`, and
+  // getting it wrong is silent: a locally created file compared against an
+  // inventory that has never named it looks exactly like a file an agent deleted.
+  const pendingCreates = new Set([...canonical.keys()].filter((path) => !onDisk.has(path)));
+  const pendingDeletes = new Set([...onDisk.keys()].filter((path) => !canonical.has(path)));
+
   // A full snapshot's inventory is the authority on which documents exist, so a
-  // document this window holds that it does not name is a removal this window was
-  // never told about — a file deleted while its socket was down. In a diff only
-  // `removed` may say that.
-  const gone =
-    change.scope === "full" ? [...canonical.keys()].filter((path) => !inventory.has(path)) : [];
+  // document this window believes is *on disk* that it does not name is a removal
+  // this window was never told about — a file deleted while its socket was down.
+  // Compared against `onDisk` and never against `canonical`: the server cannot
+  // have deleted a file it has never seen. In a diff only `removed` may say this.
+  const gone = change.scope === "full" ? [...onDisk.keys()].filter((path) => !inventory.has(path)) : [];
   const removed = [...new Set([...change.removed, ...gone])].filter(
     (path) => canonical.has(path) || onDisk.has(path),
   );
@@ -128,8 +147,17 @@ export function reconcileExternalChange(input: ReconcileInput): ReconcileResult 
   for (const path of removed) texts.delete(path);
   for (const file of newly) texts.set(file.path, file.text);
 
-  const unaccounted = [...inventory.keys()].filter((path) => !texts.has(path)).sort();
-  const unexpected = [...texts.keys()].filter((path) => !inventory.has(path)).sort();
+  // The two consistency checks are about a disagreement this window cannot
+  // explain, so each excuses the one case it *can*: a document still awaiting its
+  // own write is expected to be on disk and not in the model, or in the model and
+  // not on disk. Without that, any external edit arriving between a local
+  // create-or-delete and its debounced write is a spurious desync.
+  const unaccounted = [...inventory.keys()]
+    .filter((path) => !texts.has(path) && !pendingDeletes.has(path))
+    .sort();
+  const unexpected = [...texts.keys()]
+    .filter((path) => !inventory.has(path) && !pendingCreates.has(path))
+    .sort();
   if (unaccounted.length > 0 || unexpected.length > 0) {
     return {
       kind: "outOfSync",
@@ -195,6 +223,11 @@ export function reconcileExternalChange(input: ReconcileInput): ReconcileResult 
     project,
     adopted,
     removed: [...removed].sort(),
-    discarded: [...adopted.keys()].filter((path) => input.dirty.includes(path)).sort(),
+    // A local deletion the disk has just contradicted counts as a discarded edit
+    // too: the file is back in the model, and saying nothing would let a document
+    // the author deleted reappear with no explanation.
+    discarded: [...adopted.keys()]
+      .filter((path) => input.dirty.includes(path) || pendingDeletes.has(path))
+      .sort(),
   };
 }

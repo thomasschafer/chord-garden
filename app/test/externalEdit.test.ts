@@ -6,6 +6,7 @@ import {
   type DocumentSink,
   type DocumentStore,
   type ExternalChange,
+  type PendingDelete,
   type PendingFile,
 } from "../src/store/documentStore";
 import { FIXTURE, openedFrom } from "./fixture";
@@ -13,14 +14,20 @@ import { FIXTURE, openedFrom } from "./fixture";
 /** Records what it was asked to write, and resolves immediately. */
 class RecordingSink implements DocumentSink {
   readonly batches: PendingFile[][] = [];
+  readonly deleteBatches: PendingDelete[][] = [];
 
-  async write(files: readonly PendingFile[]) {
+  async write(files: readonly PendingFile[], deletes: readonly PendingDelete[] = []) {
     this.batches.push(files.map((file) => ({ ...file })));
+    this.deleteBatches.push(deletes.map((entry) => ({ ...entry })));
     return { diagnostics: [] };
   }
 
   get paths(): string[][] {
     return this.batches.map((batch) => batch.map((file) => file.path));
+  }
+
+  get deletedPaths(): string[][] {
+    return this.deleteBatches.map((batch) => batch.map((entry) => entry.path));
   }
 }
 
@@ -602,5 +609,108 @@ describe("catching up after a dropped connection", () => {
 
     expect(store.getState().outOfSync).toContain("patterns/appeared.json");
     expect(store.getState().project).toBe(before);
+  });
+});
+
+describe("local documents the disk has never seen", () => {
+  /**
+   * The asymmetry these cover: `canonical` is the model, which may hold a file
+   * that has never been written and may have dropped one that is still on disk.
+   * Only `onDisk` says what this window believes the disk holds, so only `onDisk`
+   * may be compared against a snapshot's inventory. A file the server has never
+   * seen is not a file the server deleted.
+   */
+  it("keeps a lane created while the socket was down, and does not call it an agent deletion", async () => {
+    const sink = new RecordingSink();
+    const store = open(sink);
+    // Created in this window while the socket was down: it is in the model, it is
+    // dirty, and it has never been on disk.
+    store.getState().addAutomationLane("bass", "filter.cutoff");
+    expect(store.getState().dirty).toEqual(["automation/bass.json"]);
+
+    // The socket reconnects. The sidecar sends the disk it just read, which cannot
+    // name a document this window has never written.
+    store
+      .getState()
+      .applyExternalChange(fullSnapshot({ ...diskOf(store), "project.json": renamed(store, "Renamed offline") }));
+
+    const state = store.getState();
+    expect(state.project!.project.name).toBe("Renamed offline");
+    expect(state.project!.automation.get("bass")?.lanes.map((lane) => lane.param)).toEqual(["filter.cutoff"]);
+    expect(state.canonical.has("automation/bass.json")).toBe(true);
+    // The property that matters: still unwritten, so still owed a write.
+    expect(state.dirty).toEqual(["automation/bass.json"]);
+    expect(state.lastExternalEdit?.removed).toEqual([]);
+    expect(state.lastExternalEdit?.discarded).toEqual([]);
+    expect(state.outOfSync).toBeUndefined();
+    await store.getState().flushNow();
+    expect(sink.paths).toEqual([["automation/bass.json"]]);
+  });
+
+  it("adopts a diff that arrives while a locally created document is unwritten", async () => {
+    const sink = new RecordingSink();
+    const store = open(sink);
+    store.getState().addAutomationLane("bass", "filter.cutoff");
+
+    store.getState().applyExternalChange(externalChange(store, { "project.json": renamed(store, "Theirs") }));
+
+    const state = store.getState();
+    expect(state.outOfSync).toBeUndefined();
+    expect(state.project!.project.name).toBe("Theirs");
+    expect(state.project!.automation.has("bass")).toBe(true);
+    expect(state.dirty).toEqual(["automation/bass.json"]);
+    await store.getState().flushNow();
+    expect(sink.paths).toEqual([["automation/bass.json"]]);
+  });
+
+  it("adopts a diff that arrives while a locally dropped document is still on disk", async () => {
+    const sink = new RecordingSink();
+    const store = open(sink);
+    // The last lane of `automation/pad.json`, so the model drops the whole file;
+    // the deletion has not reached disk yet.
+    store.getState().removeAutomationLane("pad", "filter.cutoff");
+    expect(store.getState().removing).toEqual(["automation/pad.json"]);
+
+    store.getState().applyExternalChange(externalChange(store, { "project.json": renamed(store, "Theirs") }));
+
+    const state = store.getState();
+    expect(state.outOfSync).toBeUndefined();
+    expect(state.project!.project.name).toBe("Theirs");
+    expect(state.project!.automation.has("pad")).toBe(false);
+    expect(state.removing).toEqual(["automation/pad.json"]);
+    await store.getState().flushNow();
+    expect(sink.deletedPaths).toEqual([["automation/pad.json"]]);
+  });
+
+  it("says so when the agent rewrites a document this window had dropped", () => {
+    const store = open(new RecordingSink());
+    store.getState().removeAutomationLane("pad", "filter.cutoff");
+    const agentText = diskEdit(store, "automation/pad.json", '"interp": "linear"', '"interp": "step"');
+
+    store.getState().applyExternalChange(externalChange(store, { "automation/pad.json": agentText }));
+
+    const state = store.getState();
+    // Last-writer-wins: the agent wrote the file, so it comes back — and the local
+    // deletion that lost has to be named, or the file silently reappears.
+    expect(state.outOfSync).toBeUndefined();
+    expect(state.project!.automation.get("pad")?.lanes[0]?.interp).toBe("step");
+    expect(state.lastExternalEdit?.discarded).toEqual(["automation/pad.json"]);
+    expect(state.removing).toEqual([]);
+  });
+
+  it("still removes a locally dropped document the disk has also lost", () => {
+    const store = open(new RecordingSink());
+    store.getState().removeAutomationLane("pad", "filter.cutoff");
+
+    const disk = diskOf(store);
+    delete disk["automation/pad.json"];
+    store.getState().applyExternalChange(fullSnapshot(disk));
+
+    const state = store.getState();
+    expect(state.outOfSync).toBeUndefined();
+    expect(state.project!.automation.has("pad")).toBe(false);
+    // Nothing left to delete: the disk agrees, so the write batch has no work.
+    expect(state.removing).toEqual([]);
+    expect(state.onDisk.has("automation/pad.json")).toBe(false);
   });
 });

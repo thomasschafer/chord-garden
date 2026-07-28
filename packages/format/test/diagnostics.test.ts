@@ -48,6 +48,11 @@ const EXPECTED: Record<string, string> = {
   "non-automatable-effect-param": "automation.param-not-automatable",
   "non-automatable-param": "automation.param-not-automatable",
   "not-wav-sample": "sample.not-wav",
+  // A param key whose first segment starts with `-`. The schemas admit a hyphen
+  // *inside* a segment because a drumkit's params are keyed by kit voice and voice
+  // ids are kebab-case — so this fixture is the other side of that: the shape stays
+  // closed, and `swung-hat.gain` being legal does not make `-swung-hat.gain` legal.
+  "param-key-shape": "schema.additionalProperties",
   "pattern-kind-mismatch": "track.pattern-kind-mismatch",
   // Four surfaces of one mistake: a name a project file chose that happens to be
   // a member of `Object.prototype`. Each used to be accepted by an `in` test or a

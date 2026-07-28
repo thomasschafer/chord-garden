@@ -3,7 +3,7 @@ import { ticksPerBar } from "./musicTime.js";
 import { parseSteps } from "./pattern.js";
 import { pitchToMidi } from "./pitch.js";
 
-export interface DescribeTrack {
+export interface DescribedTrack {
   id: string;
   type: string;
   instrument: string;
@@ -20,6 +20,23 @@ export interface DescribeTrack {
    */
   effects?: { id: string; type: string }[];
 }
+
+/**
+ * A track `project.json`'s `trackOrder` names that has no `tracks/<id>.json`.
+ *
+ * It keeps its place in the list rather than being dropped, because `describe`'s
+ * job here is to show the project as it is: a report that silently omitted it
+ * would disagree with `project.json` about how many tracks the project has, and
+ * an agent comparing the two would be told nothing about the one that is wrong.
+ * `musictool validate` reports the same thing as `trackorder.unknown-track`.
+ */
+export interface MissingTrack {
+  id: string;
+  /** Always `true`, and the discriminant; a track that exists has no such key. */
+  missing: true;
+}
+
+export type DescribeTrack = DescribedTrack | MissingTrack;
 
 export interface DescribePattern {
   id: string;
@@ -47,14 +64,38 @@ export interface DescribeReport {
   patterns: DescribePattern[];
 }
 
-/** Machine-readable project summary; `describe --json` golden tests assert on it. */
+/**
+ * Machine-readable project summary; `describe --json` golden tests assert on it.
+ *
+ * **Total over any assembled project, including one that does not validate.**
+ * `describe` is a read-only inspection command, and an agent reaches for it
+ * precisely when something is wrong — so it summarises what it can and marks what
+ * it cannot, rather than refusing. A reader that switches itself off exactly when
+ * the project is broken is a reader that is never there when it is wanted, and
+ * `musictool validate` already exists for the yes/no answer. Contrast `fmt`, which
+ * does refuse: it *writes*, and writing over a project nobody can parse is how an
+ * edit is lost. Writers refuse, readers report.
+ *
+ * That is not a new policy — `runDescribe` already prints the diagnostics after the
+ * report and already exits 1 when the project is invalid. The crash this guards
+ * against was a missing case, not a missing decision.
+ *
+ * `meterMap[0]` and `tempoMap[0]` are still asserted: both are `required` with
+ * `minItems: 1` in `project.schema.json`, and a schema error stops `loadProject`
+ * before a `Project` is ever assembled, so unlike `trackOrder` they cannot be
+ * reached from a document on disk.
+ */
 export function describeProject(project: Project): DescribeReport {
   const meter = project.project.meterMap[0]!;
   const barTicks = ticksPerBar(project.project.ppqn, meter.timeSignature);
 
   const tracks: DescribeTrack[] = project.project.trackOrder.map((id) => {
-    const track = project.tracks.get(id)!;
-    const described: DescribeTrack = {
+    const track = project.tracks.get(id);
+    // Semantic, not schema: `trackorder.unknown-track` is reported by
+    // `semanticValidate`, which runs *after* the project is assembled, so a
+    // project reaching here can name a track that does not exist.
+    if (track === undefined) return { id, missing: true };
+    const described: DescribedTrack = {
       id,
       type: track.type,
       instrument: track.instrument,

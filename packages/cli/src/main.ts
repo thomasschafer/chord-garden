@@ -199,6 +199,10 @@ function runDescribe(root: string, json: boolean, io: CliIo): number {
   const report = describeProject(result.project);
   if (json) {
     io.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    // To stderr, so stdout stays exactly the report a caller pipes into `jq`.
+    // Without this, `describe --json` is the one command that looks at a broken
+    // project and says nothing at all about what is broken.
+    printDiagnostics(result.diagnostics, io);
   } else {
     printHumanDescribe(report, result, io);
   }
@@ -210,6 +214,12 @@ function printHumanDescribe(report: DescribeReport, result: LoadResult, io: CliI
   const key = report.key ? `${report.key.root} ${report.key.scale}` : "none";
   io.stdout.write(`${report.name} — ${formatBpm(report.bpm)} bpm, ${num}/${den}, key: ${key}, ${report.bars} bars\n`);
   for (const track of report.tracks) {
+    if ("missing" in track) {
+      // Named in its `trackOrder` position rather than skipped, so the list still
+      // matches `project.json` and the gap is the thing that stands out.
+      io.stdout.write(`  ${track.id} — no tracks/${track.id}.json; trackOrder names a track that does not exist\n`);
+      continue;
+    }
     const automation = track.automatedParams.length > 0 ? `, automates ${track.automatedParams.join(", ")}` : "";
     io.stdout.write(
       `  ${track.id} (${track.type} → ${track.instrument}): patterns [${track.patterns.join(", ")}], ${track.clipCount} clip${track.clipCount === 1 ? "" : "s"}${automation}\n`,

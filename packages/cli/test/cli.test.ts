@@ -122,6 +122,46 @@ describe("fmt --check", () => {
   });
 });
 
+describe("describe on a project that does not validate", () => {
+  // `runCli` has no try/catch anywhere above it — `main.ts` assigns its return
+  // value straight to `process.exitCode` — so anything thrown in here reached the
+  // user as a raw V8 stack trace. These run the real command, not `describeProject`,
+  // because the CLI is where that was visible.
+  const BROKEN = fileURLToPath(new URL("../../../fixtures/invalid/trackorder-unknown", import.meta.url));
+
+  it("prints the summary it can and the diagnostics, and exits 1", () => {
+    const result = run(["describe", BROKEN]);
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("diagnostics:");
+    expect(result.stdout).toContain("trackOrder names a track that does not exist");
+    expect(result.stderr).toContain("trackorder.unknown-track");
+    // The summary is real, not a stub: the project's own header line is there.
+    expect(result.stdout).toMatch(/bpm, \d+\/\d+, key: /);
+    expect(result.stdout).not.toContain("TypeError");
+  });
+
+  it("still emits parseable JSON on stdout, with the diagnostics on stderr", () => {
+    const result = run(["describe", BROKEN, "--json"]);
+
+    expect(result.code).toBe(1);
+    const report = JSON.parse(result.stdout) as { tracks: { id: string; missing?: true }[] };
+    expect(report.tracks.some((track) => track.missing === true)).toBe(true);
+    // stdout stays exactly the report, so piping it into `jq` keeps working.
+    expect(result.stdout).not.toContain("trackorder.unknown-track");
+    expect(result.stderr).toContain("trackorder.unknown-track");
+  });
+
+  it("describes every valid fixture without complaint", () => {
+    const result = run(["describe", VALID_FIXTURE]);
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain("diagnostics:");
+    expect(result.stdout).not.toContain("does not exist");
+  });
+});
+
 function run(args: readonly string[]): { code: number; stdout: string; stderr: string } {
   let stdout = "";
   let stderr = "";

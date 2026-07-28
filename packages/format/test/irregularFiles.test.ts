@@ -86,6 +86,27 @@ describe("a project directory containing something that is not a document", () =
     expect(diagnostic?.message).toContain("FIFO");
   });
 
+  it("reports a directory where a sample belongs", () => {
+    // The sibling of "a directory named like a document": samples reach the disk
+    // through `checkSamples` rather than through the document loader, so the two
+    // are separate call sites of `readRegularFile` and only one of them was
+    // covered. A plain `readFileSync` here fails with `EISDIR`, which had nowhere
+    // to be caught and left `validate` printing a V8 stack.
+    const root = project("dir-sample");
+    addDrumkitReferencing(root, "samples/kick.wav");
+    mkdirSync(join(root, "samples", "kick.wav"));
+
+    const result = loadProject(root);
+    expect(result.ok).toBe(false);
+    const diagnostic = result.diagnostics.find((d) => d.code === "sample.not-a-file");
+    expect(diagnostic?.file).toBe("instruments/k.json");
+    expect(diagnostic?.pointer).toBe("/kit/kick/sample");
+    expect(diagnostic?.severity).toBe("error");
+    expect(diagnostic?.message).toContain("directory");
+    // Specifically not reported as absent: the path is right there.
+    expect(result.diagnostics.map((d) => d.code)).not.toContain("sample.missing");
+  });
+
   it("refuses a document past the size cap instead of reading it into memory", () => {
     const root = project("huge-doc");
     const path = join(root, "tracks", "huge.json");

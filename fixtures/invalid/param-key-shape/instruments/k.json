@@ -1,0 +1,12 @@
+{
+  "id": "k",
+  "type": "drumkit",
+  "kit": {
+    "swung-hat": {
+      "sample": "samples/hat.wav"
+    }
+  },
+  "params": {
+    "-swung-hat.gain": -300
+  }
+}
