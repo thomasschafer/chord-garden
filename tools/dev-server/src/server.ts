@@ -1,5 +1,11 @@
 import { closeSync, constants, createReadStream, fstatSync, openSync, readFileSync } from "node:fs";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type OutgoingHttpHeaders,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import { loadProject } from "@chord-garden/format";
@@ -630,22 +636,35 @@ function requireOrigin(req: IncomingMessage): string | undefined {
     : undefined;
 }
 
+/**
+ * The headers every response carries, so a new route cannot forget one.
+ *
+ * `nosniff` earns its place on the two HTML pages below, which carry the
+ * session token as an injected global: a browser that disregards the declared
+ * type and sniffs its own can be talked into executing something as script in
+ * the origin holding that token. The rest of the routes take it because the
+ * hazard is not really about HTML — `/api/projects/:name/files/<path>` serves
+ * bytes out of a directory the user is editing, under a type this server chose
+ * from the extension, and "believe the label" is exactly what should happen
+ * there.
+ */
+function baseHeaders(contentType: string, length: number): OutgoingHttpHeaders {
+  return {
+    "content-type": contentType,
+    "content-length": length,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+  };
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, method = "GET"): void {
   const text = JSON.stringify(body, null, 2);
-  res.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(text),
-    "cache-control": "no-store",
-  });
+  res.writeHead(status, baseHeaders("application/json; charset=utf-8", Buffer.byteLength(text)));
   res.end(method === "HEAD" ? undefined : text);
 }
 
 function sendText(res: ServerResponse, status: number, message: string): void {
-  res.writeHead(status, {
-    "content-type": "text/plain; charset=utf-8",
-    "content-length": Buffer.byteLength(message),
-    "cache-control": "no-store",
-  });
+  res.writeHead(status, baseHeaders("text/plain; charset=utf-8", Buffer.byteLength(message)));
   res.end(message);
 }
 
@@ -675,11 +694,7 @@ function sendHtml(
   const head = html.indexOf("<head>");
   if (head < 0) throw new Error(`${path} has no <head> to inject the session token into`);
   const injected = html.slice(0, head + "<head>".length) + inject + html.slice(head + "<head>".length);
-  res.writeHead(200, {
-    "content-type": "text/html; charset=utf-8",
-    "content-length": Buffer.byteLength(injected),
-    "cache-control": "no-store",
-  });
+  res.writeHead(200, baseHeaders("text/html; charset=utf-8", Buffer.byteLength(injected)));
   res.end(method === "HEAD" ? undefined : injected);
 }
 
@@ -724,12 +739,22 @@ function sendFile(
     // A file that exists but cannot be opened is a different problem from one
     // that is not there, and saying "is missing" about a `chmod 000` sample sends
     // whoever hits it looking for the wrong thing.
+    //
+    // 500 rather than 403, because the two statuses answer different questions.
+    // Every 403 this server sends is a decision it made — a path outside the
+    // root, an extension it does not serve, a bad token — and means "you may not
+    // have this". An `EACCES` on a sample the project legitimately references is
+    // not a refusal at all: the client asked for something it is entitled to and
+    // the server could not produce it. Reporting that as 403 sends the reader to
+    // audit their permissions grant when the fix is `chmod` on one file, and it
+    // makes a genuine confinement refusal indistinguishable from a local
+    // filesystem fault in the log.
     const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
     if (code === "ENOENT" || code === "ENOTDIR") {
       sendText(res, 404, options.missing ?? `${path} is missing`);
     } else {
       log(`cannot open ${path}: ${code}`);
-      sendText(res, 403, `${path} cannot be read (${code})`);
+      sendText(res, 500, `${path} cannot be read (${code})`);
     }
     return;
   }
@@ -753,7 +778,7 @@ function sendFile(
     throw error;
   }
 
-  res.writeHead(200, { "content-type": contentType, "content-length": size, "cache-control": "no-store" });
+  res.writeHead(200, baseHeaders(contentType, size));
   if (method === "HEAD") {
     closeSync(fd);
     res.end();

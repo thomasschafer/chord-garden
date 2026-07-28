@@ -1,4 +1,4 @@
-import type { AutomationInterp, AutomationLane, ParamSpec } from "@chord-garden/format/pure";
+import type { AutomationLane, ParamSpec } from "@chord-garden/format/pure";
 
 /**
  * The automation editor's arithmetic: a param value to a pixel, a pixel back to

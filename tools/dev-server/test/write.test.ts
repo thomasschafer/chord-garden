@@ -361,6 +361,34 @@ describe("write endpoint concurrency preconditions", () => {
     expect(readFileSync(join(root, "project.json"), "utf8")).toBe(projectBefore);
   });
 
+  /**
+   * Resolving a write path used to create the document directory it names, and
+   * resolving happens during planning — before the batch-wide precondition
+   * check. A refused batch therefore left an empty `automation/` behind, which
+   * is a project the user did not ask for: `describe` and the directory scan
+   * both see a document directory that appeared out of a write nobody accepted.
+   */
+  it("leaves no directory behind when the batch it was creating for is refused", async () => {
+    const contents = canonical("automation/pad.json");
+    const projectBefore = readFileSync(join(root, "project.json"), "utf8");
+    rmSync(join(root, "automation"), { recursive: true });
+
+    // The automation file's own precondition is fine — it genuinely is absent.
+    // The batch fails on the *other* file, so the only reason `automation/`
+    // could exist afterwards is a write path that created it too eagerly.
+    const body = JSON.stringify({
+      files: [
+        { path: "automation/pad.json", contents, expectedHash: null },
+        { path: "project.json", contents: renamedProject("Should not land"), expectedHash: "not-the-hash-on-disk" },
+      ],
+    });
+    const response = await post(body);
+
+    expect(response.status).toBe(409);
+    expect(existsSync(join(root, "automation"))).toBe(false);
+    expect(readFileSync(join(root, "project.json"), "utf8")).toBe(projectBefore);
+  });
+
   it("refuses a write that omits its precondition entirely", async () => {
     const body = JSON.stringify({ files: [{ path: "project.json", contents: renamedProject("No precondition") }] });
 

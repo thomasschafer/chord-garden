@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -604,6 +604,34 @@ describe("the defaults an unadorned event compiles at", () => {
     expect(trackEvents(compile(makeProject({ pattern: withProbability })), "main-track")).toHaveLength(3);
     expect(EXPRESSION_FIELDS.probability.default).toBe(1000);
     expect(EXPRESSION_FIELDS.ratchet.default).toBe(1);
+  });
+
+  /**
+   * Unreachable from disk — the schema floors both at 1 — and reachable from
+   * here, which is the point. `compile` is a public entry point that takes a
+   * `Project` object, and the live engine and every test in this file build one
+   * without going near a validator. Left alone, `ratchet: 0` divided by zero and
+   * dropped the note, and a zero duration emitted an event of no length: a part
+   * with something missing from it and nothing saying why.
+   */
+  it("refuses a zero ratchet or a zero duration rather than silently dropping the note", () => {
+    const zeroRatchet = makeProject({
+      pattern: notesPattern([{ pitch: "A2", startTick: 0, durationTicks: 240, velocity: 800, ratchet: 0 }]),
+    });
+    expect(() => compile(zeroRatchet)).toThrow(/ratchet 0/);
+
+    const zeroDuration = makeProject({
+      pattern: notesPattern([{ pitch: "A2", startTick: 0, durationTicks: 0, velocity: 800 }]),
+    });
+    expect(() => compile(zeroDuration)).toThrow(/0 ticks/);
+
+    const zeroGate = makeProject({
+      pattern: {
+        ...gridPattern,
+        lanes: [{ ...gridPattern.lanes[0]!, defaults: { gateTicks: 0 } }],
+      },
+    });
+    expect(() => compile(zeroGate)).toThrow(/0 ticks/);
   });
 
   it("places a hit on its step exactly when nothing nudges or swings it", () => {

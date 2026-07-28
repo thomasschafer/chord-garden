@@ -175,7 +175,7 @@ Tempo and meter:
 - Renderers and schedulers must read the map shape even though v1 only contains one point.
 
 Swing:
-- `project.json.swing` is a permille integer (0–1000, default 0) applied to all grid lanes; a lane may override it with `defaults.swing`.
+- `project.json.swing` is a permille integer (0–1000) applied to all grid lanes; a lane may override it with `defaults.swing`. It is **required, not defaulted** — a project-wide timing law is written rather than inferred, so straight time says `"swing": 0`. (This line previously said "default 0", which the schema contradicts; `docs/format-spec.md` §1.1 is the inventory.)
 - Semantics: every odd-indexed grid step in a lane is delayed by `round(swing * stepTicks / 2000)` ticks, where `stepTicks` is the lane's step duration in ticks. 0 is straight, ~667 approximates triplet swing, 1000 delays the off-step halfway to the next step. Swing is applied before `microTicks`.
 - Swing is not a per-step property; per-step timing nudges are what `microTicks` is for.
 

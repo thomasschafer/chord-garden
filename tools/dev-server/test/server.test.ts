@@ -104,6 +104,29 @@ describe("dev asset server", () => {
     expect(head.body).toBe("");
   });
 
+  /**
+   * The page at `/` carries the session token as an injected global, so a
+   * browser that sniffs its own content type out of a response this server
+   * labelled is a browser that can be talked into running something as script
+   * in the origin holding that token.
+   *
+   * Asserted across every kind of response rather than on the HTML alone: the
+   * header comes from one shared builder, and a route that grew its own
+   * `writeHead` would be exactly the regression worth catching.
+   */
+  it("tells the browser not to sniff a content type, on every response", async () => {
+    const responses = [
+      ["token-bearing html", await get("/")],
+      ["json api", await get("/api/projects")],
+      ["project document", await get("/api/projects/first-track/files/project.json")],
+      ["sample bytes", await get("/api/projects/first-track/files/samples/kick.wav")],
+      ["plain-text error", await get("/api/projects/nope")],
+    ] as const;
+    for (const [label, response] of responses) {
+      expect(response.headers["x-content-type-options"], label).toBe("nosniff");
+    }
+  });
+
   it("answers only to loopback host names", async () => {
     expect((await get("/", { host: "attacker.example.com" })).status).toBe(403);
     expect((await get("/", { host: `localhost:${port}` })).status).toBe(200);

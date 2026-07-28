@@ -13,7 +13,6 @@ import {
   axisFor,
   axisOffset,
   clampTrim,
-  dbfsLabel,
   draggedAxisValue,
   keyboardStep,
   mixerLanes,

@@ -27,9 +27,9 @@ time:
    scheduled events must not be `silent`, `onsets.matched` should equal
    `onsets.expected`, and `onsets.spurious` should be inspected. A silent
    track with zero `eventCount` is normal.
-   `validate` only proves the JSON is well-formed; this proves the result
-   actually made sound at the scheduled positions. `musictool render --help`
-   lists the flags and what each analysis field means.
+   `validate` proves the project is coherent; this proves it made the sound you
+   meant, at the positions you meant. `musictool render --help` lists the flags
+   and what each analysis field means.
 
    A drumkit track's numbers are its whole kit mixed together, and coincident
    hits collapse into one onset — a kick landing on a hat adds no distinct
@@ -67,6 +67,26 @@ time:
 Don't consider an edit done until `validate` passes with no errors. Read
 `musictool validate <project>` output for `error`-severity `code` values —
 they're stable identifiers, not prose to parse loosely.
+
+**`validate` catches every project that cannot render at default settings.** If
+it passes, `musictool render` will not fail on the document itself — not on a
+bad reference, a pattern the track can't play, a lane that isn't in the kit, a
+sample the renderer can't decode, or a part the arrangement schedules but
+`trackOrder` never places. **It does not prove the music is there.** A project
+can validate cleanly and still render silence, or render something you didn't
+mean. Three classes of failure stay render-time only, by construction:
+
+- **Bad options** — `--bars` past the end of the arrangement, an out-of-range
+  `--sample-rate` or `--seed`. These are properties of the command you typed,
+  not of the project, so no amount of document checking can see them.
+- **A render that is silent at the seed you used.** `probability` outcomes move
+  with `--seed`, so "everything came out silent" is not a property of the
+  document and cannot be decided without rendering.
+- **A sample that changes or disappears between the two commands.** `validate`
+  reads the disk when you run it; `render` reads it again.
+
+So `validate` answers "is this project coherent?" and `render --analyze`
+answers "did it make the sound I meant?". Run both, and read `warnings` first.
 
 Three things about the render that look like bugs and aren't:
 
@@ -166,6 +186,7 @@ Three things about the render that look like bugs and aren't:
 | wrong number of steps in a lane | `pattern.step-count-mismatch` (message says how many to add/remove) |
 | `stepEvents` step index points at a rest, not a hit | `pattern.step-event-not-a-hit` |
 | used `X` for an accent | `pattern.accent-unsupported` — use `x` + `velocity` in `stepEvents` |
+| two lanes in one pattern naming the same kit voice | `pattern.duplicate-lane` — both fire on every shared step, at twice the level |
 | lane name isn't a voice in the instrument's `kit` | `pattern.lane-unknown-voice` (with a suggestion) |
 | misspelled a note name (`bb2`, `Ab#1`) | `schema.pattern` on `/notes/<i>/pitch` — the grammar is `docs/format-spec.md` §5.1 |
 | wrote a pitch as a MIDI number (`33`) | `schema.type` — pitch is a string |

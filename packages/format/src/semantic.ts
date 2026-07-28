@@ -1,7 +1,8 @@
 import { readdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { readRegularFile } from "./readFile.js";
-import type { DiagnosticCollector, Loc, Severity } from "./diagnostics.js";
+import type { Diagnostic, DiagnosticCollector, Loc, Severity, Span } from "./diagnostics.js";
+import { locOfOffset, stringValueOffsets } from "./jsonParse.js";
 import { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
 import type { LoadedFile } from "./loadProject.js";
 import type {
@@ -49,11 +50,40 @@ export function semanticValidate(
     pointer: string,
     message: string,
     suggestion?: string,
+    span?: Span,
   ): void => {
-    const locs = files.get(file)?.locs;
-    const loc: Loc = locs?.get(pointer) ?? locs?.get("") ?? { line: 1, column: 1 };
-    const diagnostic = { severity, code, file, pointer, message, loc };
+    const loaded = files.get(file);
+    const locs = loaded?.locs;
+    // A span is in file coordinates and names the exact characters at fault, so
+    // it also decides the line and column: the pointer only reaches the whole
+    // value, and "the string on line 5" is a worse answer than "column 14 of it"
+    // whenever the caller knew the column.
+    const loc: Loc =
+      span !== undefined && loaded !== undefined
+        ? locOfOffset(loaded.text, span.start)
+        : (locs?.get(pointer) ?? locs?.get("") ?? { line: 1, column: 1 });
+    const diagnostic: Diagnostic = { severity, code, file, pointer, message, loc };
+    if (span !== undefined) diagnostic.span = span;
     diags.add(suggestion === undefined ? diagnostic : { ...diagnostic, suggestion });
+  };
+
+  /**
+   * Move a span from a decoded string value's own coordinates into the file's.
+   *
+   * `parseSteps` counts characters of the steps string; a diagnostic's `span`
+   * counts bytes of the document. Forwarding one as the other would put a
+   * plausible-looking offset into the wrong coordinate system, which is worse
+   * than the `undefined` this returns when the string cannot be located.
+   */
+  const spanInFile = (file: string, pointer: string, span: Span | undefined): Span | undefined => {
+    if (span === undefined) return undefined;
+    const loaded = files.get(file);
+    const loc = loaded?.locs.get(pointer);
+    if (loaded === undefined || loc === undefined) return undefined;
+    const offsets = stringValueOffsets(loaded.text, loc);
+    const start = offsets?.[span.start];
+    const end = offsets?.[span.end];
+    return start === undefined || end === undefined ? undefined : { start, end };
   };
 
   const barTicks = checkTempoAndMeter(project, report);
@@ -150,7 +180,7 @@ export function semanticValidate(
   for (const pattern of project.patterns.values()) {
     const file = `patterns/${pattern.id}.json`;
     if (pattern.kind === "grid") {
-      checkGridPattern(pattern, file, barTicks, report);
+      checkGridPattern(pattern, file, barTicks, report, spanInFile);
     } else {
       checkNotesPattern(pattern, file, report);
     }
@@ -186,7 +216,16 @@ type Report = (
   pointer: string,
   message: string,
   suggestion?: string,
+  /** File-coordinate span of the exact characters at fault, when known. */
+  span?: Span,
 ) => void;
+
+/**
+ * Translates a span expressed in a string value's own characters into the file
+ * coordinates every diagnostic locator uses. Returns `undefined` when the
+ * string cannot be located, rather than guessing.
+ */
+type SpanInFile = (file: string, pointer: string, span: Span | undefined) => Span | undefined;
 
 function didYouMean(name: string, candidates: Iterable<string>): string | undefined {
   const match = closestMatch(name, candidates);
@@ -316,7 +355,13 @@ function checkGridLanesAgainstKit(
   });
 }
 
-function checkGridPattern(pattern: GridPatternDoc, file: string, barTicks: number | undefined, report: Report): void {
+function checkGridPattern(
+  pattern: GridPatternDoc,
+  file: string,
+  barTicks: number | undefined,
+  report: Report,
+  spanInFile: SpanInFile,
+): void {
   if (barTicks === undefined) return;
   if (pattern.lengthTicks % barTicks !== 0) {
     report(
@@ -330,7 +375,29 @@ function checkGridPattern(pattern: GridPatternDoc, file: string, barTicks: numbe
   }
   const bars = pattern.lengthTicks / barTicks;
 
+  /**
+   * Two lanes naming one voice is a silent wrong-audio case, not a tidiness
+   * complaint. A lane is a voice seen from the pattern side (§5), so both lanes
+   * schedule onto the same drumkit voice and every step they share fires twice
+   * — one hit at twice the amplitude, which reads as a mix problem rather than
+   * as a pattern that says the same thing twice. Probability cannot separate
+   * them either: the identity a hit is rolled from is its lane name and step, so
+   * duplicates roll identically and both fire or both drop.
+   */
+  const seenLanes = new Set<string>();
   pattern.lanes.forEach((lane, i) => {
+    if (seenLanes.has(lane.lane)) {
+      report(
+        "error",
+        "pattern.duplicate-lane",
+        file,
+        `/lanes/${i}/lane`,
+        `more than one lane plays voice "${lane.lane}"; both would fire on every step they share, at twice the level`,
+        "merge the two lanes into one, or rename one to another voice in the kit",
+      );
+    }
+    seenLanes.add(lane.lane);
+
     const stepsPointer = `/lanes/${i}/steps`;
     const { stepsPerBar } = lane.grid;
     if (barTicks % stepsPerBar !== 0) {
@@ -344,7 +411,13 @@ function checkGridPattern(pattern: GridPatternDoc, file: string, barTicks: numbe
       return;
     }
     const parsed = parseSteps(lane.steps, { file, pointer: stepsPointer, stepsPerBar, bars });
-    for (const d of parsed.diagnostics) report(d.severity, d.code, d.file, d.pointer ?? stepsPointer, d.message, d.suggestion);
+    for (const d of parsed.diagnostics) {
+      // `parseSteps` computed the exact column in the steps string; translated
+      // here rather than dropped, so a locator that knows which character is
+      // wrong reaches the caller instead of pointing at the whole string.
+      const pointer = d.pointer ?? stepsPointer;
+      report(d.severity, d.code, d.file, pointer, d.message, d.suggestion, spanInFile(d.file, pointer, d.span));
+    }
     if (parsed.hits === undefined) return;
 
     const hitSet = new Set(parsed.hits);

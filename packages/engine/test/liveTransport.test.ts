@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadProject, type Project, type SynthInstrumentDoc } from "@chord-garden/format";
+import { loadProject, type Project } from "@chord-garden/format";
 import { describe, expect, it } from "vitest";
 import { compile, type CompiledSchedule } from "../src/compiler.js";
 import { CONTROL_BLOCK_SIZE, db100ToGain } from "../src/index.js";
@@ -168,13 +168,6 @@ describe("structural and parameter changes through the worklet", () => {
         ],
       },
     };
-  }
-
-  function withBassGain(project: Project, gainDb100: number): Project {
-    const bass = project.instruments.get("bass-synth");
-    if (bass === undefined || bass.type !== "synth") throw new Error("fixture lost its bass synth");
-    const replacement: SynthInstrumentDoc = { ...bass, params: { ...bass.params, gain: gainDb100 } };
-    return { ...project, instruments: new Map(project.instruments).set("bass-synth", replacement) };
   }
 
   /**

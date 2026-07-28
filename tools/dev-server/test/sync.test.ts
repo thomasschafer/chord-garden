@@ -521,6 +521,57 @@ describe("invalid intermediate states", () => {
     await socket.expectSilence();
   });
 
+  /**
+   * The idle re-scan runs every few seconds for as long as the sidecar is up, and
+   * a broken project stays broken until someone fixes it. Re-announcing the same
+   * diagnostics on that timer is not information: the client already has them, it
+   * cannot act on the repeat, and the stream of them buries the frame that does
+   * carry news.
+   */
+  it("says the project is invalid once, not on every re-scan of the same breakage", async () => {
+    const manual = manualSync();
+    const socket = await editorSocket();
+    const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x"));
+    manual.scan();
+    expect((await socket.next()).type).toBe("projectInvalid");
+
+    // Three more scans of a project broken in exactly the same way.
+    manual.scan();
+    manual.scan();
+    manual.scan();
+    await socket.expectSilence();
+
+    // A *different* breakage is still news, so this is silence about a repeat and
+    // not a channel that has gone quiet.
+    externalEdit("patterns/drums-verse.json", "{ this is not even JSON");
+    manual.scan();
+    const second = await socket.next();
+    expect(second.type).toBe("projectInvalid");
+    if (second.type !== "projectInvalid") return;
+    expect(second.diagnostics.map((each) => each.code)).toContain("json.parse");
+  });
+
+  it("tells a project that is still broken to a session that has not heard it yet", async () => {
+    const manual = manualSync();
+    const first = await editorSocket();
+    const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");
+
+    externalEdit("patterns/drums-verse.json", pattern.replace("x..x ..x. x..x ..x.", "x..x ..x. x..x"));
+    manual.scan();
+    expect((await first.next()).type).toBe("projectInvalid");
+
+    // The window closes and a new one opens. Suppressing the repeat must not mean
+    // suppressing it for a page that has been told nothing.
+    first.dispose();
+    await untilNoEditor();
+    const second = await editorSocket();
+    manual.scan();
+
+    expect((await second.next()).type).toBe("projectInvalid");
+  });
+
   it("keeps refusing to adopt while the project stays broken", async () => {
     const socket = await editorSocket();
     const pattern = readFileSync(join(root, "patterns/drums-verse.json"), "utf8");

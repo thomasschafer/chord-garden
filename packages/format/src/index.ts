@@ -21,7 +21,14 @@ export {
   type NoteExpressionField,
   type StepEventField,
 } from "./expression.js";
-export { parseStrictJson, type JsonObject, type JsonValue, type ParseResult } from "./jsonParse.js";
+export {
+  locOfOffset,
+  parseStrictJson,
+  stringValueOffsets,
+  type JsonObject,
+  type JsonValue,
+  type ParseResult,
+} from "./jsonParse.js";
 export * from "./model.js";
 export { ticksPerBar, type TimeSignature } from "./musicTime.js";
 export { formatSteps, parseSteps, type StepsContext, type StepsParseResult } from "./pattern.js";

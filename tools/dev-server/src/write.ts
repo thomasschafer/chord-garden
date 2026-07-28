@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { hashContent } from "@chord-garden/engine/live";
 import { docKindFromHint, docKindHintForPath, parseStrictJson, serializeCanonical } from "@chord-garden/format/pure";
@@ -86,7 +86,14 @@ export function writeBatch(
     };
   }
 
-  const planned: { target: string; relative: string; contents: string; expectedHash: string | null; hash: string }[] = [];
+  const planned: {
+    target: string;
+    relative: string;
+    contents: string;
+    expectedHash: string | null;
+    hash: string;
+    missingParent: string | undefined;
+  }[] = [];
   const removals: { target: string; relative: string; expectedHash: string }[] = [];
   const seen = new Set<string>();
 
@@ -123,6 +130,7 @@ export function writeBatch(
       contents: file.contents,
       expectedHash: file.expectedHash,
       hash: hashContent(Buffer.from(file.contents, "utf8")),
+      missingParent: resolved.missingParent,
     });
   }
 
@@ -159,6 +167,13 @@ export function writeBatch(
       status: WRITE_CONFLICT_STATUS,
       message: `${conflicts.join(", ")} changed on disk since this editor last read ${conflicts.length === 1 ? "it" : "them"}; nothing was written. Reload the project to pick up the change.`,
     };
+  }
+
+  // Only now, past every refusal: a batch this function turns down leaves no
+  // trace on disk, not even an empty `automation/` a rejected write would
+  // otherwise have created on its way to being rejected.
+  for (const entry of planned) {
+    if (entry.missingParent !== undefined) mkdirSync(entry.missingParent, { recursive: true });
   }
 
   const acks: WriteAck[] = [];

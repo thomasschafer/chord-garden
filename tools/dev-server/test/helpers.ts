@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { request } from "node:http";
+import { request, type IncomingHttpHeaders } from "node:http";
 import { Duplex } from "node:stream";
 import { SESSION_HEADER, TOKEN_HEADER } from "../src/api.js";
 
 export interface RawResponse {
   status: number;
   contentType: string;
+  /** Every response header, for the ones no field of its own is worth adding for. */
+  headers: IncomingHttpHeaders;
   body: string;
 }
 
@@ -47,7 +49,12 @@ export function rawRequest(port: number, path: string, options: RawOptions = {})
       response.setEncoding("utf8");
       response.on("data", (chunk: string) => (body += chunk));
       response.on("end", () =>
-        resolve({ status: response.statusCode ?? 0, contentType: response.headers["content-type"] ?? "", body }),
+        resolve({
+          status: response.statusCode ?? 0,
+          contentType: response.headers["content-type"] ?? "",
+          headers: response.headers,
+          body,
+        }),
       );
     });
     call.on("error", reject);

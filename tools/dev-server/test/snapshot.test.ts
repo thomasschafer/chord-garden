@@ -198,7 +198,11 @@ describe("a sidecar that contradicts itself", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const response = await originalFetch(input, init);
-      if (!String(input).endsWith(`/${SNAPSHOT_PATH}`)) return response;
+      // Not `String(input)`: a `Request` stringifies to "[object Object]", so the
+      // suffix test would quietly never match and this stub would pass every
+      // response through untouched — a test that no longer tests anything.
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith(`/${SNAPSHOT_PATH}`)) return response;
       const snapshot = (await response.json()) as ProjectSnapshot;
       snapshot.files[0]!.contentHash = "not-the-hash-of-these-bytes";
       return new Response(JSON.stringify(snapshot), { status: 200, headers: response.headers });

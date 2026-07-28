@@ -14,6 +14,16 @@ export interface Span {
  * The structured diagnostic contract shared by `validate`, the sidecar's
  * `diagnosticsChanged` push, and all tests. Tests assert on `code`, never on
  * `message` prose. At least one locator (pointer, span, or loc) must be present.
+ *
+ * The three locators answer different questions and are in different coordinate
+ * systems, so the one rule they all obey is worth stating: `span` and `loc` are
+ * always in *file* coordinates — a character offset and a line/column into the
+ * bytes of `file` — and never in the coordinates of some value inside it. A
+ * producer that computes a position within a string value, as the steps-string
+ * parser does, must translate it before it becomes a `span`; forwarding the
+ * inner index would put a number here that reads as a file offset and is not
+ * one. `pointer` is the model-side locator, and is the only one that survives
+ * reformatting.
  */
 export interface Diagnostic {
   severity: Severity;

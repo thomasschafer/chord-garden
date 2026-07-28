@@ -176,6 +176,40 @@ describe("locators on the diagnostics validate emits", () => {
     expect(diagnostic?.loc).toEqual({ line: 11, column: 20 });
   });
 
+  /**
+   * A steps string has its own coordinate system — `parseSteps` counts the
+   * characters of the decoded string — and a diagnostic's locators are in the
+   * file's. These used to be computed and then dropped, so a column-accurate
+   * complaint about one character arrived pointing at the whole string.
+   *
+   * The escape is the point of the fixture rather than decoration: `X` is
+   * one decoded character and six written ones, so a translation that added the
+   * string index to the string's start would land in the middle of it.
+   */
+  it("translates a steps-string column into the file that spells it", () => {
+    const root = createTempProject("steps-span");
+    //                     1234567890123456789012345678
+    const line = '  "steps": "x..\\u0058 ..x. x..x ..x."';
+    const text = `{\n  "id": "p",\n  "kind": "grid",\n  "lengthTicks": 3840,\n  "lanes": [\n    {\n      "lane": "kick",\n      "grid": { "stepsPerBar": 16 },\n    ${line}\n    }\n  ]\n}`;
+    writeFileSync(join(root, "patterns", "p.json"), text);
+
+    try {
+      const result = loadProject(root);
+      const diagnostic = result.diagnostics.find((d) => d.code === "pattern.accent-unsupported");
+      expect(diagnostic?.pointer).toBe("/lanes/0/steps");
+      // The `X` is decoded character 3 of the steps string, written as the six
+      // characters `X`. Read back out of the file, the span is exactly them.
+      expect(diagnostic?.span).toBeDefined();
+      expect(text.slice(diagnostic!.span!.start, diagnostic!.span!.end)).toBe("\\u0058");
+      // And the line and column follow the span rather than the pointer, so they
+      // name the offending character and not the string that contains it.
+      expect(diagnostic?.loc?.line).toBe(9);
+      expect(diagnostic?.loc?.column).toBe(text.split("\n")[8]!.indexOf("\\u0058") + 1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("carries the parser's span through loadProject to the caller", () => {
     const root = createTempProject("span");
     writeFileSync(join(root, "tracks", "t.json"), '{\n  "id": "t",\n  "id": "t"\n}');

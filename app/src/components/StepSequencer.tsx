@@ -95,15 +95,6 @@ export function StepSequencer({
   const patternId = pattern.id;
   const projectSwing = project.project.swing;
 
-  function attempt(action: () => void): void {
-    try {
-      action();
-      setError(undefined);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }
-
   /**
    * Stable across renders, so the memo on `LaneRow` can actually bail out. A fresh
    * arrow function per row per render would make every cell in the pattern re-render

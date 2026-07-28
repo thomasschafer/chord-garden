@@ -178,6 +178,21 @@ export class ProjectSync {
    */
   private reportedInvalid = false;
   /**
+   * The `projectInvalid` payload the current session has already been sent, so
+   * an unchanged one is not sent again.
+   *
+   * A project stays broken for as long as it takes someone to fix it, and the
+   * idle re-scan runs every few seconds throughout. Saying so once is
+   * information; saying so on a timer is a stream the client has to learn to
+   * ignore, and it drowns the frame that actually carries news — the moment the
+   * diagnostics change, or the project comes back.
+   *
+   * Cleared on every transition that makes the same payload news again: a
+   * validating scan, a served snapshot, and a new editor session, which has by
+   * definition not been told anything yet.
+   */
+  private announcedInvalid: string | undefined;
+  /**
    * Set when the current session asked to be caught up — it arrived holding an
    * inventory that is not the one established here — and has not been. The next
    * validating snapshot is then sent in full rather than as a diff. Retained
@@ -270,6 +285,9 @@ export class ProjectSync {
         clearTimeout(timeout);
         this.editor = connection;
         this.session = randomBytes(16).toString("hex");
+        // A new page has been told nothing, so a still-broken project is news to
+        // it even if the previous session had already heard it.
+        this.announcedInvalid = undefined;
         connection.startKeepalive(this.keepaliveMs, this.pongTimeoutMs);
         this.send(connection, {
           type: "welcome",
@@ -359,6 +377,7 @@ export class ProjectSync {
     // definition and nothing about an earlier invalid state is still on its screen.
     this.owedFullSnapshot = false;
     this.reportedInvalid = false;
+    this.announcedInvalid = undefined;
   }
 
   /**
@@ -504,6 +523,7 @@ export class ProjectSync {
       }${removed.length > 0 ? `, removed ${removed.join(", ")}` : ""}`,
     );
     this.reportedInvalid = false;
+    this.announcedInvalid = undefined;
     this.owedFullSnapshot = false;
     this.broadcast({ type: "projectChanged", scope: full ? "full" : "diff", files, changed, removed, diagnostics });
   }
@@ -565,7 +585,14 @@ export class ProjectSync {
    */
   private reportInvalid(diagnostics: ApiDiagnostic[]): void {
     this.reportedInvalid = true;
-    this.broadcast({ type: "projectInvalid", diagnostics });
+    const message: ServerMessage = { type: "projectInvalid", diagnostics };
+    // Compared on the serialized frame, which is exactly what the client would
+    // receive: two scans of an unchanged broken file produce equal diagnostics,
+    // and a repeat of a frame carries no information a client could act on.
+    const announced = JSON.stringify(message);
+    if (announced === this.announcedInvalid) return;
+    this.announcedInvalid = announced;
+    this.broadcast(message);
   }
 
   close(): void {

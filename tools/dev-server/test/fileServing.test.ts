@@ -70,7 +70,7 @@ describe("serving a file that cannot be read", () => {
     expect(response.body).toContain("export const ok");
   });
 
-  it("answers 403 for an unreadable file instead of taking the process down", async () => {
+  it("answers 500 for an unreadable file instead of taking the process down", async () => {
     // The premise, asserted rather than assumed: as root, mode 000 is still
     // readable and the failure this test exists to reproduce cannot be created.
     // Reported as a failure rather than skipped, because a suite that quietly
@@ -84,7 +84,11 @@ describe("serving a file that cannot be read", () => {
     expect(readable, "this test needs a non-root user: a mode-000 file was still readable").toBe(false);
 
     const response = await get("/harness.js.map");
-    expect(response.status).toBe(403);
+    // 500, not 403: the client is entitled to this file and the server could not
+    // read it. 403 is reserved for the refusals this server decides on — a path
+    // outside the root, an unservable extension, a bad token — and conflating the
+    // two sends the reader auditing an access rule when the fix is one `chmod`.
+    expect(response.status).toBe(500);
     expect(response.body).toContain("EACCES");
   });
 

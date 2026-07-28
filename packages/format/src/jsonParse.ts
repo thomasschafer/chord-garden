@@ -268,6 +268,65 @@ export function parseStrictJson(text: string, file: string): ParseResult {
   }
 }
 
+/**
+ * Where each character of a JSON string value sits in the file that spells it.
+ *
+ * The two are not the same coordinate system, and nothing else in this codebase
+ * bridges them. A steps string is parsed as its *decoded* characters, so a
+ * diagnostic about it knows an index into `"x..X"`; a diagnostic's `span` is an
+ * offset into the file, where that same string may be written with escapes and
+ * is preceded by everything above it. `X` is one decoded character and six
+ * raw ones, so the mapping is a walk rather than an addition.
+ *
+ * `loc` must be the location of the string value itself, which is what a
+ * parse's `locs` map holds. Returns one offset per decoded character plus a
+ * final one for the closing quote, so an exclusive end index maps too — or
+ * `undefined` if `loc` does not name a string literal, which leaves the caller
+ * with the pointer-derived location it already had.
+ */
+export function stringValueOffsets(text: string, loc: Loc): number[] | undefined {
+  let start = 0;
+  for (let line = 1; line < loc.line; line++) {
+    const next = text.indexOf("\n", start);
+    if (next < 0) return undefined;
+    start = next + 1;
+  }
+  start += loc.column - 1;
+  if (text[start] !== '"') return undefined;
+
+  const offsets: number[] = [];
+  let pos = start + 1;
+  while (pos < text.length) {
+    const char = text[pos]!;
+    if (char === '"') {
+      offsets.push(pos);
+      return offsets;
+    }
+    offsets.push(pos);
+    if (char !== "\\") {
+      pos += 1;
+      continue;
+    }
+    // `\uXXXX` is six raw characters for one decoded one; every other escape is
+    // two. A lone trailing backslash cannot occur in text this parser accepted.
+    pos += text[pos + 1] === "u" ? 6 : 2;
+  }
+  return undefined;
+}
+
+/** Line and column of a file offset, counted the way this parser counts them. */
+export function locOfOffset(text: string, offset: number): Loc {
+  let line = 1;
+  let lineStart = 0;
+  for (let index = 0; index < offset && index < text.length; index++) {
+    if (text[index] === "\n") {
+      line += 1;
+      lineStart = index + 1;
+    }
+  }
+  return { line, column: offset - lineStart + 1 };
+}
+
 function computeLineStarts(text: string): number[] {
   const starts = [0];
   for (let i = 0; i < text.length; i++) {

@@ -19,4 +19,7 @@ jobs:
       # for whoever imports them, and then typechecks sources and tests. Running
       # `build` separately afterwards would just repeat that work.
       - run: npm run typecheck
+      # After `typecheck`, because every lint rule here is type-aware and a type
+      # error surfaces more clearly from the compiler than from the linter.
+      - run: npm run lint
       - run: npm test

@@ -11,15 +11,20 @@
     "build": "npm run build -w @chord-garden/format && npm run build -w @chord-garden/engine && npm run build -w @chord-garden/cli && npm run build -w @chord-garden/dev-server && npm run build:web && npm run build -w @chord-garden/app",
     "build:web": "node tools/dev-server/dist/buildWeb.js",
     "typecheck": "npm run build && npm run typecheck:packages",
-    "typecheck:packages": "npm run typecheck -w @chord-garden/format && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli && npm run typecheck -w @chord-garden/dev-server && npm run typecheck -w @chord-garden/app",
+    "typecheck:packages": "npm run typecheck -w @chord-garden/format && npm run typecheck -w @chord-garden/engine && npm run typecheck -w @chord-garden/cli && npm run typecheck -w @chord-garden/dev-server && npm run typecheck -w @chord-garden/app && npm run typecheck:root",
+    "typecheck:root": "tsc -p tsconfig.lint.json",
+    "lint": "eslint .",
     "dev": "npm run build && node tools/dev-server/dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^24.0.0",
     "esbuild": "^0.28.1",
+    "eslint": "^9.39.5",
     "typescript": "^5.6.0",
+    "typescript-eslint": "^8.65.0",
     "vitest": "^3.0.0"
   }
 }

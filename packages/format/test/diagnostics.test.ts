@@ -44,6 +44,10 @@ const EXPECTED: Record<string, string> = {
   "duplicate-automation-lane": "automation.duplicate-lane",
   "duplicate-effect-id": "effect.duplicate-id",
   "duplicate-key": "json.duplicate-key",
+  // Two lanes on one voice: the only one of these duplicates that changed the
+  // audio rather than making a reference ambiguous. It validated clean and
+  // doubled every hit the two lanes shared.
+  "duplicate-lane": "pattern.duplicate-lane",
   "duplicate-step-event": "pattern.step-event-duplicate",
   "float-param": "number.float",
   "float-tempo": "number.float",

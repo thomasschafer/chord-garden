@@ -5,7 +5,8 @@ generated from and must stay consistent with `PLAN.md` Part One; if they
 disagree, treat that as a bug and fix the mismatch. Agents editing a project
 should read this file and `AGENTS.md` before making changes. This file is
 self-sufficient: it defers nothing to `PLAN.md`, so everything needed to write
-a valid project — including the full parameter registry (§6) — is here.
+a valid project — including the required and optional fields of every document
+(§1.1) and the full parameter registry (§6) — is here.
 
 ## 1. A project is a directory
 
@@ -28,6 +29,93 @@ validate <project>` to check both.
 IDs are lowercase kebab-case: `^[a-z][a-z0-9-]*$`. A file's `id` field (or
 `track` field, for automation files) must equal its file name. `project.json`
 and `arrangement.json` are singletons with no `id`.
+
+### 1.1 Required and optional fields
+
+Every object in this format is closed, so the tables below are a complete
+inventory: a field that is required and absent is `schema.required`, and a
+field that appears in neither column is `schema.unevaluatedProperties` — there
+is no third category of tolerated extra key. What the fields *mean*, and the
+unit each number is in, is the rest of this document; this section is only
+their shape. `description` is optional on every document that has one and is
+never read by the tool.
+
+Rows name an object by a dotted path from its document kind, where `[]` is an
+element of an array and `[*]` is a value in an open map. These are the same
+paths canonical key order is defined over (§5.2).
+
+`project.json`:
+
+| object | required | optional |
+|---|---|---|
+| `project` | `format`, `name`, `ppqn`, `tempoMap`, `meterMap`, `swing`, `trackOrder` | `description`, `key` |
+| `project.tempoMap[]` | `startTick`, `bpm` | (none) |
+| `project.meterMap[]` | `startTick`, `timeSignature` | (none) |
+| `project.key` | `root`, `scale` | (none) |
+
+Two of those catch people out. `name` is required and has no default — a
+project without one does not validate. And `swing` is required even though 0 is
+the neutral value: it is a project-wide timing law (§4), so it is written
+rather than inferred, and a project that means straight time says `"swing": 0`.
+
+`tracks/<id>.json`:
+
+| object | required | optional |
+|---|---|---|
+| `track` | `id`, `type`, `instrument`, `patterns` | `description`, `effects` |
+| `track.effects[]` | `id`, `type` | `description`, `params` |
+
+`instruments/<id>.json`, in its two kinds:
+
+| object | required | optional |
+|---|---|---|
+| `instrument.synth` | `id`, `type`, `engine` | `description`, `params` |
+| `instrument.drumkit` | `id`, `type`, `kit` | `description`, `params` |
+| `instrument.drumkit.kit[*]` | `sample` | (none) |
+
+`patterns/<id>.json`, in its two kinds:
+
+| object | required | optional |
+|---|---|---|
+| `pattern.grid` | `id`, `kind`, `lengthTicks`, `lanes` | `description` |
+| `pattern.grid.lanes[]` | `lane`, `grid`, `steps` | `defaults`, `stepEvents` |
+| `pattern.grid.lanes[].grid` | `stepsPerBar` | (none) |
+| `pattern.grid.lanes[].defaults` | (none) | `velocity`, `gateTicks`, `probability`, `swing` |
+| `pattern.grid.lanes[].stepEvents[]` | `step` | `velocity`, `microTicks`, `gateTicks`, `probability`, `ratchet` |
+| `pattern.notes` | `id`, `kind`, `lengthTicks`, `notes` | `description` |
+| `pattern.notes.notes[]` | `pitch`, `startTick`, `durationTicks`, `velocity` | `microTicks`, `probability`, `ratchet` |
+
+`arrangement.json` and `automation/<track-id>.json`:
+
+| object | required | optional |
+|---|---|---|
+| `arrangement` | `lengthTicks`, `clips` | `description` |
+| `arrangement.clips[]` | `track`, `pattern`, `startTick`, `repeatCount` | (none) |
+| `automation` | `track`, `lanes` | `description` |
+| `automation.lanes[]` | `param`, `interp`, `points` | (none) |
+
+Optional does not mean an empty one will do. Where a value carries no
+information unless it holds something, the empty form is rejected rather than
+ignored, so omitting it and writing it are not two spellings of one state. A
+lane's `defaults` needs at least one key; a `stepEvents` entry needs at least
+one key besides the `step` it targets, since an entry that only names a step
+overrides nothing. Write no `defaults` rather than `{}`.
+
+The same applies to six arrays, each the entire content of the thing holding
+it: `project.tempoMap` and `project.meterMap` (v1 in fact requires exactly one
+point in each, §3), a grid pattern's `lanes`, a lane's `stepEvents`, an
+automation document's `lanes`, and a lane's `points`. Two arrays are fixed-arity
+rather than merely non-empty: a `timeSignature` is exactly two integers, and an
+automation point is exactly `[tick, value]`.
+
+The arrays that may be empty are the ones whose emptiness is a real state you
+can be partway through writing: a pattern's `notes`, an arrangement's `clips`, a
+track's `patterns` and `effects`, and `trackOrder`.
+
+`params` and `kit` are open maps rather than fixed objects, so they have no
+column here. `kit` keys are voice names (§5, §6) and `params` keys come from the
+registry (§6); both are closed against those, not against a list of fields. A
+`kit` may not be empty either — a drumkit with no voices plays nothing.
 
 ## 2. Numbers are always integers in a fixed unit
 
@@ -89,8 +177,10 @@ integer in a unit above.
 
 ## 4. Swing
 
-`project.json.swing` (permille, default 0) applies to every grid lane. A
-lane may override it with `defaults.swing`. Every odd-indexed step in a lane
+`project.json.swing` (permille) applies to every grid lane. It is required
+rather than defaulted, so straight time is the written value 0 (§1.1). A lane
+may override it with `defaults.swing`, which is optional and falls back to the
+project's value when absent. Every odd-indexed step in a lane
 is delayed by `round(swing * stepTicks / 2000)` ticks, applied before
 `microTicks`. Swing is a lane/project setting, not a per-step field — for a
 single step's timing nudge use `microTicks` in `stepEvents`.
@@ -145,6 +235,15 @@ name (§6). A name that isn't a kit key is an error,
 per track→pattern reference, so a pattern reached by two tracks is
 checked against both kits, and a pattern no track references is not checked at
 all (it is already reported as `orphan.pattern`).
+
+One voice gets at most one lane in a pattern: two lanes naming the same voice is
+`pattern.duplicate-lane`. A lane is a voice seen from the pattern side, so both
+would schedule onto the same voice and every step they share would fire twice —
+one hit at twice the level, which reads as a mix problem rather than as a pattern
+that says the same thing twice. `probability` cannot separate them either, since
+a grid hit's identity is its lane name and step (below): duplicate lanes roll
+identically and both fire or both drop. Merge them, or rename one to another
+voice in the kit.
 
 `probability` (permille, in `defaults` or a `stepEvents` entry, and on note
 events) is resolved deterministically at render time from the render seed
@@ -494,6 +593,15 @@ Every diagnostic (from either layer) is one shape:
 `code` is stable and namespaced — write tooling and tests against `code`,
 never against `message` prose, which can change. `severity` is
 `error | warning | info`; `validate` exits non-zero only on `error`.
+
+A diagnostic carries up to three locators, and they are not interchangeable.
+`pointer` is a JSON Pointer into the document's model, so it survives `fmt` and
+is the one to key tooling on. `loc` and `span` locate the same fault in the
+file's *bytes* — a line and column, and a character range — so they move when
+the file is reformatted, and they are always in file coordinates even when the
+fault is a single character inside a string. A bad character in a steps string
+is found at a column of that string and reported at its column in the file, so
+an editor can underline the character itself rather than the whole value.
 
 Effects add three codes: `format.effects-require-2` (a format-1 track carrying a
 chain, §10), `effect.duplicate-id` (two effects on one track sharing an id, which

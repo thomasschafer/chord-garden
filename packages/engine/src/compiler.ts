@@ -453,6 +453,19 @@ function emitRatchets(
   voice: string | undefined,
   output: CompiledNoteEvent[],
 ): void {
+  // The schema floors both of these at 1, so a project read from disk cannot get
+  // here with either at zero. A caller that builds a `Project` in memory can, and
+  // the silence it buys is the worst kind: `ratchet: 0` divides by zero, produces
+  // a `NaN` boundary, runs the loop no times and drops the note entirely, while a
+  // zero gate emits an event of zero length. Both render as a part with something
+  // missing from it and nothing anywhere saying why.
+  if (!Number.isInteger(ratchet) || ratchet < 1) {
+    throw new Error(`cannot compile a note with ratchet ${ratchet}; ratchet is a count of at least 1`);
+  }
+  if (!Number.isInteger(gateTicks) || gateTicks < 1) {
+    throw new Error(`cannot compile a note of ${gateTicks} ticks; a note's duration and a gate are at least 1 tick`);
+  }
+
   const boundaries = Array.from({ length: ratchet + 1 }, (_, index) => {
     const tick = startTick + (gateTicks * index) / ratchet;
     return {

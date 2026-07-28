@@ -1,4 +1,4 @@
-import { mkdirSync, realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { ID_PATTERN } from "@chord-garden/format/pure";
 
@@ -22,7 +22,21 @@ const ROOT_DOCS = new Set(["project.json", "arrangement.json"]);
 export type ResolvedAsset = { ok: true; path: string; contentType: string };
 export type RejectedAsset = { ok: false; status: 400 | 403 | 404; message: string };
 
-export type ResolvedWrite = { ok: true; path: string; relative: string };
+export type ResolvedWrite = {
+  ok: true;
+  path: string;
+  relative: string;
+  /**
+   * A document directory that does not exist yet and would have to be created
+   * for this write to land, or `undefined` when the parent is already there.
+   *
+   * Reported rather than created, because resolving a path is something a
+   * *rejected* batch also does. The caller creates these only once every
+   * precondition in the batch has passed, so a 409 leaves the disk exactly as
+   * it found it.
+   */
+  missingParent: string | undefined;
+};
 export type RejectedWrite = { ok: false; status: 400 | 403; message: string };
 
 /** Media type for a project-relative path, or undefined if it is not servable. */
@@ -199,16 +213,27 @@ export function resolveDocumentWrite(root: string, requested: string): ResolvedW
 
   const realRoot = realpathSync(root);
   const parent = dirname(path);
-  let realParent: string;
+  let realParent: string | undefined;
   try {
     realParent = realpathSync(parent);
   } catch {
-    // Only the four known document directories can reach this, and only inside
-    // an already-confined root, so a project that has never had automation can
-    // still receive its first automation file.
-    mkdirSync(parent, { recursive: true });
-    realParent = realpathSync(parent);
+    realParent = undefined;
   }
+
+  // A parent that is not there yet is only reachable for the four known document
+  // directories, and only directly inside an already-confined root — the layout
+  // check above admits nothing deeper. A directory that does not exist cannot be
+  // a symlink pointing out of the root either, so confinement is settled by the
+  // root itself and the target is named under the real root.
+  if (realParent === undefined) {
+    return {
+      ok: true,
+      path: resolve(realRoot, ...segments),
+      relative: segments.join("/"),
+      missingParent: parent,
+    };
+  }
+
   if (!isInside(realRoot, realParent)) {
     return { ok: false, status: 403, message: `"${decoded}" sits in a directory that links out of the project root` };
   }
@@ -229,7 +254,7 @@ export function resolveDocumentWrite(root: string, requested: string): ResolvedW
     }
   }
 
-  return { ok: true, path: target, relative: segments.join("/") };
+  return { ok: true, path: target, relative: segments.join("/"), missingParent: undefined };
 }
 
 /** The §4 bundle layout, as an allowlist. Returns a refusal, or nothing. */
