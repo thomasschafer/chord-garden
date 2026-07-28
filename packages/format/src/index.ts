@@ -63,7 +63,7 @@ export {
 } from "./registry.js";
 export { loadSchema, schemaValidate } from "./schema.js";
 export { serializeCanonical, type DocKind } from "./serialize.js";
-export { loadProject, SUPPORTED_FORMAT, type LoadResult, type LoadedFile } from "./loadProject.js";
+export { loadProject, MAX_DOCUMENT_BYTES, SUPPORTED_FORMAT, type LoadResult, type LoadedFile } from "./loadProject.js";
 export { semanticValidate, MAX_SAMPLE_BYTES } from "./semantic.js";
 export { HIGHEST_MIDI, LOWEST_MIDI, midiToPitch, pitchToMidi, transposePitch } from "./pitch.js";
 export { assembleProject, type AssembledFile } from "./assemble.js";

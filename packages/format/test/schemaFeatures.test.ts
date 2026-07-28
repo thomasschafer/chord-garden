@@ -1,3 +1,4 @@
+import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 import { loadSchema, schemaValidate } from "../src/index.js";
 
@@ -55,8 +56,11 @@ describe("JSON Schema 2020-12 feature enforcement", () => {
     delete permissive.unevaluatedProperties;
     // This directly exercises Ajv rather than the cached compiled validator,
     // confirming the failure above is due to the keyword, not something else.
-    const Ajv2020 = (await import("ajv/dist/2020.js")).default;
-    const ajv = new Ajv2020({ allErrors: true, strict: false });
+    // Constructed the same way `src/schema.ts` constructs it: Ajv is CommonJS,
+    // so under NodeNext the default export is its `module.exports` and the class
+    // is one `.default` further in. Diverging from src here is how this ended up
+    // as the one expression in the package that would not typecheck.
+    const ajv = new Ajv2020.default({ allErrors: true, strict: false });
     const validate = ajv.compile(permissive);
     const value = {
       format: 1,

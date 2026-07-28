@@ -1,5 +1,6 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
+import { readRegularFile } from "./readFile.js";
 import { assembleProject } from "./assemble.js";
 import { docKindFromHint, type DocKindHint } from "./docKind.js";
 import { DiagnosticCollector, type Diagnostic, type Loc } from "./diagnostics.js";
@@ -39,6 +40,17 @@ export interface LoadResult {
 }
 
 const DOC_DIRS = ["tracks", "patterns", "instruments", "automation"] as const;
+
+/**
+ * The largest a single project document may be.
+ *
+ * Nothing anyone writes music with comes close — the worked example's biggest
+ * document is a few kilobytes, and a pattern would need hundreds of thousands of
+ * notes to approach this. It exists so that a stray large file that happens to
+ * end in `.json` becomes a diagnostic instead of an out-of-memory kill of
+ * whatever was validating: the CLI, or the dev server holding unsaved edits.
+ */
+export const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
 
 export function loadProject(root: string): LoadResult {
   const diags = new DiagnosticCollector();
@@ -94,21 +106,48 @@ function loadFile(
   diags: DiagnosticCollector,
   opts: { required: boolean },
 ): JsonValue | undefined {
-  let text: string;
-  try {
-    text = readFileSync(join(root, path), "utf8");
-  } catch {
-    if (opts.required) {
-      diags.add({
-        severity: "error",
-        code: "project.missing-file",
-        file: path,
-        message: `required file ${path} is missing`,
-        loc: { line: 1, column: 1 },
-      });
+  // A document is read as a regular file or not at all. A FIFO left in a project
+  // directory used to block this read forever, and because the dev server calls
+  // `loadProject` synchronously per request, that took the whole process with it
+  // — it never recovered, even once the FIFO was deleted.
+  const read = readRegularFile(join(root, path), MAX_DOCUMENT_BYTES);
+  if (!read.ok) {
+    const { refusal } = read;
+    if (refusal.reason === "missing") {
+      if (opts.required) {
+        diags.add({
+          severity: "error",
+          code: "project.missing-file",
+          file: path,
+          message: `required file ${path} is missing`,
+          loc: { line: 1, column: 1 },
+        });
+      }
+      return undefined;
     }
+    // Unlike a missing file, these are always errors: something is present at a
+    // document's path and it is not a document, which no project layout wants
+    // whether or not the file was required.
+    diags.add(
+      refusal.reason === "not-regular"
+        ? {
+            severity: "error",
+            code: "project.not-a-file",
+            file: path,
+            message: `${path} is ${refusal.description}; a project document must be a regular file`,
+            loc: { line: 1, column: 1 },
+          }
+        : {
+            severity: "error",
+            code: "project.file-too-large",
+            file: path,
+            message: `${path} is ${refusal.size} bytes; the per-document cap is ${MAX_DOCUMENT_BYTES}`,
+            loc: { line: 1, column: 1 },
+          },
+    );
     return undefined;
   }
+  const text = read.bytes.toString("utf8");
 
   const parsed = parseStrictJson(text, path);
   diags.addAll(parsed.diagnostics);

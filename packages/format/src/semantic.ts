@@ -1,5 +1,6 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { readRegularFile } from "./readFile.js";
 import type { DiagnosticCollector, Loc, Severity } from "./diagnostics.js";
 import { EFFECTS_MIN_FORMAT } from "./formatVersion.js";
 import type { LoadedFile } from "./loadProject.js";
@@ -587,24 +588,28 @@ function checkSamples(project: Project, report: Report): void {
     }
     referenced.set(sample, { file, pointer });
 
-    let stat;
-    try {
-      stat = statSync(join(project.root, sample));
-    } catch {
-      report("error", "sample.missing", file, pointer, `sample file "${sample}" does not exist on disk`);
+    // Same rule as a project document: read it as a regular file within the cap
+    // or refuse it. A FIFO named `samples/kick.wav` passed the old `statSync`
+    // with size 0 and then blocked the read forever.
+    const read = readRegularFile(join(project.root, sample), MAX_SAMPLE_BYTES);
+    if (!read.ok) {
+      const { refusal } = read;
+      if (refusal.reason === "missing") {
+        report("error", "sample.missing", file, pointer, `sample file "${sample}" does not exist on disk`);
+      } else if (refusal.reason === "not-regular") {
+        report("error", "sample.not-a-file", file, pointer, `sample "${sample}" is ${refusal.description}; a sample must be a regular file`);
+      } else {
+        report(
+          "error",
+          "sample.oversize",
+          file,
+          pointer,
+          `sample "${sample}" is ${refusal.size} bytes; the per-sample cap is ${MAX_SAMPLE_BYTES}`,
+        );
+      }
       continue;
     }
-    if (stat.size > MAX_SAMPLE_BYTES) {
-      report(
-        "error",
-        "sample.oversize",
-        file,
-        pointer,
-        `sample "${sample}" is ${stat.size} bytes; the per-sample cap is ${MAX_SAMPLE_BYTES}`,
-      );
-      continue;
-    }
-    const header = checkWavHeader(readFileSync(join(project.root, sample)));
+    const header = checkWavHeader(read.bytes);
     if (!header.ok) {
       report("error", "sample.not-wav", file, pointer, `sample "${sample}" is not a valid PCM WAV file: ${header.reason}`);
     }

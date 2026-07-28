@@ -1,9 +1,9 @@
-import { closeSync, ftruncateSync, mkdirSync, openSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, ftruncateSync, openSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadProject } from "../src/index.js";
+import { addDrumkitReferencing, createTempProject } from "./tempProject.js";
 
 const INVALID_ROOT = fileURLToPath(new URL("../../../fixtures/invalid", import.meta.url));
 
@@ -103,31 +103,17 @@ describe("invalid fixtures", () => {
   });
 
   it("oversize samples are rejected", () => {
-    const root = join(tmpdir(), `chord-garden-oversize-${process.pid}`);
-    mkdirSync(join(root, "instruments"), { recursive: true });
-    mkdirSync(join(root, "samples"), { recursive: true });
-    writeFileSync(
-      join(root, "project.json"),
-      JSON.stringify({
-        format: 1,
-        name: "oversize",
-        ppqn: 960,
-        tempoMap: [{ startTick: 0, bpm: 12000 }],
-        meterMap: [{ startTick: 0, timeSignature: [4, 4] }],
-        swing: 0,
-        trackOrder: [],
-      }),
-    );
-    writeFileSync(join(root, "arrangement.json"), JSON.stringify({ lengthTicks: 3840, clips: [] }));
-    writeFileSync(
-      join(root, "instruments", "k.json"),
-      JSON.stringify({ id: "k", type: "drumkit", kit: { kick: { sample: "samples/big.wav" } } }),
-    );
+    const root = createTempProject("oversize");
+    addDrumkitReferencing(root, "samples/big.wav");
     const fd = openSync(join(root, "samples", "big.wav"), "w");
     ftruncateSync(fd, 51 * 1024 * 1024);
     closeSync(fd);
 
-    const result = loadProject(root);
-    expect(result.diagnostics.some((d) => d.code === "sample.oversize")).toBe(true);
+    try {
+      const result = loadProject(root);
+      expect(result.diagnostics.some((d) => d.code === "sample.oversize")).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

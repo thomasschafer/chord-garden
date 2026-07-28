@@ -1,4 +1,4 @@
-import { createReadStream, readFileSync, statSync } from "node:fs";
+import { closeSync, constants, createReadStream, fstatSync, openSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
@@ -221,7 +221,7 @@ function handle(
     }
     const bundleType = BUNDLE_FILES[path];
     if (bundleType !== undefined) {
-      sendFile(res, join(options.bundleRoot, path.slice(1)), bundleType, method, {
+      sendFile(res, join(options.bundleRoot, path.slice(1)), bundleType, method, log, {
         missing: "the web bundles are not built; run `npm run build`",
       });
       return;
@@ -246,7 +246,7 @@ function handle(
         sendText(res, asset.status, asset.message);
         return;
       }
-      sendFile(res, asset.path, asset.contentType, method);
+      sendFile(res, asset.path, asset.contentType, method, log);
       return;
     }
   }
@@ -347,7 +347,7 @@ function handle(
     sendText(res, asset.status, asset.message);
     return;
   }
-  sendFile(res, asset.path, asset.contentType, method);
+  sendFile(res, asset.path, asset.contentType, method, log);
 }
 
 /** Read, validate and persist a write batch, then report the project's state. */
@@ -668,25 +668,88 @@ function sendHtml(
   res.end(method === "HEAD" ? undefined : injected);
 }
 
+/**
+ * `O_NONBLOCK` keeps the open from waiting on a FIFO that will never have a
+ * writer. Windows has no such flag and Node leaves it undefined there despite the
+ * type, so it is defaulted rather than assumed. It has no effect on reads from a
+ * regular file, which is the only kind this agrees to send.
+ */
+const READ_FLAGS = constants.O_RDONLY | ((constants.O_NONBLOCK as number | undefined) ?? 0);
+
+/**
+ * Stream one file to the client.
+ *
+ * A single `open` decides everything — existence, permission, and file type —
+ * and the `fstat` that measures it is taken on that same descriptor. The
+ * previous `statSync`-then-let-the-stream-`open`-it split had two ways to end the
+ * process rather than the request. A `stat` that succeeded where the `open` then
+ * failed (an unreadable file, a file replaced between the two calls) surfaced as
+ * an `'error'` event on a `ReadStream` nobody was listening to, which Node
+ * rethrows as an uncaught exception: `chmod 000` on any sample took down a server
+ * holding the user's unsaved edits. And a FIFO passed `stat` and then blocked.
+ *
+ * The stream still gets an error listener regardless, because a read can fail
+ * after a perfectly good open — a disk error, or a network volume going away.
+ * By then the headers are gone, so there is no status left to correct; breaking
+ * the response off is what tells the client something went wrong, and the
+ * short body against the announced `content-length` says the same.
+ */
 function sendFile(
   res: ServerResponse,
   path: string,
   contentType: string,
   method: string,
+  log: (line: string) => void,
   options: { missing?: string } = {},
 ): void {
-  let size: number;
+  let fd: number;
   try {
-    size = statSync(path).size;
-  } catch {
-    sendText(res, 404, options.missing ?? `${path} is missing`);
+    fd = openSync(path, READ_FLAGS);
+  } catch (error) {
+    // A file that exists but cannot be opened is a different problem from one
+    // that is not there, and saying "is missing" about a `chmod 000` sample sends
+    // whoever hits it looking for the wrong thing.
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      sendText(res, 404, options.missing ?? `${path} is missing`);
+    } else {
+      log(`cannot open ${path}: ${code}`);
+      sendText(res, 403, `${path} cannot be read (${code})`);
+    }
     return;
   }
+
+  let size: number;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      closeSync(fd);
+      // Deliberately not `options.missing`: that message explains an *absent*
+      // file ("the web bundles are not built"), and saying it about a FIFO
+      // sitting right there would send the reader to rebuild something that is
+      // already built.
+      log(`404 ${path} is not a regular file`);
+      sendText(res, 404, `${path} is not a regular file`);
+      return;
+    }
+    size = stat.size;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+
   res.writeHead(200, { "content-type": contentType, "content-length": size, "cache-control": "no-store" });
   if (method === "HEAD") {
+    closeSync(fd);
     res.end();
     return;
   }
+
   // Small files, but streaming keeps a 100 MB sample from being buffered whole.
-  createReadStream(path).pipe(res);
+  const stream = createReadStream(path, { fd, autoClose: true });
+  stream.on("error", (error: Error) => {
+    log(`read failed mid-response for ${path}: ${error.message}`);
+    res.destroy(error);
+  });
+  stream.pipe(res);
 }
